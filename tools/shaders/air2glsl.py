@@ -1029,6 +1029,13 @@ def glsl_to_cg(glsl, stage):
     # not moved to GL's -w..w (GXM clips below 0 like Metal, it seems)
     head_decls = [d.replace("2.0 * p.z - p.w", "p.z") for d in decls]
     decls[:] = head_decls
+    # the y sign is mina_yflip: -1 into framebuffers (GL's rows), +1 when a
+    # pass draws straight to the screen
+    for k, d in enumerate(decls):
+        if d.startswith("float4 flip_pos("):
+            decls[k] = d.replace("-p.y", "p.y * mina_yflip")
+            decls.insert(k, "uniform float mina_yflip;")
+            break
     body = _cg_types(body)
     if stage == 0:
         if "gl_VertexID" in body:

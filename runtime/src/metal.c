@@ -903,6 +903,7 @@ static void link_program(MPipeline *p)
         }
     }
     glGenVertexArrays(1, &p->vao);
+    p->yflip_loc = glGetUniformLocation(p->prog, "mina_yflip");
 }
 
 /* ---- pipeline reflection: what the engine binds per draw ---------------------------- */
@@ -1482,8 +1483,14 @@ void metal_present(uint64_t drawable)
      * frame goes to the screen with a quad of our own (Metal row 0 at the top) */
     {
         extern MTexture *g_show_tex;
-        MTexture *src = g_show_tex ? g_show_tex : t;
-        vita_copy_quad(src, 0, 0, (float)src->width, (float)src->height, 0, 0, 0, 960, 544, 1);
+        int direct_display(void);
+        /* the drawable's content: drawn on the screen already, or a texture
+         * a blit only aliased (see be_copyTexture), or the drawable itself */
+        MTexture *src = g_show_tex ? g_show_tex : t->alias ? t->alias : t;
+        if (g_show_tex || !t->on_display || !direct_display())
+            vita_copy_quad(src, 0, 0, (float)src->width, (float)src->height, 0, 0, 0, 960, 544, 1);
+        t->on_display = 0;
+        t->alias = NULL;
         static int keep_show = -1;
         if (keep_show < 0)
             keep_show = getenv("MINA_SHOW_PASS") != NULL;

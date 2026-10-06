@@ -65,6 +65,8 @@ typedef struct MTexture {
     uint32_t shift;          /* Vita: the GL texture is 2^shift times smaller (sampled only) */
     GLuint depth_tex;        /* Vita: a texture showing a sampled depth renderbuffer (vitaGL patch) */
     int clear_valid;         /* holds clear_value everywhere (cleared, nothing drawn or copied since) */
+    struct MTexture *alias;  /* Vita drawable: the texture a whole-texture blit would have copied in */
+    int on_display;          /* Vita drawable: this frame's passes drew it straight to the screen */
     float clear_value[4];    /* color, or depth and stencil */
 } MTexture;
 
@@ -126,6 +128,7 @@ typedef struct MPipeline {
     struct { int stage, tex, samp, unit; GLint size_loc; } texb[16];   /* size_loc: CG <sampler>_texsize */
     int ntex;
     GLuint vao;
+    GLint yflip_loc;         /* Vita: mina_yflip (-1 framebuffers, +1 the screen) */
 } MPipeline;
 
 /* GLSL translated from the game's metallibs (generated: build/gen/shaders.c) */

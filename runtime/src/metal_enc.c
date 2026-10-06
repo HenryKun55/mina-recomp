@@ -75,6 +75,7 @@ typedef struct REnc {
     float depth_value;
     int stencil_value;
     int vp_set, sc_set;
+    int to_display;                      /* Vita: the drawable's pass draws to the screen */
     double vp[6];
     int sc[4];
 } REnc;
@@ -138,10 +139,22 @@ static void framelog_pass(REnc *e, uint64_t *color, uint64_t depth, uint64_t ste
     rt_log("%s\n", buf);
 }
 
+/* MINA_NO_DIRECT: the drawable stays a texture copied to the screen */
+int direct_display(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("MINA_NO_DIRECT") == NULL;
+    return on;
+}
+
+/* rows run the other way on the screen (the shaders' y sign is +1 there) */
+static int screen_y(REnc *e, int y, int h) { return e->to_display ? (int)e->th - y - h : y; }
+
 static void apply_viewport(REnc *e)
 {
     const double *v = e->vp;
-    glViewport((GLint)v[0], (GLint)v[1], (GLsizei)v[2], (GLsizei)v[3]);
+    glViewport((GLint)v[0], screen_y(e, (int)v[1], (int)v[3]), (GLsizei)v[2], (GLsizei)v[3]);
 #if defined(__vita__)
     /* the CG shaders keep Metal's 0..1 depth: vitaGL's window z is
      * (f + n) / 2 + z * (f - n) / 2, so this stores zn + z * (zf - zn) */
@@ -156,6 +169,15 @@ static void apply_viewport(REnc *e)
 static void pass_begin(REnc *e)
 {
     e->begun = 1;
+#if defined(__vita__)
+    /* the drawable is the screen: its passes draw there, no copy at present */
+    if (e->color[0] && e->color[0]->is_drawable && !e->dtex && !e->stex && direct_display()) {
+        e->to_display = 1;
+        e->fbo = 0;
+        e->color[0]->on_display = 1;
+        e->color[0]->alias = NULL;
+    } else
+#endif
     e->fbo = metal_pass_fbo(e->color, e->levels, e->dtex, e->stex);
     glBindFramebuffer(GL_FRAMEBUFFER, e->fbo);
     glViewport(0, 0, (GLsizei)e->tw, (GLsizei)e->th);
@@ -196,7 +218,7 @@ static void pass_begin(REnc *e)
     if (e->vp_set)
         apply_viewport(e);
     if (e->sc_set)
-        glScissor(e->sc[0], e->sc[1], e->sc[2], e->sc[3]);
+        glScissor(e->sc[0], screen_y(e, e->sc[1], e->sc[3]), e->sc[2], e->sc[3]);
     gl_check("pass begin");
 }
 
@@ -410,7 +432,7 @@ static void re_setScissor(Ctx *c)
         e->sc[k] = (int)rt_ld64(G(r + 8 * k));
     e->sc_set = 1;
     if (e->begun)
-        glScissor(e->sc[0], e->sc[1], e->sc[2], e->sc[3]);
+        glScissor(e->sc[0], screen_y(e, e->sc[1], e->sc[3]), e->sc[2], e->sc[3]);
 }
 static void re_setDepthBias(Ctx *c)
 {
@@ -464,7 +486,9 @@ static void apply_state(REnc *e, MPipeline *p)
         glColorMaski((GLuint)i, (b->write_mask & 8) != 0, (b->write_mask & 4) != 0, (b->write_mask & 2) != 0,
                      (b->write_mask & 1) != 0);
     }
-    MDepthStencil *ds = e->ds ? objc_host(e->ds) : NULL;
+    /* Metal ignores depth/stencil state in a pass without those attachments;
+     * the Vita's screen has its own, so it must not be tested there */
+    MDepthStencil *ds = e->ds && (e->dtex || e->stex) ? objc_host(e->ds) : NULL;
 #if defined(__vita__)
     static int no_depth = -1, no_stencil = -1;
     if (no_depth < 0) {
@@ -512,7 +536,7 @@ static void apply_state(REnc *e, MPipeline *p)
         glDisable(GL_CULL_FACE);
     }
     /* the y flip mirrors the winding: Metal clockwise is GL counter-clockwise */
-    glFrontFace(e->winding == 0 ? GL_CCW : GL_CW);
+    glFrontFace((e->winding == 0) != e->to_display ? GL_CCW : GL_CW);   /* y mirrored on the screen */
 }
 
 static void apply_uniforms(REnc *e, MPipeline *p)
@@ -765,7 +789,16 @@ static MPipeline *draw_setup(REnc *e)
             rt_log("[draw] first draw with vs %d fs %d (%d textures) prog %u\n", p->vs, p->fs, p->ntex, p->prog);
     }
 #endif
+    if (e->to_display && getenv("MINA_DISPLAY_LOG")) {
+        static int n;
+        if (n++ < 6)
+            rt_log("[display] fs %d cull %u winding %u vp_set %d vp %g %g %g %g sc_set %d sc %d %d %d %d yflip_loc %d\n",
+                   p->fs, e->cull, e->winding, e->vp_set, e->vp[0], e->vp[1], e->vp[2], e->vp[3], e->sc_set, e->sc[0],
+                   e->sc[1], e->sc[2], e->sc[3], p->yflip_loc);
+    }
     glUseProgram(p->prog);
+    if (p->yflip_loc >= 0)
+        glUniform1f(p->yflip_loc, e->to_display ? 1.0f : -1.0f);
 #if defined(__vita__)
     if (getenv("MINA_DRAWLOG")) {
         GLint cur = -1;
@@ -966,6 +999,7 @@ static void be_copyBufferToTexture(Ctx *c)
 /* copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toTexture:destinationSlice:
  *   destinationLevel:destinationOrigin:
  * x2 src, x3 slice, x4 level, x5 &origin, x6 &size, x7 dst, stack: slice, level, &origin */
+int direct_display(void);
 static void be_copyTextureRegion(Ctx *c)
 {
     MTexture *s = objc_host(MARG(0)), *d = objc_host(MARG(5));
@@ -976,6 +1010,14 @@ static void be_copyTextureRegion(Ctx *c)
     GLint sx = (GLint)rt_ld64(G(so)), sy = (GLint)rt_ld64(G(so + 8));
     GLint w = (GLint)rt_ld64(G(sz)), h = (GLint)rt_ld64(G(sz + 8));
     GLint dx = (GLint)rt_ld64(G(dor)), dy = (GLint)rt_ld64(G(dor + 8));
+#if defined(__vita__)
+    if (d->is_drawable && sx == 0 && sy == 0 && dx == 0 && dy == 0 && (uint32_t)w == s->width &&
+        (uint32_t)h == s->height && s->width == d->width && s->height == d->height && direct_display()) {
+        d->alias = s;           /* the frame copied whole into the drawable */
+        d->on_display = 0;
+        return;
+    }
+#endif
 #if defined(__vita__)
     vita_copy_quad(s, (float)sx, (float)sy, (float)w, (float)h, metal_tex_fbo(d, (int)dlevel), dx, dy, w, h, 0);
 #else
@@ -991,6 +1033,14 @@ static void be_copyTexture(Ctx *c)
 {
     MTexture *s = objc_host(MARG(0)), *d = objc_host(MARG(1));
     d->clear_valid = 0;
+#if defined(__vita__)
+    /* the frame copied whole into the drawable: present shows it from there */
+    if (d->is_drawable && s->width == d->width && s->height == d->height && direct_display()) {
+        d->alias = s;
+        d->on_display = 0;
+        return;
+    }
+#endif
 #if defined(__vita__)
     vita_copy_quad(s, 0, 0, (float)s->width, (float)s->height, metal_tex_fbo(d, 0), 0, 0, (GLsizei)d->width,
                    (GLsizei)d->height, 0);
