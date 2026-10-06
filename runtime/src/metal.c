@@ -343,6 +343,7 @@ static void d_maxBufferLength(Ctx *c) { RET(256u << 20); }
 static void buf_dealloc(void *h)
 {
     MBuffer *b = h;
+
     gfree(b->contents);
 }
 static void d_newBufferWithLength(Ctx *c)
@@ -352,8 +353,7 @@ static void d_newBufferWithLength(Ctx *c)
     b->length = (uint32_t)MARG(0);
     b->options = (uint32_t)MARG(1);
     b->contents = gcalloc(1, b->length ? b->length : 16);
-    if (getenv("MINA_MEMSTAT") && b->length >= (4u << 20))
-        rt_log("[alloc] MTLBuffer %.1f MiB\n", b->length / 1048576.0);
+
     RET(o);
 }
 static void d_newBufferWithBytes(Ctx *c)

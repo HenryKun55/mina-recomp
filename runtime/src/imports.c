@@ -23,7 +23,7 @@ static const ImportImpl *find_impl(const char *name)
 
 static void imp_missing(Ctx *c)
 {
-    fprintf(stderr, "unimplemented import %s (x0=%#llx x1=%#llx x2=%#llx)\n",
+    rt_log("unimplemented import %s (x0=%#llx x1=%#llx x2=%#llx)\n",
             g_import_names[c->cur_import], (unsigned long long)c->x[0],
             (unsigned long long)c->x[1], (unsigned long long)c->x[2]);
     abort();

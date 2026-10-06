@@ -1422,7 +1422,9 @@ def gen_function(prog, start, end, natives=()):
     code = Lower(fn).run()
     name = prog.names.get(start)
     if name in natives:
-        code = code.replace("void %s(Ctx *c)" % cname(start), "void %s_orig(Ctx *c)" % cname(start), 1)
+        # prototypes here, not in funcs.h: changing the natives must not touch every file
+        code = code.replace("void %s(Ctx *c)" % cname(start), "void %s_orig(Ctx *c);\nvoid %s(Ctx *c);\nvoid %s_orig(Ctx *c)"
+                            % (cname(start), native_ident(name), cname(start)), 1)
         code += "void %s(Ctx *c) { %s(c); }\n" % (cname(start), native_ident(name))
     return code
 
@@ -1528,13 +1530,17 @@ def main():
         want = {int(x, 16) for x in args.only.split(",")}
         funcs = [f for f in funcs if f[0] in want]
 
-    with open(os.path.join(args.out, "funcs.h"), "w") as f:
+    import io
+    with io.StringIO() as f:
         f.write("/* generated */\n#ifndef MINA_FUNCS_H\n#define MINA_FUNCS_H\n#include \"recomp.h\"\n")
         for a, _ in sorted(prog.funcs):
             f.write("void %s(Ctx *c);\n" % cname(a))
-            if prog.names.get(a) in natives:
-                f.write("void %s_orig(Ctx *c);\nvoid %s(Ctx *c);\n" % (cname(a), native_ident(prog.names[a])))
         f.write("#endif\n")
+        header = f.getvalue()
+    hp = os.path.join(args.out, "funcs.h")
+    if not os.path.exists(hp) or open(hp).read() != header:
+        with open(hp, "w") as f:
+            f.write(header)
 
     errors = 0
     files = []

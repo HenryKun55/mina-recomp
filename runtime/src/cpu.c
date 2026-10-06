@@ -103,29 +103,29 @@ static void report(Ctx *c, uint32_t pc)
 {
     uint32_t start = 0;
     const char *name = func_name_at(pc, &start);
-    fprintf(stderr, "  at guest pc %#x in %s (function %#x, original %#llx)\n", pc, name, start,
+    rt_log("  at guest pc %#x in %s (function %#x, original %#llx)\n", pc, name, start,
             (unsigned long long)(start - GUEST_IMAGE_BASE + GUEST_ORIG_BASE));
     for (int i = 0; i < 31; i += 4) {
-        fprintf(stderr, "  ");
+        rt_log("  ");
         for (int k = i; k < i + 4 && k < 31; k++)
-            fprintf(stderr, "x%-2d=%016llx ", k, (unsigned long long)c->x[k]);
-        fprintf(stderr, "\n");
+            rt_log("x%-2d=%016llx ", k, (unsigned long long)c->x[k]);
+        rt_log("\n");
     }
-    fprintf(stderr, "  sp=%016llx\n", (unsigned long long)c->sp);
+    rt_log("  sp=%016llx\n", (unsigned long long)c->sp);
 #if !defined(__vita__)
     /* host frames of generated functions (f_<offset>) name the guest call chain */
     void *frames[64];
     int n = backtrace(frames, 64);
     char **syms = backtrace_symbols(frames, n);
-    fprintf(stderr, "  guest call chain:\n");
+    rt_log("  guest call chain:\n");
     for (int i = 0; i < n; i++) {
         const char *f = strstr(syms[i], " f_");
-        if (getenv("MINA_BT")) fprintf(stderr, "    [%s]\n", syms[i]);
+        if (getenv("MINA_BT")) rt_log("    [%s]\n", syms[i]);
         if (!f)
             continue;
         uint32_t off = (uint32_t)strtoul(f + 3, NULL, 16), st;
         const char *nm = func_name_at(off + GUEST_IMAGE_BASE, &st);
-        fprintf(stderr, "    %#x %s\n", off + GUEST_IMAGE_BASE, nm);
+        rt_log("    %#x %s\n", off + GUEST_IMAGE_BASE, nm);
     }
     free(syms);
 #endif
@@ -133,24 +133,38 @@ static void report(Ctx *c, uint32_t pc)
 
 void rt_unimpl(Ctx *c, uint32_t pc, const char *what)
 {
-    fprintf(stderr, "unimplemented: %s\n", what);
+    rt_log("unimplemented: %s\n", what);
     report(c, pc);
     abort();
 }
 
 void rt_trap(Ctx *c, uint32_t pc, uint32_t imm)
 {
-    fprintf(stderr, "guest trap (brk #%u)\n", imm);
+    rt_log("guest trap (brk #%u)\n", imm);
     report(c, pc);
     abort();
 }
 
 void rt_bad_jump(Ctx *c, uint32_t pc, uint64_t target)
 {
-    fprintf(stderr, "bad jump to %#llx\n", (unsigned long long)target);
+    rt_log("bad jump to %#llx\n", (unsigned long long)target);
     report(c, pc);
     abort();
 }
+
+#if defined(__vita__)
+/* No terminal on the Vita: the log goes to ux0:data/mina/mina.log too. */
+static FILE *log_file(void)
+{
+    static FILE *f;
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&lock);
+    if (!f)
+        f = fopen("ux0:data/mina/mina.log", "w");
+    pthread_mutex_unlock(&lock);
+    return f;
+}
+#endif
 
 void rt_log(const char *fmt, ...)
 {
@@ -158,6 +172,15 @@ void rt_log(const char *fmt, ...)
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
     va_end(ap);
+#if defined(__vita__)
+    FILE *f = log_file();
+    if (f) {
+        va_start(ap, fmt);
+        vfprintf(f, fmt, ap);
+        va_end(ap);
+        fflush(f);
+    }
+#endif
 }
 
 void rt_fatal(const char *fmt, ...)
@@ -168,6 +191,17 @@ void rt_fatal(const char *fmt, ...)
     vfprintf(stderr, fmt, ap);
     fprintf(stderr, "\n");
     va_end(ap);
+#if defined(__vita__)
+    FILE *f = log_file();
+    if (f) {
+        va_start(ap, fmt);
+        fprintf(f, "fatal: ");
+        vfprintf(f, fmt, ap);
+        fprintf(f, "\n");
+        va_end(ap);
+        fclose(f);
+    }
+#endif
     abort();
 }
 

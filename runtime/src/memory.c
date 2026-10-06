@@ -66,6 +66,7 @@ void gfree(uint32_t a)
     free(G(a));
 }
 uint64_t gmalloc_usable(uint32_t a) { return malloc_usable_size(G(a)); }
+int gmalloc_was_fresh(void) { return 0; }     /* newlib memory is never known to be zero */
 uint32_t gcalloc(uint64_t n, uint64_t size)
 {
     uint64_t total = n * size;
@@ -159,11 +160,32 @@ typedef struct BlockHdr {
     uint64_t size;           /* requested size */
 } BlockHdr;
 
+/* MINA_HEAPMAP: live bytes per allocating site (host return addresses of the
+ * generated functions above malloc), reported by mem_report. */
+#include <dlfcn.h>
+#define SITES 4096
+static struct { void *pc; int64_t bytes; int64_t count; } sites[SITES];
+static uint32_t *block_site;       /* per 16-byte heap granule: site index + 1 */
+static int heapmap = -1;
+
+static int site_of(void *pc)
+{
+    uint32_t h = (uint32_t)(((uintptr_t)pc >> 2) * 2654435761u) % SITES;
+    for (int k = 0; k < SITES; k++, h = (h + 1) % SITES) {
+        if (sites[h].pc == pc || !sites[h].pc) {
+            sites[h].pc = pc;
+            return (int)h;
+        }
+    }
+    return 0;
+}
+
 #define MAGIC_USED 0x6D696E61u   /* "mina" */
 #define MAGIC_FREE 0x66726565u   /* "free" */
 
 static pthread_mutex_t heap_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t heap_top = HEAP_BASE;
+static __thread int last_fresh;     /* the last gmalloc came from untouched (zero) memory */
 static uint32_t free_list[NCLASS];
 static uint64_t heap_in_use;
 
@@ -199,6 +221,7 @@ uint32_t gmalloc(uint64_t size)
     uint32_t cls = class_of(size, &cap);
     pthread_mutex_lock(&heap_lock);
     uint32_t a = free_list[cls];
+    last_fresh = !a;
     if (a) {
         BlockHdr *h = G(a - HDR);
         free_list[cls] = *(uint32_t *)G(a);
@@ -221,6 +244,21 @@ uint32_t gmalloc(uint64_t size)
         a = blk + HDR;
     }
     heap_in_use += cap;
+    if (heapmap < 0)
+        heapmap = getenv("MINA_HEAPMAP") != NULL;
+    if (heapmap) {
+        if (!block_site)
+            block_site = calloc((HEAP_END - HEAP_BASE) / 16, sizeof *block_site);
+        /* walk the frame chain: gmalloc <- imp_malloc <- allocator <- caller */
+        void **fp = __builtin_frame_address(0);
+        for (int d = 0; d < 3 && fp; d++)
+            fp = (void **)fp[0];
+        void *pc = fp ? fp[1] : NULL;
+        int si = site_of(pc);
+        sites[si].bytes += (int64_t)cap;
+        sites[si].count++;
+        block_site[(a - HEAP_BASE) / 16] = (uint32_t)si + 1;
+    }
     pthread_mutex_unlock(&heap_lock);
     return a;
 }
@@ -238,6 +276,14 @@ void gfree(uint32_t a)
     if (h->magic != MAGIC_USED)
         rt_fatal("free of a non-heap or freed pointer %#x", a);
     h->magic = MAGIC_FREE;
+    if (heapmap > 0 && block_site) {
+        uint32_t si = block_site[(a - HEAP_BASE) / 16];
+        if (si) {
+            sites[si - 1].bytes -= (int64_t)class_cap(h->cls);
+            sites[si - 1].count--;
+            block_site[(a - HEAP_BASE) / 16] = 0;
+        }
+    }
     *(uint32_t *)G(a) = free_list[h->cls];
     free_list[h->cls] = a;
     heap_in_use -= class_cap(h->cls);
@@ -256,10 +302,11 @@ uint32_t gcalloc(uint64_t n, uint64_t size)
     if (size && total / size != n)
         return 0;
     uint32_t a = gmalloc(total);
-    if (a)
+    if (a && !last_fresh)
         memset(G(a), 0, total);
     return a;
 }
+int gmalloc_was_fresh(void) { return last_fresh; }
 
 uint32_t grealloc(uint32_t a, uint64_t size)
 {
@@ -314,6 +361,7 @@ uint32_t gstrdup(const char *s)
 }
 
 /* MINA_MEMSTAT: heap figures for the memory budget (Vita) */
+const char *func_name_at(uint32_t pc, uint32_t *start);
 void mem_report(void)
 {
     static uint64_t peak;
@@ -321,6 +369,61 @@ void mem_report(void)
         peak = heap_in_use;
     rt_log("[mem] heap in use %.1f MiB (peak %.1f), heap span %.1f MiB\n", heap_in_use / 1048576.0,
            peak / 1048576.0, (heap_top - HEAP_BASE) / 1048576.0);
+    if (heapmap > 0) {
+        /* the 12 biggest sites */
+        int order[12] = { 0 };
+        int64_t best[12] = { 0 };
+        for (int i = 0; i < SITES; i++) {
+            int64_t b = sites[i].bytes;
+            for (int k = 0; k < 12; k++)
+                if (b > best[k]) {
+                    memmove(best + k + 1, best + k, (size_t)(11 - k) * sizeof best[0]);
+                    memmove(order + k + 1, order + k, (size_t)(11 - k) * sizeof order[0]);
+                    best[k] = b;
+                    order[k] = i;
+                    break;
+                }
+        }
+        /* resident (touched) bytes per site: mincore over every used block */
+        static int64_t resident[SITES];
+        memset(resident, 0, sizeof resident);
+        int64_t total_res = 0;
+        unsigned char vec[512];
+        for (uint32_t a = HEAP_BASE; a < heap_top;) {
+            BlockHdr *h = G(a);
+            uint64_t cap = class_cap(h->cls);
+            uint32_t data = a + HDR;
+            if (h->magic == MAGIC_USED && block_site && block_site[(data - HEAP_BASE) / 16]) {
+                uint64_t lo = (uint64_t)(uintptr_t)G(data) & ~16383ull;
+                uint64_t hi = ((uint64_t)(uintptr_t)G(data) + cap + 16383) & ~16383ull;
+                int64_t res = 0;
+                for (uint64_t p = lo; p < hi; p += 512ull * 16384) {
+                    uint64_t len = hi - p < 512ull * 16384 ? hi - p : 512ull * 16384;
+                    if (mincore((void *)(uintptr_t)p, (size_t)len, (char *)vec) == 0)
+                        for (uint64_t k = 0; k < len / 16384; k++)
+                            res += (vec[k] & 1) ? 16384 : 0;
+                }
+                if (res > (int64_t)cap) res = (int64_t)cap;
+                resident[block_site[(data - HEAP_BASE) / 16] - 1] += res;
+                total_res += res;
+            }
+            a = data + (uint32_t)cap;
+        }
+        rt_log("[mem] resident (touched) in tracked blocks: %.1f MiB\n", total_res / 1048576.0);
+        for (int k = 0; k < 12 && best[k] > 0; k++) {
+            Dl_info di;
+            const char *nm = "?";
+            if (dladdr(sites[order[k]].pc, &di) && di.dli_sname) {
+                nm = di.dli_sname;
+                if (strncmp(nm, "f_", 2) == 0) {
+                    uint32_t st;
+                    nm = func_name_at((uint32_t)strtoul(nm + 2, NULL, 16) + GUEST_IMAGE_BASE, &st);
+                }
+            }
+            rt_log("[mem]   %7.1f MiB (touched %6.1f) %6lld blocks  %s\n", best[k] / 1048576.0,
+                   resident[order[k]] / 1048576.0, (long long)sites[order[k]].count, nm);
+        }
+    }
 }
 
 #endif

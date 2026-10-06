@@ -917,7 +917,9 @@ static void imp_mmap(Ctx *c)
         RET((uint64_t)-1);
         return;
     }
-    memset(G(a), 0, len);
+    int gmalloc_was_fresh(void);
+    if (!gmalloc_was_fresh())
+        memset(G(a), 0, len);     /* fresh memory is already zero (and stays untouched) */
     RET(a);
 }
 static void imp_munmap(Ctx *c) { gfree((uint32_t)A0); RET(0); }
