@@ -22,7 +22,7 @@ uint8_t *g_mem;
  * p - g_mem (mod 2^32): the guest heap is newlib's malloc. */
 #include <malloc.h>
 /* with the extended memory mode (ATTRIBUTE2=12 in param.sfo) */
-int _newlib_heap_size_user = 330 * 1024 * 1024;
+int _newlib_heap_size_user = 272 * 1024 * 1024;   /* the rest of the extended memory is vitaGL's */
 static uint32_t image_size;
 
 #include <pthread.h>

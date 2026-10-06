@@ -158,7 +158,12 @@ void nat_SDL_Init(Ctx *c)
     main_tid = SDL_ThreadID();
     if (!jobs_lock)
         jobs_lock = SDL_CreateMutex();
+#if defined(__vita__)
+    /* no SDL video on the Vita: vitaGL owns GXM (SDL's driver would set it up too) */
+    int r = SDL_Init((flags & ~(uint32_t)SDL_INIT_VIDEO) | SDL_INIT_EVENTS);
+#else
     int r = SDL_Init(flags | SDL_INIT_VIDEO | SDL_INIT_EVENTS);
+#endif
     wake_init();
     gl_ensure();
     RET((uint64_t)(int64_t)r);

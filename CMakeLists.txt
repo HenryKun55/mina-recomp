@@ -94,9 +94,11 @@ target_compile_definitions(mina PRIVATE ${MINA_DEFS} ${MINA_RUNTIME_DEFS})
 target_compile_options(mina PRIVATE ${MINA_ARCH_FLAGS} -ffp-contract=off -fno-strict-aliasing -Wall -Wno-unused-function)
 
 if(VITA)
+  # MINA_VITAGL_LIB: another libvitaGL.a (a build of its own) instead of the SDK's
+  set(MINA_VITAGL_LIB "vitaGL" CACHE STRING "vitaGL library to link (name or path)")
   target_include_directories(mina PRIVATE "$ENV{VITASDK}/arm-vita-eabi/include/SDL2")
   target_link_libraries(mina PRIVATE
-    SDL2 vitaGL vitashark SceShaccCgExt mathneon taihen_stub
+    SDL2 ${MINA_VITAGL_LIB} vitashark SceShaccCgExt mathneon taihen_stub
     SceShaccCg_stub SceKernelDmacMgr_stub SceCtrl_stub SceTouch_stub SceHid_stub SceMotion_stub
     SceAudio_stub SceAudioIn_stub SceDisplay_stub SceGxm_stub SceCommonDialog_stub SceSysmodule_stub
     ScePower_stub SceAppMgr_stub SceAppUtil_stub SceIme_stub SceLibKernel_stub SceProcessmgr_stub

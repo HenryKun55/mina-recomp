@@ -46,6 +46,10 @@ int main(int argc, char **argv)
 {
 #if defined(__vita__)
     load_env_file();
+#if !defined(MINA_NULL_GL)
+    void metal_vita_init(void);
+    metal_vita_init();
+#endif
 #endif
     const char *exe = getenv("MINA_EXE");
     if (!exe)

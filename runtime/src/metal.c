@@ -25,16 +25,23 @@ static pthread_t gl_owner;
 static int gl_owned;
 static SDL_Window *gl_window;
 
+#if defined(__vita__) && !defined(MINA_NULL_GL)
+/* vitaGL starts on the main thread at boot, before the game takes memory */
+void metal_vita_init(void)
+{
+    vglInitExtended(0x800000, 960, 544, 0x1000000, SCE_GXM_MULTISAMPLE_NONE);
+    static const char *names[] = { "vram", "ram", "phycont", "cdlg", "newlib" };
+    for (int k = 0; k < 5; k++)
+        rt_log("[vgl] %s: %.1f of %.1f MiB free\n", names[k], vglMemFree((vglMemType)k) / 1048576.0,
+               vglMemTotal((vglMemType)k) / 1048576.0);
+}
+#endif
+
 void gpu_lock(void)
 {
     pthread_mutex_lock(&gpu_mutex);
 #if defined(__vita__)
 #if !defined(MINA_NULL_GL)
-    static int vgl_ready;
-    if (!vgl_ready) {
-        vglInitExtended(0x800000, 960, 544, 0x1000000, SCE_GXM_MULTISAMPLE_NONE);
-        vgl_ready = 1;
-    }
 #endif
     return;
 #endif
@@ -298,8 +305,15 @@ static int gl_format(uint32_t mtl, GLFmt *f)
 {
     memset(f, 0, sizeof *f);
     switch (mtl) {
+#if defined(__vita__)
+    /* vitaGL makes GL_R8 a U8_R texture that glTexSubImage2D cannot write:
+     * U8_RRRR (every channel = the value) samples the same for .r and .a */
+    case 1:   *f = (GLFmt){ GL_INTENSITY, GL_RED, GL_UNSIGNED_BYTE, 1 }; return 1;    /* A8Unorm */
+    case 10:  *f = (GLFmt){ GL_INTENSITY, GL_RED, GL_UNSIGNED_BYTE, 1 }; return 1;   /* R8Unorm */
+#else
     case 1:   *f = (GLFmt){ GL_R8, GL_RED, GL_UNSIGNED_BYTE, 1 }; return 1;           /* A8Unorm */
     case 10:  *f = (GLFmt){ GL_R8, GL_RED, GL_UNSIGNED_BYTE, 1 }; return 1;
+#endif
     case 25:  *f = (GLFmt){ GL_R16F, GL_RED, GL_HALF_FLOAT, 2 }; return 1;
     case 30:  *f = (GLFmt){ GL_RG8, GL_RG, GL_UNSIGNED_BYTE, 2 }; return 1;
     case 55:  *f = (GLFmt){ GL_R32F, GL_RED, GL_FLOAT, 4 }; return 1;
@@ -516,9 +530,19 @@ static void tex_create_gl(MTexture *t)
     }
     if (target == GL_TEXTURE_2D_ARRAY)
         rt_fatal("metal: 2D array textures are not supported yet");
+#if defined(__vita__)
+    /* the GPU takes at most 4096 per side: bigger textures that are only
+     * sampled (atlases) are kept halved; the game still sees its size */
+    if (!(t->usage & 4) && !f.block_bytes)
+        while ((t->width >> t->shift) > 4096 || (t->height >> t->shift) > 4096)
+            t->shift++;
+    if (t->shift)
+        rt_log("[tex] %ux%u texture (format %u) kept at 1/%u\n", t->width, t->height, t->format, 1u << t->shift);
+#endif
     for (uint32_t level = 0; level < t->mips; level++) {
-        GLsizei w = (GLsizei)(t->width >> level ? t->width >> level : 1);
-        GLsizei h = (GLsizei)(t->height >> level ? t->height >> level : 1);
+        uint32_t lw = t->width >> t->shift, lh = t->height >> t->shift;
+        GLsizei w = (GLsizei)(lw >> level ? lw >> level : 1);
+        GLsizei h = (GLsizei)(lh >> level ? lh >> level : 1);
         int faces = target == GL_TEXTURE_CUBE_MAP ? 6 : 1;
         for (int face = 0; face < faces; face++) {
             GLenum tt = target == GL_TEXTURE_CUBE_MAP ? (GLenum)(GL_TEXTURE_CUBE_MAP_POSITIVE_X + face) : target;
@@ -704,6 +728,16 @@ static void lib_newFunctionWithName(Ctx *c)
 
 static GLuint compile(GLenum type, const char *src, int index)
 {
+#if defined(__vita__)
+    if (getenv("MINA_SHADER_MARKS")) {
+        /* the emulator logs every open: the marks place a compiler crash */
+        char mark[96];
+        snprintf(mark, sizeof mark, "ux0:data/mina/mark_%s_%d", type == GL_VERTEX_SHADER ? "vs" : "fs", index);
+        FILE *m = fopen(mark, "rb");
+        if (m)
+            fclose(m);
+    }
+#endif
     GLuint s = glCreateShader(type);
     glShaderSource(s, 1, &src, NULL);
     glCompileShader(s);
@@ -1002,8 +1036,26 @@ static void tex_upload(MTexture *t, uint32_t x, uint32_t y, uint32_t w, uint32_t
         return;
     }
 #if defined(__vita__)
-    /* no GL_UNPACK_ROW_LENGTH: rows with padding are packed first */
     uint8_t *packed = NULL;
+    if (t->shift && f.bpp) {
+        /* a box filter down to the GL texture (regions are taken whole cells) */
+        uint32_t s = t->shift, n = 1u << s, bpp = (uint32_t)f.bpp;
+        uint32_t dx = x >> s, dy = y >> s, dw = (w + n - 1) >> s, dh = (h + n - 1) >> s;
+        packed = malloc((size_t)dw * dh * bpp);
+        for (uint32_t r = 0; r < dh; r++)
+            for (uint32_t col = 0; col < dw; col++)
+                for (uint32_t ch = 0; ch < bpp; ch++) {
+                    uint32_t sum = 0, cnt = 0;
+                    for (uint32_t yy = r * n; yy < r * n + n && yy < h; yy++)
+                        for (uint32_t xx = col * n; xx < col * n + n && xx < w; xx++, cnt++)
+                            sum += src[(size_t)yy * bpr + (size_t)xx * bpp + ch];
+                    packed[((size_t)r * dw + col) * bpp + ch] = (uint8_t)(cnt ? sum / cnt : 0);
+                }
+        glTexSubImage2D(tt, (GLint)level, (GLint)dx, (GLint)dy, (GLsizei)dw, (GLsizei)dh, f.format, f.type, packed);
+        free(packed);
+        return;
+    }
+    /* no GL_UNPACK_ROW_LENGTH: rows with padding are packed first */
     if (f.bpp && bpr != w * (uint32_t)f.bpp) {
         packed = malloc((size_t)w * h * (uint32_t)f.bpp);
         for (uint32_t row = 0; row < h; row++)
@@ -1153,6 +1205,42 @@ static void cb_presentDrawable(Ctx *c)
     cb->present = objc_retain_obj(MARG(0));
 }
 
+#if !defined(MINA_NULL_GL)
+/* MINA_DUMP=path: every 60th presented frame is written there (PPM, a
+ * quarter of the size; "%d" in the path numbers the files) */
+static void dump_frame(MTexture *t)
+{
+    static int frame;
+    const char *dump = getenv("MINA_DUMP");
+    if (dump && ++frame % 60 == 0) {
+        uint32_t W = t->width, H = t->height;
+        uint8_t *px = malloc((size_t)W * H * 4);
+#if defined(__vita__)
+        /* vitaGL reads the bound GL_FRAMEBUFFER, and the GPU must be done */
+        glFinish();
+        glBindFramebuffer(GL_FRAMEBUFFER, tex_fbo(t, 0));
+        glReadPixels(0, 0, (GLsizei)W, (GLsizei)H, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+#else
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, tex_fbo(t, 0));
+        glReadPixels(0, 0, (GLsizei)W, (GLsizei)H, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+#endif
+        char path[512];
+        snprintf(path, sizeof path, dump, frame / 60);
+        FILE *f = fopen(path, "wb");
+        if (f) {
+            fprintf(f, "P6 %u %u 255\n", W / 4, H / 4);
+            for (uint32_t y = 0; y + 4 <= H; y += 4)
+                for (uint32_t x = 0; x + 4 <= W; x += 4)
+                    fwrite(px + 4 * (y * W + x), 1, 3, f);
+            fclose(f);
+        }
+        free(px);
+    }
+}
+#endif
+
 void metal_present(uint64_t drawable);
 
 static void cb_commit(Ctx *c)
@@ -1268,11 +1356,53 @@ void metal_present(uint64_t drawable)
     gpu_lock();
 #if defined(__vita__)
 #if !defined(MINA_NULL_GL)
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, tex_fbo(t, 0));
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-    glDisable(GL_SCISSOR_TEST);
-    glBlitFramebuffer(0, 0, (GLint)t->width, (GLint)t->height, 0, 544, 960, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    /* vitaGL's glBlitFramebuffer draws one triangle of its quad here: the
+     * frame goes to the screen with a quad of our own (Metal row 0 at the top) */
+    static GLuint prog;
+    if (!prog) {
+        static const char *vs =
+            "void main(float2 position, float2 texcoord, out float2 vtex : TEXCOORD0, out float4 vpos : POSITION)"
+            " { vtex = texcoord; vpos = float4(position, 0.0, 1.0); }";
+        static const char *fs =
+            "uniform sampler2D tex;"
+            " void main(float2 vtex : TEXCOORD0, out float4 o0 : COLOR) { o0 = tex2D(tex, vtex); }";
+        GLuint v = glCreateShader(GL_VERTEX_SHADER), f = glCreateShader(GL_FRAGMENT_SHADER);
+        glShaderSource(v, 1, &vs, NULL);
+        glCompileShader(v);
+        glShaderSource(f, 1, &fs, NULL);
+        glCompileShader(f);
+        prog = glCreateProgram();
+        glAttachShader(prog, v);
+        glAttachShader(prog, f);
+        glBindAttribLocation(prog, 0, "position");
+        glBindAttribLocation(prog, 1, "texcoord");
+        glLinkProgram(prog);
+        GLint ok = 0;
+        glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+        if (!ok)
+            rt_fatal("metal: the present shader does not link");
+    }
+    static const float pos[12] = { -1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1 };
+    static const float uv[12] = { 0, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 0 };
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, 960, 544);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_BLEND);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glUseProgram(prog);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, t->gl);
+    glUniform1i(glGetUniformLocation(prog, "tex"), 0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glEnableVertexAttribArray(0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, pos);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, uv);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    dump_frame(t);
     vglSwapBuffers(GL_FALSE);
 #endif
     gpu_unlock();
@@ -1286,28 +1416,7 @@ void metal_present(uint64_t drawable)
     /* Metal layout (row 0 at the top) to the window (row 0 at the bottom) */
     glBlitFramebuffer(0, 0, (GLint)t->width, (GLint)t->height, 0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_LINEAR);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    /* MINA_DUMP=path: every 60th presented frame is written there (PPM, a
-     * quarter of the size; "%d" in the path numbers the files) */
-    static int frame;
-    const char *dump = getenv("MINA_DUMP");
-    if (dump && ++frame % 60 == 0) {
-        uint32_t W = t->width, H = t->height;
-        uint8_t *px = malloc((size_t)W * H * 4);
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, tex_fbo(t, 0));
-        glReadPixels(0, 0, (GLsizei)W, (GLsizei)H, GL_RGBA, GL_UNSIGNED_BYTE, px);
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-        char path[512];
-        snprintf(path, sizeof path, dump, frame / 60);
-        FILE *f = fopen(path, "wb");
-        if (f) {
-            fprintf(f, "P6 %u %u 255\n", W / 4, H / 4);
-            for (uint32_t y = 0; y + 4 <= H; y += 4)
-                for (uint32_t x = 0; x + 4 <= W; x += 4)
-                    fwrite(px + 4 * (y * W + x), 1, 3, f);
-            fclose(f);
-        }
-        free(px);
-    }
+    dump_frame(t);
     SDL_GL_SwapWindow(sdl_main_window());
     gpu_unlock();
 }

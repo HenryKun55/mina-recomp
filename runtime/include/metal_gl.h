@@ -62,6 +62,7 @@ typedef struct MTexture {
     uint32_t staging;        /* guest copy for CPU-visible textures (getBytes / replaceRegion) */
     int is_drawable;
     int is_rb;               /* a renderbuffer (Vita depth/stencil), not a texture */
+    uint32_t shift;          /* Vita: the GL texture is 2^shift times smaller (sampled only) */
 } MTexture;
 
 typedef struct MSampler {

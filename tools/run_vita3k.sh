@@ -18,6 +18,7 @@ DATA="$UX0/data/mina"
 
 [ -x "$VITA3K" ] || { echo "no Vita3K at $VITA3K" >&2; exit 1; }
 [ -f "$BUILD/mina.vpk" ] || { echo "no $BUILD/mina.vpk" >&2; exit 1; }
+[ "$BUILD/mina.vpk" -nt "$BUILD/mina" ] || { echo "$BUILD/mina.vpk is older than the binary (did the vpk step fail?)" >&2; exit 1; }
 
 mkdir -p "$APP" "$DATA"
 (cd "$APP" && rm -rf sce_sys && unzip -oq "$BUILD/mina.vpk" eboot.bin 'sce_sys/*')
