@@ -46,7 +46,9 @@ typedef struct Obj {
     Class *cls;
     int32_t refs;
     void *host;                  /* host_size bytes, zeroed */
+    int traced;                  /* debug: log its retains and releases */
 } Obj;
+void objc_trace_ref(Obj *o, const char *op);
 
 void objc_init(void);
 void objc_register(Class *cls);

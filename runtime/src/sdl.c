@@ -342,11 +342,16 @@ static uint64_t filter_fn, filter_ud;
 /* A host event, as the guest sees it (per-thread scratch). */
 static uint32_t guest_event(const SDL_Event *e)
 {
+#if defined(__vita__)
+#define scratch (host_tls()->scratch)
+#else
     static __thread uint32_t scratch;
+#endif
     if (!scratch)
         scratch = rt_alloc(64, 16);
     memcpy(G(scratch), e, sizeof *e);
     return scratch;
+#undef scratch
 }
 
 static Uint32 wake_event;

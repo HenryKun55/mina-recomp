@@ -65,8 +65,11 @@ void rt_call(Ctx *c, uint64_t addr)
         return;
     }
     GuestFn fn = cpu_lookup(a);
-    if (!fn)
+    if (!fn) {
+        /* the host code that asked for the jump (addr2line on the ELF) */
+        rt_log("rt_call from host %p\n", __builtin_return_address(0));
         rt_bad_jump(c, 0, addr);
+    }
     fn(c);
 }
 
@@ -153,16 +156,29 @@ void rt_bad_jump(Ctx *c, uint32_t pc, uint64_t target)
 }
 
 #if defined(__vita__)
-/* No terminal on the Vita: the log goes to ux0:data/mina/mina.log too. */
-static FILE *log_file(void)
+/* No terminal on the Vita: the log goes to ux0:data/mina/mina.log (sceIo
+ * directly, so it survives an abort). */
+#include <psp2/io/fcntl.h>
+static SceUID log_fd = -1;
+static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
+static void log_write(const char *fmt, va_list ap)
 {
-    static FILE *f;
-    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
-    pthread_mutex_lock(&lock);
-    if (!f)
-        f = fopen("ux0:data/mina/mina.log", "w");
-    pthread_mutex_unlock(&lock);
-    return f;
+    char buf[2048];
+    int n = vsnprintf(buf, sizeof buf, fmt, ap);
+    if (n < 0)
+        return;
+    if (n > (int)sizeof buf - 1)
+        n = (int)sizeof buf - 1;
+    /* opened and closed every time: what is written survives a crash */
+    pthread_mutex_lock(&log_lock);
+    int flags = SCE_O_WRONLY | SCE_O_CREAT | (log_fd < 0 ? SCE_O_TRUNC : SCE_O_APPEND);
+    SceUID fd = sceIoOpen("ux0:data/mina/mina.log", flags, 0666);
+    if (fd >= 0) {
+        sceIoWrite(fd, buf, (SceSize)n);
+        sceIoClose(fd);
+        log_fd = 1;
+    }
+    pthread_mutex_unlock(&log_lock);
 }
 #endif
 
@@ -173,13 +189,9 @@ void rt_log(const char *fmt, ...)
     vfprintf(stderr, fmt, ap);
     va_end(ap);
 #if defined(__vita__)
-    FILE *f = log_file();
-    if (f) {
-        va_start(ap, fmt);
-        vfprintf(f, fmt, ap);
-        va_end(ap);
-        fflush(f);
-    }
+    va_start(ap, fmt);
+    log_write(fmt, ap);
+    va_end(ap);
 #endif
 }
 
@@ -192,15 +204,11 @@ void rt_fatal(const char *fmt, ...)
     fprintf(stderr, "\n");
     va_end(ap);
 #if defined(__vita__)
-    FILE *f = log_file();
-    if (f) {
-        va_start(ap, fmt);
-        fprintf(f, "fatal: ");
-        vfprintf(f, fmt, ap);
-        fprintf(f, "\n");
-        va_end(ap);
-        fclose(f);
-    }
+    va_start(ap, fmt);
+    char msg[1024];
+    vsnprintf(msg, sizeof msg, fmt, ap);
+    va_end(ap);
+    rt_log("fatal: %s\n", msg);
 #endif
     abort();
 }

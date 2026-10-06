@@ -418,7 +418,8 @@ static int mkdir_p(const char *path)
 {
     char buf[1024];
     snprintf(buf, sizeof buf, "%s", path);
-    for (char *p = buf + 1; *p; p++) {
+    char *start = strchr(buf, ':');       /* "ux0:" is a device, not a directory */
+    for (char *p = start ? start + 2 : buf + 1; *p; p++) {
         if (*p == '/') {
             *p = 0;
             mkdir(buf, 0755);
@@ -521,9 +522,20 @@ typedef struct NSThr {
 } NSThr;
 static Class cls_NSThread;
 
+/* debug: the game's Thread ivars (fn, arg) through its ivar offset variables */
+static void thread_ivars(const char *when, uint64_t self)
+{
+    if (!g_trace_imports)
+        return;
+    int32_t ofn = (int32_t)rt_ld32(G(0x01e11184)), oarg = (int32_t)rt_ld32(G(0x01e11188));
+    rt_log("[thread] %s self %#llx fn@%d=%#llx arg@%d=%#llx\n", when, (unsigned long long)self, ofn,
+           (unsigned long long)rt_ld64(G(self + ofn)), oarg, (unsigned long long)rt_ld64(G(self + oarg)));
+}
+
 static void thread_body(Ctx *c, void *arg)
 {
     uint64_t self = (uint64_t)(uintptr_t)arg;
+    thread_ivars("running", self);
     objc_send(c, self, "main", 0);
     NSThr *t = objc_host(self);
     __atomic_store_n(&t->finished, 1, __ATOMIC_SEQ_CST);
@@ -533,6 +545,7 @@ static void t_setStackSize(Ctx *c) { ((NSThr *)objc_host(SELF))->stack_size = MA
 static void t_start(Ctx *c)
 {
     NSThr *t = objc_host(SELF);
+    thread_ivars("start", SELF);
     t->started = 1;
     objc_retain_obj(SELF);
     thread_spawn(thread_body, (void *)(uintptr_t)SELF, t->stack_size ? (uint32_t)t->stack_size : 512 * 1024);

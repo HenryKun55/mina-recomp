@@ -430,6 +430,17 @@ static void d_newBufferWithLength(Ctx *c)
     MBuffer *b = objc_host(o);
     b->length = (uint32_t)MARG(0);
     b->options = (uint32_t)MARG(1);
+    {
+        static int ntraced;
+        char bt[512];
+        if (b->length >= (1u << 20) && getenv("MINA_BUFTRACE") && ntraced < 3 &&
+            (guest_backtrace(bt, sizeof bt, 8), strstr(bt, getenv("MINA_BUFTRACE")))) {
+            ntraced++;
+            Obj *ob = objc_obj(o);
+            ob->traced = 1;
+            objc_trace_ref(ob, "new");
+        }
+    }
     /* MTLStorageModePrivate: GPU memory only (filled by blits), no guest copy */
     if ((b->options & 0xF0) == 0x20 && !getenv("MINA_NO_PRIVATE")) {
         b->gpu_only = 1;
@@ -945,11 +956,22 @@ static void d_newRenderPipelineState(Ctx *c)
 
 /* ---- buffers, textures, others: properties ------------------------------------------------- */
 
+uint32_t metal_buf_mem(MBuffer *b)
+{
+    if (!b->contents && !b->gpu_only) {
+        static int told;
+        if (told++ < 8)
+            rt_log("metal: a %u-byte buffer is used again after its upload\n", b->length);
+        b->contents = gcalloc(1, b->length ? b->length : 16);
+    }
+    return b->contents;
+}
+
 static void b_contents(Ctx *c)
 {
     MBuffer *b = objc_host(SELF);
     b->contents_asked++;
-    RET(b->contents);
+    RET(metal_buf_mem(b));
 }
 static void b_length(Ctx *c) { RET(((MBuffer *)objc_host(SELF))->length); }
 static void b_didModifyRange(Ctx *c) { (void)c; }
@@ -1116,6 +1138,8 @@ typedef struct MCmdBuf {
 
 static void q_commandBuffer(Ctx *c) { RET(objc_autorelease_obj(objc_new_object(&cls_CmdBuf))); }
 
+void block_release(Ctx *c, uint64_t block);
+
 static void cb_addCompletedHandler(Ctx *c)
 {
     MCmdBuf *cb = objc_host(SELF);
@@ -1143,7 +1167,7 @@ static void cb_commit(Ctx *c)
     }
     for (int i = 0; i < cb->nhandlers; i++) {
         block_call(c, cb->handlers[i], 1, self);
-        gfree((uint32_t)cb->handlers[i]);
+        block_release(c, cb->handlers[i]);
     }
     cb->nhandlers = 0;
 }

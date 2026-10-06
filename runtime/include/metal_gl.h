@@ -52,6 +52,9 @@ typedef struct MBuffer {
     uint8_t *shadow;         /* CPU copy of a small private buffer (index data) */
 } MBuffer;
 
+/* guest memory of a shared buffer (given back after a whole-buffer upload: made again on use) */
+uint32_t metal_buf_mem(MBuffer *b);
+
 typedef struct MTexture {
     uint32_t type, format, width, height, depth, mips, samples, usage, storage;
     GLuint gl;

@@ -21,8 +21,32 @@ static uint32_t guest_strv(int n, char **v)
 int sceUserMainThreadStackSize = 8 * 1024 * 1024;
 #endif
 
+#if defined(__vita__)
+/* No environment on the Vita: ux0:data/mina/env.txt holds KEY=VALUE lines
+ * (MINA_TRACE, MINA_MEMSTAT, ...). */
+static void load_env_file(void)
+{
+    FILE *f = fopen("ux0:data/mina/env.txt", "r");
+    if (!f)
+        return;
+    char line[512];
+    while (fgets(line, sizeof line, f)) {
+        line[strcspn(line, "\r\n")] = 0;
+        char *eq = strchr(line, '=');
+        if (line[0] == '#' || !eq)
+            continue;
+        *eq = 0;
+        setenv(line, eq + 1, 1);
+    }
+    fclose(f);
+}
+#endif
+
 int main(int argc, char **argv)
 {
+#if defined(__vita__)
+    load_env_file();
+#endif
     const char *exe = getenv("MINA_EXE");
     if (!exe)
 #if defined(__vita__)
@@ -41,6 +65,12 @@ int main(int argc, char **argv)
     objc_init();
 
     Ctx *c = threads_main_ctx(8u << 20);
+    if (g_trace_imports) {
+        void *probe = malloc(16);
+        rt_log("[mem] g_mem %p, heap probe %p, main host sp %p, main ctx %p, guest stack %#x..%#x\n",
+               (void *)g_mem, probe, (void *)&c, (void *)c, c->stack_lo, c->stack_hi);
+        free(probe);
+    }
 
     /* guest argv[0] is the executable inside the bundle, as on macOS */
     char *gargs[16];

@@ -21,7 +21,32 @@ uint8_t *g_mem;
  * Pointers are 32-bit, so every host pointer p is the guest address
  * p - g_mem (mod 2^32): the guest heap is newlib's malloc. */
 #include <malloc.h>
-int _newlib_heap_size_user = 300 * 1024 * 1024;
+/* with the extended memory mode (ATTRIBUTE2=12 in param.sfo) */
+int _newlib_heap_size_user = 330 * 1024 * 1024;
+
+#include <pthread.h>
+#include <unistd.h>
+static uint32_t image_end;
+static void *lowguard_thread(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        usleep(20000);
+        const uint32_t *w = (const uint32_t *)g_mem;
+        for (uint32_t i = GUEST_NULL_GUARD / 4; i < GUEST_IMAGE_BASE / 4; i++) {
+            if (w[i] != 0xA5A5A5A5u) {
+                rt_log("[lowguard] guest %#x written: %#x %#x %#x %#x\n", i * 4, w[i], w[i + 1], w[i + 2], w[i + 3]);
+                /* report each run once */
+                uint32_t j = i;
+                while (j < GUEST_IMAGE_BASE / 4 && w[j] != 0xA5A5A5A5u)
+                    ((uint32_t *)g_mem)[j++] = 0xA5A5A5A5u;
+                rt_log("[lowguard]   %u bytes\n", (j - i) * 4);
+                i = j;
+            }
+        }
+    }
+    return NULL;
+}
 
 void mem_init(void)
 {
@@ -29,6 +54,19 @@ void mem_init(void)
     for (uint32_t k = 0; k < g_segment_count; k++)
         if (g_segments[k].addr + g_segments[k].size > end)
             end = g_segments[k].addr + g_segments[k].size;
+    image_end = end;
+    /* MINA_LOWGUARD: guest addresses below the image are a block of their own
+     * (else they are this executable), filled with a pattern and watched */
+    if (getenv("MINA_LOWGUARD")) {
+        uint8_t *all = memalign(16384, end);
+        if (!all)
+            rt_fatal("cannot allocate the image and the low guard (%u bytes)", end);
+        g_mem = all;
+        memset(all, 0xA5, GUEST_IMAGE_BASE);
+        pthread_t t;
+        pthread_create(&t, NULL, lowguard_thread, NULL);
+        return;
+    }
     uint8_t *block = memalign(16384, end - GUEST_IMAGE_BASE);
     if (!block)
         rt_fatal("cannot allocate the image (%u bytes)", end - GUEST_IMAGE_BASE);
@@ -58,9 +96,21 @@ uint32_t gmalloc(uint64_t size)
     heap_in_use += malloc_usable_size(p);
     return guest_addr(p);
 }
+/* heap blocks are never below the end of the image (that is the runtime area,
+ * this executable, or the image): newlib would take such a block in */
+static int not_heap(uint32_t a, const char *what)
+{
+    if (a >= image_end)
+        return 0;
+    static int told;
+    if (told++ < 20)
+        rt_log("%s of a non-heap pointer %#x ignored\n", what, a);
+    return 1;
+}
+
 void gfree(uint32_t a)
 {
-    if (!a)
+    if (!a || not_heap(a, "free"))
         return;
     heap_in_use -= malloc_usable_size(G(a));
     free(G(a));
@@ -83,6 +133,8 @@ uint32_t grealloc(uint32_t a, uint64_t size)
         gfree(a);
         return 0;
     }
+    if (not_heap(a, "realloc"))
+        rt_fatal("realloc of a non-heap pointer %#x", a);
     size_t old = malloc_usable_size(G(a));
     uint32_t b = gmalloc(size);
     if (!b)
@@ -94,8 +146,11 @@ uint32_t grealloc(uint32_t a, uint64_t size)
 uint32_t gmemalign(uint64_t align, uint64_t size)
 {
     void *p = memalign((size_t)align, (size_t)size);
-    if (!p)
+    if (!p) {
+        rt_log("guest heap: %llu bytes aligned to %llu not available\n", (unsigned long long)size,
+               (unsigned long long)align);
         return 0;
+    }
     heap_in_use += malloc_usable_size(p);
     return guest_addr(p);
 }
@@ -114,6 +169,8 @@ void mem_report(void)
 
 #else
 
+static int strict_mem;
+
 void mem_init(void)
 {
     void *p = mmap(NULL, 0x100000000ull, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -126,6 +183,21 @@ void mem_init(void)
         rt_fatal("cannot map the guest address space");
     /* the lazy-bank window is never memory: a stray access faults */
     mprotect(g_mem + 0x40000000u, 0x60000000u, PROT_NONE);
+    /* MINA_STRICTMEM: only what is allocated is memory, as on the Vita, where
+     * any other guest address is some host memory */
+    if (getenv("MINA_STRICTMEM")) {
+        uint32_t end = GUEST_IMAGE_BASE;
+        for (uint32_t k = 0; k < g_segment_count; k++)
+            if (g_segments[k].addr + g_segments[k].size > end)
+                end = g_segments[k].addr + g_segments[k].size;
+        end = (end + 16383u) & ~16383u;
+        /* the runtime area comes from the heap (as on the Vita, where these
+         * guest addresses are the executable itself) */
+        mprotect(g_mem + GUEST_NULL_GUARD, GUEST_RT_END - GUEST_NULL_GUARD, PROT_NONE);
+        mprotect(g_mem + end, 0x40000000u - end, PROT_NONE);
+        mprotect(g_mem + HEAP_BASE, HEAP_END - HEAP_BASE, PROT_NONE);
+        strict_mem = 1;
+    }
 }
 
 /* ---- runtime area -------------------------------------------------------- */
@@ -135,6 +207,11 @@ static uint32_t rt_top = GUEST_THUNK_END;
 
 uint32_t rt_alloc(uint32_t size, uint32_t align)
 {
+    if (strict_mem) {
+        uint32_t a = gmemalign(align, size);
+        memset(G(a), 0, size);
+        return a;
+    }
     pthread_mutex_lock(&rt_lock);
     uint32_t a = (rt_top + align - 1) & ~(align - 1);
     if (a + size > GUEST_RT_END)
@@ -163,10 +240,65 @@ typedef struct BlockHdr {
 /* MINA_HEAPMAP: live bytes per allocating site (host return addresses of the
  * generated functions above malloc), reported by mem_report. */
 #include <dlfcn.h>
+#include <unistd.h>
 #define SITES 4096
 static struct { void *pc; int64_t bytes; int64_t count; } sites[SITES];
 static uint32_t *block_site;       /* per 16-byte heap granule: site index + 1 */
 static int heapmap = -1;
+
+/* the live blocks of 1 MiB and more, with the guest call chain that made them */
+static struct { uint32_t a; uint64_t size; char *chain; } bigs[65536];
+static int nbigs;
+
+static void big_add(uint32_t a, uint64_t size)
+{
+    char bt[512];
+    guest_backtrace(bt, sizeof bt, 5);
+    for (int i = 0; i < nbigs; i++)
+        if (!bigs[i].a) {
+            bigs[i].a = a; bigs[i].size = size; bigs[i].chain = strdup(bt);
+            return;
+        }
+    if (nbigs < 65536) {
+        bigs[nbigs].a = a; bigs[nbigs].size = size; bigs[nbigs].chain = strdup(bt);
+        nbigs++;
+    }
+}
+static void big_remove(uint32_t a)
+{
+    for (int i = 0; i < nbigs; i++)
+        if (bigs[i].a == a) {
+            bigs[i].a = 0;
+            free(bigs[i].chain);
+            return;
+        }
+}
+static void bigs_report(void)
+{
+    /* totals per chain, biggest first */
+    static struct { const char *chain; uint64_t bytes; int n; } t[65536];
+    int nt = 0;
+    for (int i = 0; i < nbigs; i++) {
+        if (!bigs[i].a)
+            continue;
+        int k = 0;
+        while (k < nt && strcmp(t[k].chain, bigs[i].chain))
+            k++;
+        if (k == nt) { t[nt].chain = bigs[i].chain; t[nt].bytes = 0; t[nt].n = 0; nt++; }
+        t[k].bytes += bigs[i].size;
+        t[k].n++;
+    }
+    for (int r = 0; r < 30; r++) {
+        int best = -1;
+        for (int k = 0; k < nt; k++)
+            if (t[k].bytes && (best < 0 || t[k].bytes > t[best].bytes))
+                best = k;
+        if (best < 0)
+            break;
+        rt_log("[big] %7.1f MiB %4d x %s\n", t[best].bytes / 1048576.0, t[best].n, t[best].chain);
+        t[best].bytes = 0;
+    }
+}
 
 static int site_of(void *pc)
 {
@@ -185,6 +317,16 @@ static int site_of(void *pc)
 
 static pthread_mutex_t heap_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t heap_top = HEAP_BASE;
+static uint32_t heap_mapped = HEAP_BASE;   /* MINA_STRICTMEM: heap memory ends here */
+
+static void heap_map(void)
+{
+    if (strict_mem && heap_top > heap_mapped) {
+        uint32_t to = (heap_top + (1u << 20) - 1) & ~((1u << 20) - 1);
+        mprotect(g_mem + heap_mapped, to - heap_mapped, PROT_READ | PROT_WRITE);
+        heap_mapped = to;
+    }
+}
 static __thread int last_fresh;     /* the last gmalloc came from untouched (zero) memory */
 static uint32_t free_list[NCLASS];
 static uint64_t heap_in_use;
@@ -213,9 +355,82 @@ static uint64_t class_cap(uint32_t cls)
     return base + k * (base / 4);
 }
 
+/* MINA_HEAPCHECK: every block gets at least 16 canary bytes after its
+ * requested size, checked when it is freed or reallocated (overruns that the
+ * class rounding hides here corrupt newlib's heap on the Vita). */
+#define CANARY 0xFDu
+static int heapcheck = -1;
+
+static void canary_set(uint32_t a, uint64_t size, uint64_t cap)
+{
+    memset(G(a + (uint32_t)size), CANARY, (size_t)(cap - size));
+}
+
+static void canary_check(uint32_t a, const char *what)
+{
+    BlockHdr *h = G(a - HDR);
+    uint64_t cap = class_cap(h->cls);
+    const uint8_t *p = G(a);
+    for (uint64_t i = h->size; i < cap; i++) {
+        if (p[i] != CANARY) {
+            char bt[512];
+            guest_backtrace(bt, sizeof bt, 8);
+            rt_log("[heapcheck] %s %#x: block of %llu written at +%llu (%#x) [%s]\n", what, a,
+                   (unsigned long long)h->size, (unsigned long long)i, p[i], bt);
+            return;
+        }
+    }
+}
+
+static uint32_t heap_top;
+static pthread_mutex_t heap_lock;
+
+/* walks the heap every second and checks the canaries of the live blocks */
+static void *heapcheck_thread(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        sleep(1);
+        pthread_mutex_lock(&heap_lock);
+        for (uint32_t blk = HEAP_BASE; blk < heap_top;) {
+            BlockHdr *h = G(blk);
+            if (h->magic != MAGIC_USED && h->magic != MAGIC_FREE) {
+                rt_log("[heapcheck] heap walk lost at %#x\n", blk);
+                break;
+            }
+            uint64_t cap = class_cap(h->cls);
+            if (h->magic == MAGIC_USED) {
+                const uint8_t *p = G(blk + HDR);
+                for (uint64_t i = h->size; i < cap; i++) {
+                    if (p[i] != CANARY) {
+                        rt_log("[heapcheck] live block %#x of %llu written at +%llu (%#x)\n", blk + HDR,
+                               (unsigned long long)h->size, (unsigned long long)i, p[i]);
+                        memset(G(blk + HDR + (uint32_t)h->size), CANARY, (size_t)(cap - h->size));
+                        break;
+                    }
+                }
+            }
+            blk += HDR + (uint32_t)cap;
+        }
+        pthread_mutex_unlock(&heap_lock);
+    }
+    return NULL;
+}
+
 uint32_t gmalloc(uint64_t size)
 {
     uint64_t cap;
+    if (heapcheck < 0) {
+        heapcheck = getenv("MINA_HEAPCHECK") != NULL;
+        if (heapcheck) {
+            pthread_t t;
+            pthread_create(&t, NULL, heapcheck_thread, NULL);
+        }
+    }
+        heapcheck = getenv("MINA_HEAPCHECK") != NULL;
+    uint64_t want = size;
+    if (heapcheck)
+        size += 16;
     if (size > 0x40000000ull)
         return 0;
     uint32_t cls = class_of(size, &cap);
@@ -228,7 +443,7 @@ uint32_t gmalloc(uint64_t size)
         if (h->magic != MAGIC_FREE)
             rt_fatal("guest heap corrupted at %#x", a);
         h->magic = MAGIC_USED;
-        h->size = size;
+        h->size = want;
     } else {
         uint32_t blk = heap_top;
         if ((uint64_t)blk + HDR + cap > HEAP_END) {
@@ -237,12 +452,15 @@ uint32_t gmalloc(uint64_t size)
             return 0;
         }
         heap_top = blk + HDR + (uint32_t)cap;
+        heap_map();
         BlockHdr *h = G(blk);
         h->cls = cls;
         h->magic = MAGIC_USED;
-        h->size = size;
+        h->size = want;
         a = blk + HDR;
     }
+    if (heapcheck)
+        canary_set(a, want, cap);
     heap_in_use += cap;
     if (heapmap < 0)
         heapmap = getenv("MINA_HEAPMAP") != NULL;
@@ -258,6 +476,8 @@ uint32_t gmalloc(uint64_t size)
         sites[si].bytes += (int64_t)cap;
         sites[si].count++;
         block_site[(a - HEAP_BASE) / 16] = (uint32_t)si + 1;
+        if (want >= (64u << 10))
+            big_add(a, want);
     }
     pthread_mutex_unlock(&heap_lock);
     return a;
@@ -272,6 +492,8 @@ void gfree(uint32_t a)
         a = (uint32_t)h->size;
         h = G(a - HDR);
     }
+    if (heapcheck > 0 && h->magic == MAGIC_USED)
+        canary_check(a, "free");
     pthread_mutex_lock(&heap_lock);
     if (h->magic != MAGIC_USED)
         rt_fatal("free of a non-heap or freed pointer %#x", a);
@@ -283,6 +505,8 @@ void gfree(uint32_t a)
             sites[si - 1].count--;
             block_site[(a - HEAP_BASE) / 16] = 0;
         }
+        if (class_cap(h->cls) >= (64u << 10))
+            big_remove(a);
     }
     *(uint32_t *)G(a) = free_list[h->cls];
     free_list[h->cls] = a;
@@ -315,6 +539,7 @@ uint32_t gmalloc_fresh(uint64_t size)
     pthread_mutex_lock(&heap_lock);
     uint32_t a = (heap_top + 16383u) & ~16383u;
     heap_top = a + (uint32_t)((size + 16383u) & ~16383ull);
+    heap_map();
     pthread_mutex_unlock(&heap_lock);
     return a;
 }
@@ -330,8 +555,12 @@ uint32_t grealloc(uint32_t a, uint64_t size)
     BlockHdr *h = G(a - HDR);
     if (h->magic != MAGIC_USED)
         rt_fatal("realloc of a non-heap pointer %#x", a);
-    if (size <= class_cap(h->cls)) {
+    if (heapcheck > 0)
+        canary_check(a, "realloc");
+    if (size + (heapcheck > 0 ? 16 : 0) <= class_cap(h->cls)) {
         h->size = size;
+        if (heapcheck > 0)
+            canary_set(a, size, class_cap(h->cls));
         return a;
     }
     uint32_t b = gmalloc(size);
@@ -383,6 +612,9 @@ void mem_report(void)
     void metal_buffers_report(void);
     metal_buffers_report();
     if (heapmap > 0) {
+        pthread_mutex_lock(&heap_lock);
+        bigs_report();
+        pthread_mutex_unlock(&heap_lock);
         /* the 12 biggest sites */
         int order[12] = { 0 };
         int64_t best[12] = { 0 };

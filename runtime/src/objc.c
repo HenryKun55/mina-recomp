@@ -353,7 +353,8 @@ static CacheEnt *cache[8192];
 static int cached_lookup(Class *k, int meta, uint32_t sel, Imp *out)
 {
     uint32_t h = (uint32_t)(((uintptr_t)k >> 4) * 31u + sel * 2654435761u + (uint32_t)meta) & 8191;
-    for (CacheEnt *e = cache[h]; e; e = e->next)
+    /* lock-free readers: entries are published with release, read with acquire */
+    for (CacheEnt *e = __atomic_load_n(&cache[h], __ATOMIC_ACQUIRE); e; e = e->next)
         if (e->cls == k && e->sel == sel && e->meta == meta) {
             *out = e->imp;
             return out->host || out->guest;
@@ -367,7 +368,7 @@ static int cached_lookup(Class *k, int meta, uint32_t sel, Imp *out)
     e->meta = meta;
     e->imp = imp;
     e->next = cache[h];
-    cache[h] = e;
+    __atomic_store_n(&cache[h], e, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&objc_lock);
     *out = imp;
     return found;
@@ -390,7 +391,8 @@ static void dispatch(Ctx *c, Class *k, int meta, uint32_t sel)
         return;
     }
     if (!cached_lookup(k, meta, sel, &imp)) {
-        rt_log("objc: unrecognized selector %c[%s %s]\n", meta ? '+' : '-', k->name, gstr(sel));
+        rt_log("objc: unrecognized selector %c[%s %s] (sel %#x, receiver %#llx)\n", meta ? '+' : '-', k->name,
+               gstr(sel), sel, (unsigned long long)c->x[0]);
         nil_result(c);
         return;
     }
@@ -489,22 +491,57 @@ uint64_t block_call(Ctx *c, uint64_t block, int nargs, ...)
 /* Block_copy: blocks built on the stack are copied to the heap before they
  * outlive their frame. Layout: isa, flags (i32), reserved, invoke, descriptor
  * {reserved, size, copy helper, dispose helper}. */
+#define BLOCK_REFCOUNT_MASK 0xfffeu
+#define BLOCK_NEEDS_FREE (1u << 24)
+#define BLOCK_HAS_COPY_DISPOSE (1u << 25)
+#define BLOCK_IS_GLOBAL (1u << 28)
+
+/* Heap copies are reference counted in their flags (2 per reference, as in
+ * libclosure): copying one again only counts it, releasing the last reference
+ * runs the dispose helper (which releases what the block captured). */
 uint64_t block_copy(Ctx *c, uint64_t block)
 {
     if (!block)
         return 0;
-    uint32_t flags = rt_ld32(G(block + 8));
+    uint32_t *fl = G(block + 8);
+    uint32_t flags = __atomic_load_n(fl, __ATOMIC_ACQUIRE);
+    if (flags & BLOCK_IS_GLOBAL)
+        return block;
+    if (flags & BLOCK_NEEDS_FREE) {
+        __atomic_add_fetch(fl, 2, __ATOMIC_SEQ_CST);
+        return block;
+    }
     uint64_t desc = rt_ld64(G(block + 24));
     uint64_t size = rt_ld64(G(desc + 8));
     if (size < 32 || size > 4096)
         rt_fatal("block_copy: odd block size %llu", (unsigned long long)size);
     uint32_t heap = gmalloc(size);
     memcpy(G(heap), G(block), size);
-    if (flags & (1u << 25)) {                 /* BLOCK_HAS_COPY_DISPOSE */
+    rt_st32(G(heap + 8), (flags & ~BLOCK_REFCOUNT_MASK) | BLOCK_NEEDS_FREE | 2);
+    if (flags & BLOCK_HAS_COPY_DISPOSE) {
         uint64_t copy = rt_ld64(G(desc + 16));
         guest_call(c, copy, 2, (uint64_t)heap, block);
     }
     return heap;
+}
+
+void block_release(Ctx *c, uint64_t block)
+{
+    if (!block)
+        return;
+    uint32_t *fl = G(block + 8);
+    uint32_t flags = __atomic_load_n(fl, __ATOMIC_ACQUIRE);
+    if (!(flags & BLOCK_NEEDS_FREE))
+        return;                               /* global or stack block */
+    if ((__atomic_sub_fetch(fl, 2, __ATOMIC_SEQ_CST) & BLOCK_REFCOUNT_MASK) != 0)
+        return;
+    if (flags & BLOCK_HAS_COPY_DISPOSE) {
+        uint64_t desc = rt_ld64(G(block + 24));
+        uint64_t dispose = rt_ld64(G(desc + 24));
+        if (dispose)
+            guest_call(c, dispose, 1, block);
+    }
+    gfree((uint32_t)block);
 }
 
 /* ---- objects ---------------------------------------------------------------------- */
@@ -554,11 +591,21 @@ void *objc_host(uint64_t a)
     return o ? o->host : NULL;
 }
 
+void objc_trace_ref(Obj *o, const char *op)
+{
+    char bt[512];
+    guest_backtrace(bt, sizeof bt, 4);
+    rt_log("[ref] %s %#x %s -> %d: %s\n", op, o->addr, o->cls->name, o->refs, bt);
+}
+
 uint64_t objc_retain_obj(uint64_t a)
 {
     Obj *o = objc_obj(a);
-    if (o)
+    if (o) {
         __atomic_add_fetch(&o->refs, 1, __ATOMIC_SEQ_CST);
+        if (o->traced)
+            objc_trace_ref(o, "retain");
+    }
     return a;
 }
 
@@ -573,6 +620,8 @@ void objc_release_obj(uint64_t a)
     Obj *o = objc_obj(a);
     if (!o)
         return;
+    if (o->traced)
+        objc_trace_ref(o, "release");
     if (__atomic_sub_fetch(&o->refs, 1, __ATOMIC_SEQ_CST) == 0)
         destroy(thread_ctx(), a);
 }
@@ -597,13 +646,22 @@ static void m_dealloc(Ctx *c)
 
 /* ---- autorelease pools (per thread) --------------------------------------------- */
 
+#if defined(__vita__)
+#define pool (host_tls()->pool)
+#define pool_n (host_tls()->pool_n)
+#define pool_cap (host_tls()->pool_cap)
+#else
 static __thread uint64_t *pool;
 static __thread uint32_t pool_n, pool_cap;
+#endif
 
 uint64_t objc_autorelease_obj(uint64_t a)
 {
     if (!a)
         return 0;
+    Obj *to = objc_obj(a);
+    if (to && to->traced)
+        objc_trace_ref(to, "autorelease");
     if (pool_n == pool_cap) {
         pool_cap = pool_cap ? pool_cap * 2 : 256;
         pool = realloc(pool, pool_cap * sizeof *pool);

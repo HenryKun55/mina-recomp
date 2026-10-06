@@ -8,6 +8,8 @@ if(VITA)
   set(VITA_APP_NAME "Mina the Hollower")
   set(VITA_TITLEID "MINA00001")
   set(VITA_VERSION "00.01")
+  # ATTRIBUTE2=12: the extended memory mode (about 109 MiB more main memory)
+  set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d ATTRIBUTE2=12")
 endif()
 
 set(CMAKE_C_STANDARD 11)

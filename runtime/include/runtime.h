@@ -106,6 +106,21 @@ uint32_t tls_block(Ctx *c);
 
 extern int g_trace_imports;
 void rt_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+void guest_backtrace(char *out, size_t cap, int max);
+
+#if defined(__vita__)
+/* The runtime's per-thread state. On the Vita __thread is one global copy
+ * (libgcc's emutls finds no threads), so it lives behind a pthread key. */
+typedef struct HostTls {
+    struct Ctx *ctx;            /* threads.c */
+    int lazy_pending;           /* libc.c, -1 when none */
+    uint32_t err;               /* libc.c: the guest errno cell */
+    uint32_t scratch;           /* sdl.c: guest copy of an event */
+    uint64_t *pool;             /* objc.c: autorelease pool */
+    uint32_t pool_n, pool_cap;
+} HostTls;
+HostTls *host_tls(void);
+#endif   /* guest functions on the host stack */
 void rt_fatal(const char *fmt, ...) __attribute__((format(printf, 1, 2), noreturn));
 
 #endif

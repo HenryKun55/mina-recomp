@@ -18,7 +18,46 @@ typedef struct GThread {
     int detached;
 } GThread;
 
+#if defined(__vita__)
+#define tl_ctx (host_tls()->ctx)
+
+static pthread_key_t tls_key;
+static pthread_once_t tls_once = PTHREAD_ONCE_INIT;
+
+static void tls_free(void *p)
+{
+    HostTls *t = p;
+    free(t->pool);
+    if (t->err)
+        free(G(t->err));
+    if (t->scratch)
+        free(G(t->scratch));
+    free(t);
+}
+static void tls_init(void) { pthread_key_create(&tls_key, tls_free); }
+
+HostTls *host_tls(void)
+{
+    pthread_once(&tls_once, tls_init);
+    HostTls *t = pthread_getspecific(tls_key);
+    if (!t) {
+        t = calloc(1, sizeof *t);
+        t->lazy_pending = -1;
+        pthread_setspecific(tls_key, t);
+    }
+    return t;
+}
+#else
 static __thread Ctx *tl_ctx;
+#endif
+
+/* Host stack of a guest thread: the recompiled functions keep the guest
+ * registers in C locals, and on the Vita every 64-bit register is two. */
+#if defined(__vita__)
+#define HOST_STACK (4 * 1024 * 1024)
+#else
+#define HOST_STACK (2 * 1024 * 1024)
+#endif
 
 Ctx *thread_ctx(void) { return tl_ctx; }
 
@@ -45,10 +84,11 @@ static void imp_tlv_bootstrap(Ctx *c)
 
 /* ---- threads -------------------------------------------------------------- */
 
-/* Guest stacks: the engine asks for ~10 MiB per thread and touches well under
- * 1 MiB in all of them together; the Vita gets 1 MiB each. */
+/* Guest stacks: the engine asks for 256 KiB to 8 MiB per thread (~14 MiB in
+ * all); the Vita gets what is asked up to 8 MiB. A smaller stack overflows
+ * into the heap below it, where its own Ctx lives. */
 #if defined(__vita__)
-#define GUEST_STACK_CAP (1u << 20)
+#define GUEST_STACK_CAP (8u << 20)
 #else
 #define GUEST_STACK_CAP (64u << 20)
 #endif
@@ -56,6 +96,8 @@ static void imp_tlv_bootstrap(Ctx *c)
 static Ctx *new_ctx(uint32_t stack_size)
 {
     Ctx *c = calloc(1, sizeof *c);
+    if (g_trace_imports)
+        rt_log("[thread] guest stack of %u KiB asked\n", stack_size >> 10);
     if (stack_size > GUEST_STACK_CAP)
         stack_size = GUEST_STACK_CAP;
     uint32_t lo = gmemalign(64, stack_size);
@@ -100,7 +142,14 @@ static GThread *thread_of_id(uint64_t id)
 static void *thread_main(void *p)
 {
     GThread *t = p;
+    if (tl_ctx)
+        rt_log("[thread] new host thread already has a ctx %p (stale TLS)\n", (void *)tl_ctx);
     tl_ctx = t->ctx;
+    if (g_trace_imports)
+        rt_log("[thread] %u (pthread) host sp %p, guest stack %#x..%#x (host %p), ctx %p\n", t->ctx->thread_id,
+               (void *)&t, t->ctx->stack_lo, t->ctx->stack_hi, G(t->ctx->stack_lo), (void *)t->ctx);
+    if (!t->start)
+        rt_log("pthread_create with a null start routine (arg %#x)\n", t->arg);
     t->result = guest_call(t->ctx, t->start, 1, (uint64_t)t->arg);
     return NULL;
 }
@@ -118,7 +167,12 @@ typedef struct HostJob {
 static void *host_job_main(void *p)
 {
     HostJob *j = p;
+    if (tl_ctx)
+        rt_log("[thread] new host thread already has a ctx %p (stale TLS)\n", (void *)tl_ctx);
     tl_ctx = j->t->ctx;
+    if (g_trace_imports)
+        rt_log("[thread] %u host sp %p, guest stack %#x..%#x (host %p), ctx %p\n", j->t->ctx->thread_id,
+               (void *)&j, j->t->ctx->stack_lo, j->t->ctx->stack_hi, G(j->t->ctx->stack_lo), (void *)j->t->ctx);
     j->fn(j->t->ctx, j->arg);
     free(j);
     return NULL;
@@ -143,7 +197,7 @@ uint32_t thread_spawn(void (*fn)(Ctx *, void *), void *arg, uint32_t stack_size)
     j->t = t;
     pthread_attr_t ha;
     pthread_attr_init(&ha);
-    pthread_attr_setstacksize(&ha, 2 * 1024 * 1024);
+    pthread_attr_setstacksize(&ha, HOST_STACK);
     pthread_attr_setdetachstate(&ha, PTHREAD_CREATE_DETACHED);
     pthread_create(&t->host, &ha, host_job_main, j);
     pthread_attr_destroy(&ha);
@@ -184,6 +238,8 @@ static void imp_pthread_attr_setdetachstate(Ctx *c) { rt_st32(G(A0 + 16), (uint3
 
 static void imp_pthread_create(Ctx *c)
 {
+    if (g_trace_imports)
+        rt_log("pthread_create(start %#llx, arg %#llx)\n", (unsigned long long)A2, (unsigned long long)A3);
     uint32_t out = (uint32_t)A0, attr = (uint32_t)A1;
     uint64_t stack = 512 * 1024;
     int detached = 0;
@@ -207,7 +263,7 @@ static void imp_pthread_create(Ctx *c)
     t->ctx->thread_id = rt_ld32(G(t->id));
     pthread_attr_t ha;
     pthread_attr_init(&ha);
-    pthread_attr_setstacksize(&ha, 2 * 1024 * 1024);   /* host frames of the recompiled code */
+    pthread_attr_setstacksize(&ha, HOST_STACK);   /* host frames of the recompiled code */
     if (detached)
         pthread_attr_setdetachstate(&ha, PTHREAD_CREATE_DETACHED);
     int r = pthread_create(&t->host, &ha, thread_main, t);
@@ -486,6 +542,7 @@ typedef struct AsyncJob {
 } AsyncJob;
 
 static void group_leave(uint32_t g);
+void block_release(Ctx *c, uint64_t block);
 
 static void *async_main(void *p)
 {
@@ -496,14 +553,26 @@ static void *async_main(void *p)
     t->id = rt_alloc(64, 16);
     rt_st64(G(t->id + 8), (uint64_t)(uintptr_t)t);
     c->thread = t;
+    if (tl_ctx)
+        rt_log("[thread] new host thread already has a ctx %p (stale TLS)\n", (void *)tl_ctx);
     tl_ctx = c;
-    if (j->block)
+    if (j->block) {
         run_block(c, j->block);
-    else
+        block_release(c, j->block);
+    } else {
+        if (!j->fn)
+            rt_log("async job without a block or function\n");
         guest_call(c, j->fn, 1, (uint64_t)j->ctx);
+    }
     if (j->group)
         group_leave(j->group);
     free(j);
+    /* one host thread per job: its guest stack and context go with it */
+    tl_ctx = NULL;
+    gfree(c->stack_lo);
+    rt_st64(G(t->id + 8), 0);
+    free(c);
+    free(t);
     return NULL;
 }
 
@@ -512,7 +581,7 @@ static void spawn_job(AsyncJob *j)
     pthread_t th;
     pthread_attr_t ha;
     pthread_attr_init(&ha);
-    pthread_attr_setstacksize(&ha, 2 * 1024 * 1024);
+    pthread_attr_setstacksize(&ha, HOST_STACK);
     pthread_attr_setdetachstate(&ha, PTHREAD_CREATE_DETACHED);
     pthread_create(&th, &ha, async_main, j);
     pthread_attr_destroy(&ha);
@@ -537,11 +606,12 @@ void mainq_drain(Ctx *c)
         memmove(mainq, mainq + 1, (size_t)(--mainq_n) * sizeof mainq[0]);
         pthread_mutex_unlock(&mainq_lock);
         run_block(c, b);
-        gfree(b);
+        block_release(c, b);
     }
 }
 
 uint64_t block_copy(Ctx *c, uint64_t block);
+void block_release(Ctx *c, uint64_t block);
 
 static void imp_dispatch_async(Ctx *c)
 {

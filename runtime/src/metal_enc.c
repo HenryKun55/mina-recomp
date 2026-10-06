@@ -206,7 +206,7 @@ static const uint8_t *binding_data(const Binding *b, uint32_t *avail)
         return NULL;
     }
     *avail = b->buf->length > b->offset ? b->buf->length - b->offset : 0;
-    return G(b->buf->contents + b->offset);
+    return G(metal_buf_mem(b->buf) + b->offset);
 }
 
 static void re_setVertexBuffer(Ctx *c) { set_binding(&((REnc *)objc_host(SELF))->vb[MARG(2) % MAX_VBUF], MARG(0), (uint32_t)MARG(1)); }
@@ -541,7 +541,7 @@ static void draw_indexed(Ctx *c, uint32_t instances)
     if (!count || !instances || !ib)
         return;
     uint32_t isz = type ? 4 : 2;
-    const uint8_t *idx = ib->gpu_only ? (ib->shadow ? ib->shadow + off : NULL) : G(ib->contents + off);
+    const uint8_t *idx = ib->gpu_only ? (ib->shadow ? ib->shadow + off : NULL) : G(metal_buf_mem(ib) + off);
     uint32_t maxv = UINT32_MAX;          /* unknown: shared vertex buffers go up whole */
     if (idx) {
         maxv = 0;
@@ -633,7 +633,7 @@ static void be_copyBufferToTexture(Ctx *c)
     uint32_t slice = (uint32_t)rt_ld64(G(sp)), level = (uint32_t)rt_ld64(G(sp + 8));
     uint64_t origin = rt_ld64(G(sp + 16));
     metal_tex_upload(t, (uint32_t)rt_ld64(G(origin)), (uint32_t)rt_ld64(G(origin + 8)), (uint32_t)rt_ld64(G(size)),
-                     (uint32_t)rt_ld64(G(size + 8)), level, slice, G(b->contents + (uint32_t)MARG(1)),
+                     (uint32_t)rt_ld64(G(size + 8)), level, slice, G(metal_buf_mem(b) + (uint32_t)MARG(1)),
                      (uint32_t)MARG(2));
 }
 
@@ -690,10 +690,16 @@ static void be_copyBuffer(Ctx *c)
             rt_log("metal: copy from a private buffer is not supported\n");
         return;
     }
-    if (d->gpu_only)
-        gpu_buffer_write(d, dof, G(s->contents + so), n);
-    else
-        memmove(G(d->contents + dof), G(s->contents + so), n);
+    if (d->gpu_only) {
+        gpu_buffer_write(d, dof, G(metal_buf_mem(s) + so), n);
+        /* A whole staging buffer uploaded to GPU memory: the game never reads
+         * it again (tile levels even keep them all), so its memory goes now. */
+        if (so == 0 && n == s->length && !s->fresh) {
+            gfree(s->contents);
+            s->contents = 0;
+        }
+    } else
+        memmove(G(metal_buf_mem(d) + dof), G(metal_buf_mem(s) + so), n);
 }
 /* fillBuffer:range:value: (NSRange in x3/x4) */
 static void be_fillBuffer(Ctx *c)
@@ -706,7 +712,7 @@ static void be_fillBuffer(Ctx *c)
         free(tmp);
         return;
     }
-    memset(G(b->contents + (uint32_t)MARG(1)), (int)MARG(3), (size_t)MARG(2));
+    memset(G(metal_buf_mem(b) + (uint32_t)MARG(1)), (int)MARG(3), (size_t)MARG(2));
 }
 static void be_generateMipmaps(Ctx *c)
 {

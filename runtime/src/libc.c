@@ -208,7 +208,11 @@ static LazyBlob lazy[8];
 static int nlazy;
 static uint32_t next_window = LAZY_WINDOW_BASE;
 static pthread_mutex_t lazy_lock = PTHREAD_MUTEX_INITIALIZER;
+#if defined(__vita__)
+#define lazy_pending (host_tls()->lazy_pending)
+#else
 static __thread int lazy_pending = -1;     /* blob whose malloc is expected on this thread */
+#endif
 
 static int lazy_candidate(const char *path)
 {
@@ -289,7 +293,6 @@ static void log_big(Ctx *c, const char *what, uint64_t n)
         on = getenv("MINA_MEMSTAT") != NULL;
     if (on && n >= (64u << 10)) {
         char bt[1024];
-        void guest_backtrace(char *out, size_t cap, int max);
         guest_backtrace(bt, sizeof bt, n >= (4u << 20) ? 4 : 3);
         rt_log("[alloc] %s %.1f MiB: %s\n", what, n / 1048576.0, bt);
     }
@@ -319,7 +322,11 @@ static void imp_free(Ctx *c)
 
 /* ---- errno ------------------------------------------------------------------ */
 
+#if defined(__vita__)
+#define tl_errno (host_tls()->err)
+#else
 static __thread uint32_t tl_errno;
+#endif
 static void imp_error(Ctx *c)
 {
     (void)c;
@@ -624,11 +631,29 @@ static FILE *host_file(uint64_t a)
     return (FILE *)(uintptr_t)rt_ld64(G(a + 8));
 }
 
-/* Host path of a guest path (hook for the Vita's file system). */
+/* The current directory is the runtime's: the game chdir()s into its
+ * resources and opens relative paths, and the Vita has no working directory. */
+static char cwd[512];
+static pthread_mutex_t cwd_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Host path of a guest path: relative paths are resolved against cwd. */
 const char *host_path(const char *p, char *buf, size_t cap)
 {
-    (void)buf; (void)cap;
-    return p;
+    if (!p || !p[0])
+        return p;
+    int absolute = p[0] == '/' || strchr(p, ':') != NULL;
+    pthread_mutex_lock(&cwd_lock);
+    if (absolute || !cwd[0]) {
+        pthread_mutex_unlock(&cwd_lock);
+        return p;
+    }
+    const char *q = p;
+    while (q[0] == '.' && q[1] == '/')
+        q += 2;
+    size_t n = strlen(cwd);
+    snprintf(buf, cap, "%s%s%s", cwd, n && cwd[n - 1] == '/' ? "" : "/", q);
+    pthread_mutex_unlock(&cwd_lock);
+    return buf;
 }
 
 static void imp_fopen(Ctx *c)
@@ -765,10 +790,29 @@ static void imp_mkdir(Ctx *c)
 }
 static void imp_getcwd(Ctx *c)
 {
-    char *r = getcwd(G(A0), (size_t)A1);
-    RET(r ? A0 : 0);
+    pthread_mutex_lock(&cwd_lock);
+    if (!cwd[0] && !getcwd(cwd, sizeof cwd))
+        cwd[0] = 0;
+    snprintf(G(A0), (size_t)A1, "%s", cwd);
+    pthread_mutex_unlock(&cwd_lock);
+    RET(A0);
 }
-static void imp_chdir(Ctx *c) { RET((int64_t)chdir(gstr(A0))); }
+static void imp_chdir(Ctx *c)
+{
+    char pb[512];
+    const char *p = host_path(gstr(A0), pb, sizeof pb);
+    struct stat st;
+    if (stat(p, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        set_errno(ENOENT);
+        RET((uint64_t)-1);
+        return;
+    }
+    pthread_mutex_lock(&cwd_lock);
+    snprintf(cwd, sizeof cwd, "%s", p);
+    pthread_mutex_unlock(&cwd_lock);
+    rt_log("[fs] chdir %s\n", cwd);
+    RET(0);
+}
 
 static void stderr_init(uint32_t a) { if (!g_stderr) g_stderr = wrap_file(stderr); rt_st64(G(a), g_stderr); }
 static void stdin_init(uint32_t a) { if (!g_stdin) g_stdin = wrap_file(stdin); rt_st64(G(a), g_stdin); }
@@ -936,6 +980,8 @@ static void imp_mmap(Ctx *c)
     log_big(c, "mmap", len);
     uint32_t real = prot == 0 ? reservation_real_size(len) : (uint32_t)len;
     uint32_t a = gmemalign(16384, real);
+    if (g_trace_imports || !a)
+        rt_log("[mmap] %llu bytes (prot %d, real %u) -> %#x\n", (unsigned long long)len, prot, real, a);
     if (!a) {
         RET((uint64_t)-1);
         return;
@@ -957,10 +1003,14 @@ static void imp_mprotect(Ctx *c)
 {
     uint32_t a = (uint32_t)A0;
     uint64_t end = A0 + A1;
-    for (int i = 0; i < nres; i++) {
-        Reservation *r = &reservations[i];
-        if (a < r->base || a >= r->base + r->len)
-            continue;
+    /* the reservation holding a: the closest base at or below it (on the Vita
+     * reservations are smaller than their nominal length and may follow each other) */
+    Reservation *r = NULL;
+    for (int i = 0; i < nres; i++)
+        if (reservations[i].base <= a && a < reservations[i].base + reservations[i].len &&
+            (!r || reservations[i].base > r->base))
+            r = &reservations[i];
+    if (r) {
         if (end - r->base > r->committed) {
             r->committed = (uint32_t)(end - r->base);
             if (getenv("MINA_MEMSTAT"))
@@ -1107,6 +1157,24 @@ static void imp_block_object_assign(Ctx *c)
     rt_st64(G(dst), src);
 }
 
+/* _Block_object_dispose(obj, flags), called by block dispose helpers: undoes
+ * _Block_object_assign. __block variables stay on the heap (never freed). */
+void block_release(Ctx *c, uint64_t block);
+void objc_release_obj(uint64_t a);
+static void imp_block_object_dispose(Ctx *c)
+{
+    uint64_t obj = A0;
+    uint32_t flags = (uint32_t)A1;
+    if (!obj)
+        return;
+    if ((flags & 7) == 7)                               /* BLOCK_FIELD_IS_BLOCK */
+        block_release(c, obj);
+    else if (flags & 8)                                 /* BLOCK_FIELD_IS_BYREF */
+        return;
+    else if ((flags & 3) == 3 && !(flags & 16))         /* object, not weak */
+        objc_release_obj(obj);
+}
+
 static void imp_setjmp(Ctx *c) { RET(0); }
 static void imp_longjmp(Ctx *c) { (void)c; rt_fatal("guest longjmp is not supported"); }
 
@@ -1229,7 +1297,7 @@ const ImportImpl g_impl_libc[] = {
     { "__ZdlPv", imp_operator_delete, 0, NULL },
     { "__ZdlPvSt11align_val_t", imp_operator_delete, 0, NULL },
     { "__Block_object_assign", imp_block_object_assign, 0, NULL },
-    { "__Block_object_dispose", imp_nop, 0, NULL },
+    { "__Block_object_dispose", imp_block_object_dispose, 0, NULL },
     { "_setjmp", imp_setjmp, 0, NULL },
     { "_longjmp", imp_longjmp, 0, NULL },
     { "___availability_version_check", imp_ret1, 0, NULL },
