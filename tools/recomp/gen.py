@@ -201,6 +201,11 @@ def patch_word(addr, w):
     return (w & ~(0xffff << 5)) | (new << 5)
 
 
+# back edges of loops this short with atomics get RT_SPIN (see recomp.h)
+SPIN_LOOP_MAX = 40
+SPIN_OPS = {"cas", "ldar", "ldop", "ldxr", "stxr"}
+
+
 class Func:
     def __init__(self, prog, start, end, words=None):
         self.p = prog
@@ -683,9 +688,21 @@ class Lower:
         """Statement for a branch to t (local label or tail call)."""
         if self.fn.inside(t):
             if t in self.fn.labels:
+                if self.spin_loop(t):
+                    return "{ RT_SPIN(c); goto %s; }" % label(t)
                 return "goto %s;" % label(t)
             raise GenError("branch to %#x without label" % t)
         return "{ @STORE@ %s return; }" % self.call_target(t)
+
+    def spin_loop(self, t):
+        """A back edge to t closing a small loop with atomics: a spin-wait."""
+        a = self.cur.addr
+        if t > a or a - t > 4 * SPIN_LOOP_MAX:
+            return False
+        i, j = self.fn.index.get(t), self.fn.index.get(a)
+        if i is None or j is None:
+            return False
+        return any(ins.op in SPIN_OPS for ins in self.fn.insns[i:j + 1])
 
     def branch_if(self, cond, t):
         self.emit("if (%s) %s" % (cond, self.goto(t)))
@@ -823,7 +840,8 @@ class Lower:
         self.emit("rt_trap(c, 0x%xu, %d);" % (rel(ins.addr), ins.imm))
 
     def i_hint(self, ins):
-        pass
+        if ins.imm in (1, 2):         # yield, wfe: spin-wait hints
+            self.emit("RT_SPIN(c);")
 
     def i_barrier(self, ins):
         self.emit("__atomic_thread_fence(__ATOMIC_SEQ_CST);")

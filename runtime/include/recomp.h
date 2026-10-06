@@ -50,7 +50,15 @@ typedef struct Ctx {
     uint32_t stack_lo, stack_hi;
     uint32_t cur_import;     /* index of the import being called (diagnostics) */
     void *thread;            /* runtime's thread record */
+    uint32_t spin;           /* iterations of spin-wait loops (RT_SPIN) */
 } Ctx;
+
+/* The back edge of a small loop with atomics (a spin-wait) and the yield/wfe
+ * hints: every 64 times the thread gives its core away. The Vita does not
+ * time-slice threads of the same priority, so spinning threads would keep
+ * the lock holder (and everything else) off its three cores forever. */
+void rt_yield(void);
+#define RT_SPIN(c) do { if ((++(c)->spin & 63) == 0) rt_yield(); } while (0)
 
 typedef void (*GuestFn)(Ctx *c);
 

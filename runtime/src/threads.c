@@ -4,6 +4,9 @@
 #include <errno.h>
 #include <pthread.h>
 #include <sched.h>
+#if defined(__vita__)
+#include <psp2/kernel/threadmgr.h>
+#endif
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -95,9 +98,24 @@ static void imp_tlv_bootstrap(Ctx *c)
 #define GUEST_STACK_CAP (64u << 20)
 #endif
 
+void rt_yield(void)
+{
+#if defined(__vita__)
+    sceKernelDelayThread(50);
+#else
+    sched_yield();
+#endif
+}
+
+/* every guest context, for the watchdog */
+static Ctx *all_ctx[128];
+static int nall_ctx;
+
 static Ctx *new_ctx(uint32_t stack_size)
 {
     Ctx *c = calloc(1, sizeof *c);
+    if (nall_ctx < 128)
+        all_ctx[nall_ctx++] = c;
     if (g_trace_imports)
         rt_log("[thread] guest stack of %u KiB asked\n", stack_size >> 10);
     if (stack_size > GUEST_STACK_CAP)
@@ -184,6 +202,41 @@ void threads_stack_report(void)
 static void stack_paint(uint32_t id) { (void)id; }
 void threads_stack_report(void) {}
 #endif
+
+/* MINA_WATCHDOG=s: every s seconds, the uptime and the last import each
+ * guest thread called (where a hung game waits), from a thread of its own */
+static void *watchdog_main(void *arg)
+{
+    int every = (int)(intptr_t)arg;
+    for (int t = every;; t += every) {
+        sleep((unsigned)every);
+        char buf[1024];
+        int n = snprintf(buf, sizeof buf, "[watchdog] %ds:", t);
+        for (int i = 0; i < nall_ctx && n < (int)sizeof buf - 64; i++) {
+            Ctx *c = all_ctx[i];
+            if (!c || !c->thread_id)
+                continue;
+            n += snprintf(buf + n, sizeof buf - n, " %u=%s", c->thread_id,
+                          c->cur_import < g_import_count ? g_import_names[c->cur_import] : "?");
+        }
+        rt_log("%s\n", buf);
+    }
+    return NULL;
+}
+
+void watchdog_start(void)
+{
+    const char *v = getenv("MINA_WATCHDOG");
+    if (!v || atoi(v) <= 0)
+        return;
+    pthread_t th;
+    pthread_attr_t ha;
+    pthread_attr_init(&ha);
+    pthread_attr_setstacksize(&ha, 64 * 1024);
+    pthread_attr_setdetachstate(&ha, PTHREAD_CREATE_DETACHED);
+    pthread_create(&th, &ha, watchdog_main, (void *)(intptr_t)atoi(v));
+    pthread_attr_destroy(&ha);
+}
 
 static void *thread_main(void *p)
 {

@@ -69,6 +69,8 @@ int main(int argc, char **argv)
     objc_init();
 
     Ctx *c = threads_main_ctx(8u << 20);
+    void watchdog_start(void);
+    watchdog_start();
     if (g_trace_imports) {
         void *probe = malloc(16);
         rt_log("[mem] g_mem %p, heap probe %p, main host sp %p, main ctx %p, guest stack %#x..%#x\n",
