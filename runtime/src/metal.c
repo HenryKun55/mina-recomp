@@ -1243,9 +1243,14 @@ static void cb_presentDrawable(Ctx *c)
  * quarter of the size; "%d" in the path numbers the files) */
 static void dump_frame(MTexture *t)
 {
-    static int frame;
+    static int frame, every = -1, full;
     const char *dump = getenv("MINA_DUMP");
-    if (dump && ++frame % 60 == 0) {
+    if (every < 0) {
+        const char *v = getenv("MINA_DUMP_EVERY");     /* frames between dumps (60) */
+        every = v && atoi(v) > 0 ? atoi(v) : 60;
+        full = getenv("MINA_DUMP_FULL") != NULL;       /* the whole frame, not a quarter */
+    }
+    if (dump && ++frame % every == 0) {
         uint32_t W = t->width, H = t->height;
         uint8_t *px = malloc((size_t)W * H * 4);
 #if defined(__vita__)
@@ -1260,12 +1265,13 @@ static void dump_frame(MTexture *t)
         glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
 #endif
         char path[512];
-        snprintf(path, sizeof path, dump, frame / 60);
+        snprintf(path, sizeof path, dump, frame / every);
         FILE *f = fopen(path, "wb");
         if (f) {
-            fprintf(f, "P6 %u %u 255\n", W / 4, H / 4);
-            for (uint32_t y = 0; y + 4 <= H; y += 4)
-                for (uint32_t x = 0; x + 4 <= W; x += 4)
+            uint32_t step = full ? 1 : 4;
+            fprintf(f, "P6 %u %u 255\n", W / step, H / step);
+            for (uint32_t y = 0; y + step <= H; y += step)
+                for (uint32_t x = 0; x + step <= W; x += step)
                     fwrite(px + 4 * (y * W + x), 1, 3, f);
             fclose(f);
         }

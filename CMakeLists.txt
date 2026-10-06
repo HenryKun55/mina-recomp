@@ -111,7 +111,19 @@ if(VITA)
     ScePower_stub SceAppMgr_stub SceAppUtil_stub SceIme_stub SceLibKernel_stub SceProcessmgr_stub
     SceIofilemgr_stub stdc++ pthread m c)
   vita_create_self(eboot.bin mina UNSAFE)
-  vita_create_vpk(mina.vpk ${VITA_TITLEID} eboot.bin VERSION ${VITA_VERSION} NAME "${VITA_APP_NAME}")
+  # bubble art (tools/vita/make_art.py, from your copy of the game) when it is there
+  set(MINA_ART "${CMAKE_SOURCE_DIR}/deps/art/sce_sys")
+  set(MINA_VPK_FILES)
+  if(EXISTS "${MINA_ART}/icon0.png")
+    foreach(f icon0.png pic0.png livearea/contents/bg.png livearea/contents/startup.png
+              livearea/contents/template.xml)
+      list(APPEND MINA_VPK_FILES FILE "${MINA_ART}/${f}" "sce_sys/${f}")
+    endforeach()
+  else()
+    message(WARNING "no bubble art: run tools/vita/make_art.py (the VPK gets the SDK's placeholder icon)")
+  endif()
+  vita_create_vpk(mina.vpk ${VITA_TITLEID} eboot.bin VERSION ${VITA_VERSION} NAME "${VITA_APP_NAME}"
+                  ${MINA_VPK_FILES})
 else()
   find_package(PkgConfig REQUIRED)
   pkg_check_modules(SDL2 REQUIRED IMPORTED_TARGET sdl2)
