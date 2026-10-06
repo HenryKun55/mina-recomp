@@ -45,9 +45,19 @@ static void imp_tlv_bootstrap(Ctx *c)
 
 /* ---- threads -------------------------------------------------------------- */
 
+/* Guest stacks: the engine asks for ~10 MiB per thread and touches well under
+ * 1 MiB in all of them together; the Vita gets 1 MiB each. */
+#if defined(__vita__)
+#define GUEST_STACK_CAP (1u << 20)
+#else
+#define GUEST_STACK_CAP (64u << 20)
+#endif
+
 static Ctx *new_ctx(uint32_t stack_size)
 {
     Ctx *c = calloc(1, sizeof *c);
+    if (stack_size > GUEST_STACK_CAP)
+        stack_size = GUEST_STACK_CAP;
     uint32_t lo = gmemalign(64, stack_size);
     if (!lo)
         rt_fatal("cannot allocate a guest stack of %u bytes", stack_size);

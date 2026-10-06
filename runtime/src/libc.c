@@ -902,27 +902,78 @@ static void imp_sysctlbyname(Ctx *c)
     RET((uint64_t)-1);
 }
 
-/* mmap: anonymous memory from the guest heap */
+/* mmap: anonymous memory from the guest heap.
+ * The engine reserves address space (PROT_NONE) and commits it from the start
+ * with mprotect as it grows (ycVirtualMemoryPoolTS: 16 MiB, SaveManager: 64 MiB).
+ * The Vita cannot reserve without memory: a reservation gets a smaller real
+ * block, and a commit past it stops with the numbers to raise. */
+typedef struct Reservation {
+    uint32_t base, real, len, committed;
+} Reservation;
+static Reservation reservations[32];
+static int nres;
+
+static uint32_t reservation_real_size(uint64_t len)
+{
+#if defined(__vita__)
+    if (len >= (64u << 20))
+        return 16u << 20;
+    return len < (4u << 20) ? (uint32_t)len : (4u << 20);
+#else
+    return (uint32_t)len;
+#endif
+}
+
 static void imp_mmap(Ctx *c)
 {
     uint64_t len = A1;
+    int prot = (int)A2;
     if (!(A3 & 0x1000)) {           /* MAP_ANON (the fd may be a VM tag) */
         rt_log("mmap of a file is not supported\n");
         RET((uint64_t)-1);
         return;
     }
     log_big(c, "mmap", len);
-    uint32_t a = gmemalign(16384, len);
+    uint32_t real = prot == 0 ? reservation_real_size(len) : (uint32_t)len;
+    uint32_t a = gmemalign(16384, real);
     if (!a) {
         RET((uint64_t)-1);
         return;
     }
     int gmalloc_was_fresh(void);
     if (!gmalloc_was_fresh())
-        memset(G(a), 0, len);     /* fresh memory is already zero (and stays untouched) */
+        memset(G(a), 0, real);     /* fresh memory is already zero (and stays untouched) */
+    if (prot == 0 && nres < 32) {
+        reservations[nres].base = a;
+        reservations[nres].real = real;
+        reservations[nres].len = (uint32_t)len;
+        reservations[nres].committed = 0;
+        nres++;
+    }
     RET(a);
 }
 static void imp_munmap(Ctx *c) { gfree((uint32_t)A0); RET(0); }
+static void imp_mprotect(Ctx *c)
+{
+    uint32_t a = (uint32_t)A0;
+    uint64_t end = A0 + A1;
+    for (int i = 0; i < nres; i++) {
+        Reservation *r = &reservations[i];
+        if (a < r->base || a >= r->base + r->len)
+            continue;
+        if (end - r->base > r->committed) {
+            r->committed = (uint32_t)(end - r->base);
+            if (getenv("MINA_MEMSTAT"))
+                rt_log("[mmap] reservation %#x: %.1f of %.1f MiB committed\n", r->base, r->committed / 1048576.0,
+                       r->len / 1048576.0);
+        }
+        if (end > (uint64_t)r->base + r->real)
+            rt_fatal("reservation of %u MiB at %#x committed to %.1f MiB, past its %u MiB "
+                     "(raise reservation_real_size)", r->len >> 20, r->base, (end - r->base) / 1048576.0,
+                     r->real >> 20);
+    }
+    RET(0);
+}
 
 static void qsort_impl(Ctx *c, uint32_t base, uint64_t n, uint64_t size, uint64_t cmp);
 
@@ -1160,7 +1211,7 @@ const ImportImpl g_impl_libc[] = {
     { "_sysctlbyname", imp_sysctlbyname, 0, NULL },
     { "_mmap", imp_mmap, 0, NULL },
     { "_munmap", imp_munmap, 0, NULL },
-    { "_mprotect", imp_ret0, 0, NULL },
+    { "_mprotect", imp_mprotect, 0, NULL },
     { "_qsort", imp_qsort, 0, NULL },
     { "_signal", imp_ret0, 0, NULL },
     { "_sigaction", imp_ret0, 0, NULL },
