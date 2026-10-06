@@ -1091,19 +1091,24 @@ void metal_present(uint64_t drawable)
     /* Metal layout (row 0 at the top) to the window (row 0 at the bottom) */
     glBlitFramebuffer(0, 0, (GLint)t->width, (GLint)t->height, 0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_LINEAR);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    /* MINA_DUMP=path: every 60th presented frame is written there (PPM) */
+    /* MINA_DUMP=path: every 60th presented frame is written there (PPM, a
+     * quarter of the size; "%d" in the path numbers the files) */
     static int frame;
     const char *dump = getenv("MINA_DUMP");
     if (dump && ++frame % 60 == 0) {
-        uint8_t *px = malloc((size_t)t->width * t->height * 4);
+        uint32_t W = t->width, H = t->height;
+        uint8_t *px = malloc((size_t)W * H * 4);
         glBindFramebuffer(GL_READ_FRAMEBUFFER, tex_fbo(t, 0));
-        glReadPixels(0, 0, (GLsizei)t->width, (GLsizei)t->height, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        glReadPixels(0, 0, (GLsizei)W, (GLsizei)H, GL_RGBA, GL_UNSIGNED_BYTE, px);
         glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-        FILE *f = fopen(dump, "wb");
+        char path[512];
+        snprintf(path, sizeof path, dump, frame / 60);
+        FILE *f = fopen(path, "wb");
         if (f) {
-            fprintf(f, "P6 %u %u 255\n", t->width, t->height);
-            for (uint32_t i = 0; i < t->width * t->height; i++)
-                fwrite(px + 4 * i, 1, 3, f);
+            fprintf(f, "P6 %u %u 255\n", W / 4, H / 4);
+            for (uint32_t y = 0; y + 4 <= H; y += 4)
+                for (uint32_t x = 0; x + 4 <= W; x += 4)
+                    fwrite(px + 4 * (y * W + x), 1, 3, f);
             fclose(f);
         }
         free(px);

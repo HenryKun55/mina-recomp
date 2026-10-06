@@ -370,6 +370,46 @@ void nat_SDL_FilterEvents(Ctx *c)
     }
 }
 void nat_SDL_RegisterEvents(Ctx *c) { RET(SDL_RegisterEvents((int)A0)); }
+/* MINA_INPUT="8:Return 12:Down 13.5:Return": scripted key taps (seconds since
+ * start : SDL key name), injected as real key events for testing. */
+static void scripted_input(void)
+{
+    static int parsed, n, next;
+    static struct { Uint32 at; SDL_Scancode sc; int up; } ev[256];
+    if (!parsed) {
+        parsed = 1;
+        const char *s = getenv("MINA_INPUT");
+        while (s && *s && n < 254) {
+            double t;
+            char name[64];
+            int len;
+            if (sscanf(s, " %lf:%63[^ ]%n", &t, name, &len) != 2)
+                break;
+            SDL_Scancode sc = SDL_GetScancodeFromName(name);
+            ev[n].at = (Uint32)(t * 1000);
+            ev[n].sc = sc;
+            ev[n++].up = 0;
+            ev[n].at = (Uint32)(t * 1000) + 120;
+            ev[n].sc = sc;
+            ev[n++].up = 1;
+            s += len;
+        }
+    }
+    while (next < n && SDL_GetTicks() >= ev[next].at) {
+        SDL_Event e;
+        memset(&e, 0, sizeof e);
+        e.type = ev[next].up ? SDL_KEYUP : SDL_KEYDOWN;
+        e.key.state = ev[next].up ? SDL_RELEASED : SDL_PRESSED;
+        e.key.keysym.scancode = ev[next].sc;
+        e.key.keysym.sym = SDL_GetKeyFromScancode(ev[next].sc);
+        e.key.windowID = windows[0].host ? SDL_GetWindowID(windows[0].host) : 0;
+        e.key.timestamp = SDL_GetTicks();
+        rt_log("[input] %s %s\n", ev[next].up ? "up" : "down", SDL_GetScancodeName(ev[next].sc));
+        SDL_PushEvent(&e);
+        next++;
+    }
+}
+
 /* Main-queue blocks (dispatch_async to the main queue) run on the main thread
  * while it waits for events; posting this event wakes it. */
 void mainq_drain(Ctx *c);
@@ -401,6 +441,7 @@ void nat_SDL_PollEvent(Ctx *c)
     for (;;) {
         drain_jobs();
         mainq_drain(c);
+        scripted_input();
         r = SDL_PollEvent(&e);
         if (!r || e.type != wake_event)
             break;
@@ -420,7 +461,10 @@ void nat_SDL_WaitEvent(Ctx *c)
     for (;;) {
         drain_jobs();
         mainq_drain(c);
-        r = SDL_WaitEvent(&e);
+        scripted_input();
+        r = getenv("MINA_INPUT") ? SDL_WaitEventTimeout(&e, 20) : SDL_WaitEvent(&e);
+        if (!r && getenv("MINA_INPUT"))
+            continue;
         if (!r || e.type != wake_event)
             break;
     }
@@ -555,6 +599,7 @@ static void imp_CFRunLoopRunInMode(Ctx *c)
     do {
         drain_jobs();
         mainq_drain(c);
+        scripted_input();
         SDL_PumpEvents();
         if (secs > 0)
             SDL_Delay(1);
