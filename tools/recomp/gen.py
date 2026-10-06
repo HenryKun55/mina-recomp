@@ -74,7 +74,30 @@ class Program:
         self.stubs = m.section("__TEXT", "__stubs")
         self.objc_stubs = m.section("__TEXT", "__objc_stubs")
 
-        starts = sorted(a for a in m.function_starts if self.text.addr <= a < self.text.end)
+        starts = set(a for a in m.function_starts if self.text.addr <= a < self.text.end)
+        # LC_FUNCTION_STARTS misses some functions (static initializers):
+        # add named code symbols, static initializers and direct call targets.
+        for s in m.symbols:
+            if (s.type & 0xE0) == 0 and (s.type & 0x0E) == 0x0E and self.text.addr <= s.value < self.text.end \
+                    and s.value % 4 == 0:
+                starts.add(s.value)
+        mi = m.section("__DATA_CONST", "__mod_init_func")
+        if mi:
+            for k in range(mi.size // 8):
+                a = m.u64(mi.addr + 8 * k)
+                if self.text.addr <= a < self.text.end:
+                    starts.add(a)
+        code = m.read(self.text.addr, self.text.size)
+        for off in range(0, len(code), 4):
+            w = struct.unpack_from("<I", code, off)[0]
+            if (w >> 26) == 0b100101:          # bl
+                imm = w & 0x3FFFFFF
+                if imm & 0x2000000:
+                    imm -= 0x4000000
+                t = self.text.addr + off + imm * 4
+                if self.text.addr <= t < self.text.end:
+                    starts.add(t)
+        starts = sorted(starts)
         self.funcs = []
         for i, a in enumerate(starts):
             end = starts[i + 1] if i + 1 < len(starts) else self.text.end
@@ -1378,10 +1401,21 @@ for _n in "fmla_elem fmls_elem mla_elem".split():
 # Output
 
 
-def gen_function(prog, start, end):
+def native_ident(name):
+    """C identifier of the native that replaces guest function `name`."""
+    n = name[1:] if name.startswith("_") else name
+    return "nat_" + "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in n)
+
+
+def gen_function(prog, start, end, natives=()):
     fn = Func(prog, start, end)
     fn.analyze()
-    return Lower(fn).run()
+    code = Lower(fn).run()
+    name = prog.names.get(start)
+    if name in natives:
+        code = code.replace("void %s(Ctx *c)" % cname(start), "void %s_orig(Ctx *c)" % cname(start), 1)
+        code += "void %s(Ctx *c) { %s(c); }\n" % (cname(start), native_ident(name))
+    return code
 
 
 def write_tables(prog, out):
@@ -1392,6 +1426,10 @@ def write_tables(prog, out):
         lines.append("    { 0x%xu, %s }," % (rel(a), cname(a)))
     lines.append("};")
     lines.append("const uint32_t g_guest_func_count = %d;" % len(prog.funcs))
+    lines.append("const char *const g_guest_func_names[] = {")
+    for a, _ in sorted(prog.funcs):
+        lines.append('    "%s",' % prog.names.get(a, "sub_%x" % a))
+    lines.append("};")
     lines.append("")
     lines.append("const char *const g_import_names[] = {")
     for n in prog.import_names:
@@ -1446,6 +1484,12 @@ def write_tables(prog, out):
     mi = m.section("__DATA_CONST", "__mod_init_func")
     lines.append("const uint32_t g_mod_init = 0x%xu, g_mod_init_count = %d;" % (
         rel(mi.addr) if mi else 0, (mi.size // 8) if mi else 0))
+    cl = m.section("__DATA_CONST", "__objc_classlist")
+    mn = m.section("__TEXT", "__objc_methname")
+    lines.append("const uint32_t g_objc_classlist = 0x%xu, g_objc_classlist_count = %d;" % (
+        rel(cl.addr) if cl else 0, (cl.size // 8) if cl else 0))
+    lines.append("const uint32_t g_objc_methname = 0x%xu, g_objc_methname_size = 0x%xu;" % (
+        rel(mn.addr) if mn else 0, mn.size if mn else 0))
     with open(os.path.join(out, "tables.c"), "w") as f:
         f.write("\n".join(lines) + "\n")
 
@@ -1455,8 +1499,19 @@ def main():
     ap.add_argument("exe")
     ap.add_argument("out")
     ap.add_argument("--only", help="comma-separated function addresses (debug)")
+    ap.add_argument("--natives", help="file listing guest functions replaced by natives")
     args = ap.parse_args()
     prog = Program(args.exe)
+    natives = set()
+    if args.natives:
+        with open(args.natives) as f:
+            for line in f:
+                line = line.split("#", 1)[0].strip()
+                if line:
+                    natives.add(line)
+        known = set(prog.names.values())
+        for n in sorted(natives - known):
+            print("warning: native %s matches no function" % n, file=sys.stderr)
     os.makedirs(args.out, exist_ok=True)
 
     funcs = sorted(prog.funcs)
@@ -1468,6 +1523,8 @@ def main():
         f.write("/* generated */\n#ifndef MINA_FUNCS_H\n#define MINA_FUNCS_H\n#include \"recomp.h\"\n")
         for a, _ in sorted(prog.funcs):
             f.write("void %s(Ctx *c);\n" % cname(a))
+            if prog.names.get(a) in natives:
+                f.write("void %s_orig(Ctx *c);\nvoid %s(Ctx *c);\n" % (cname(a), native_ident(prog.names[a])))
         f.write("#endif\n")
 
     errors = 0
@@ -1479,7 +1536,7 @@ def main():
         parts = ['/* generated by tools/recomp/gen.py */\n#include "funcs.h"\n\n']
         for a, e in chunk:
             try:
-                parts.append(gen_function(prog, a, e))
+                parts.append(gen_function(prog, a, e, natives))
             except GenError as ex:
                 errors += 1
                 print("error in %s (%#x): %s" % (prog.names.get(a, "?"), a, ex), file=sys.stderr)

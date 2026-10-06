@@ -48,6 +48,8 @@ typedef struct Ctx {
     uint32_t thread_id;
     uint32_t tls_base;       /* guest address of this thread's TLS block */
     uint32_t stack_lo, stack_hi;
+    uint32_t cur_import;     /* index of the import being called (diagnostics) */
+    void *thread;            /* runtime's thread record */
 } Ctx;
 
 typedef void (*GuestFn)(Ctx *c);
@@ -66,6 +68,7 @@ typedef struct GuestSegment { uint32_t addr, size, fileoff, filesize; } GuestSeg
 /* Generated tables (tables.c). */
 extern const GuestFunc g_guest_funcs[];
 extern const uint32_t g_guest_func_count;
+extern const char *const g_guest_func_names[];
 extern const char *const g_import_names[];
 extern const uint32_t g_import_count;
 extern const GuestBind g_binds[];
@@ -78,12 +81,13 @@ extern const GuestSegment g_segments[];
 extern const uint32_t g_segment_count;
 extern const uint32_t g_tls_template, g_tls_size, g_tls_vars, g_tls_vars_size;
 extern const uint32_t g_entry, g_mod_init, g_mod_init_count;
+extern const uint32_t g_objc_classlist, g_objc_classlist_count, g_objc_methname, g_objc_methname_size;
 
 /* Indirect call / jump to a guest address (function or import thunk). */
 void rt_call(Ctx *c, uint64_t addr);
 /* Import i called directly through its stub. */
 extern GuestFn g_import_fns[];
-#define IMPORT_CALL(c, i) g_import_fns[i](c)
+#define IMPORT_CALL(c, i) ((c)->cur_import = (i), g_import_fns[i](c))
 
 void rt_unimpl(Ctx *c, uint32_t pc, const char *what) __attribute__((noreturn));
 void rt_trap(Ctx *c, uint32_t pc, uint32_t imm) __attribute__((noreturn));
