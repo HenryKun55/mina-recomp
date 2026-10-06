@@ -530,6 +530,14 @@ static void tex_create_gl(MTexture *t)
         glBindRenderbuffer(GL_RENDERBUFFER, t->gl);
         glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, (GLsizei)t->width, (GLsizei)t->height);
         t->is_rb = 1;
+        if (t->usage & 1) {      /* MTLTextureUsageShaderRead: shaders read the depth */
+            void vglTexImageRenderbufferDepth(GLuint rb, GLsizei width, GLsizei height);   /* deps/vitaGL patch */
+            glGenTextures(1, &t->depth_tex);
+            glBindTexture(GL_TEXTURE_2D, t->depth_tex);
+            vglTexImageRenderbufferDepth(t->gl, (GLsizei)t->width, (GLsizei)t->height);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        }
         return;
     }
 #endif
@@ -1058,13 +1066,18 @@ static void tex_upload(MTexture *t, uint32_t x, uint32_t y, uint32_t w, uint32_t
 #if defined(__vita__)
     uint8_t *packed = NULL;
     if (t->shift && f.bpp) {
-        /* a box filter down to the GL texture (regions are taken whole cells) */
+        /* a box filter down to the GL texture (regions are taken whole cells);
+         * one-channel textures hold palette indices: those are sampled, never mixed */
         uint32_t s = t->shift, n = 1u << s, bpp = (uint32_t)f.bpp;
         uint32_t dx = x >> s, dy = y >> s, dw = (w + n - 1) >> s, dh = (h + n - 1) >> s;
         packed = malloc((size_t)dw * dh * bpp);
         for (uint32_t r = 0; r < dh; r++)
             for (uint32_t col = 0; col < dw; col++)
                 for (uint32_t ch = 0; ch < bpp; ch++) {
+                    if (bpp == 1) {
+                        packed[(size_t)r * dw + col] = src[(size_t)(r * n) * bpr + (size_t)(col * n)];
+                        continue;
+                    }
                     uint32_t sum = 0, cnt = 0;
                     for (uint32_t yy = r * n; yy < r * n + n && yy < h; yy++)
                         for (uint32_t xx = col * n; xx < col * n + n && xx < w; xx++, cnt++)
@@ -1436,13 +1449,34 @@ void vita_copy_quad(MTexture *src, float sx, float sy, float sw, float sh, GLuin
 
 void metal_present(uint64_t drawable)
 {
+    {
+        extern int g_framelog;
+        static int frames, every = -1;
+        if (every < 0) {
+            const char *v = getenv("MINA_FRAMELOG");
+            every = v ? atoi(v) : 0;
+        }
+        frames++;
+        g_framelog = every > 0 && frames % every == 0 ? frames : 0;
+        extern int g_pass_index;
+        g_pass_index = 0;
+    }
     MTexture *t = objc_host(((MDrawable *)objc_host(drawable))->texture);
     gpu_lock();
 #if defined(__vita__)
 #if !defined(MINA_NULL_GL)
     /* vitaGL's glBlitFramebuffer draws one triangle of its quad here: the
      * frame goes to the screen with a quad of our own (Metal row 0 at the top) */
-    vita_copy_quad(t, 0, 0, (float)t->width, (float)t->height, 0, 0, 0, 960, 544, 1);
+    {
+        extern MTexture *g_show_tex;
+        MTexture *src = g_show_tex ? g_show_tex : t;
+        vita_copy_quad(src, 0, 0, (float)src->width, (float)src->height, 0, 0, 0, 960, 544, 1);
+        static int keep_show = -1;
+        if (keep_show < 0)
+            keep_show = getenv("MINA_SHOW_PASS") != NULL;
+        if (!keep_show)
+            g_show_tex = NULL;      /* MINA_SHOW_FS: only while that shader runs */
+    }
     dump_frame(t);
     vglSwapBuffers(GL_FALSE);
 #endif

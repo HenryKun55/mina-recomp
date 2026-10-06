@@ -63,6 +63,7 @@ typedef struct MTexture {
     int is_drawable;
     int is_rb;               /* a renderbuffer (Vita depth/stencil), not a texture */
     uint32_t shift;          /* Vita: the GL texture is 2^shift times smaller (sampled only) */
+    GLuint depth_tex;        /* Vita: a texture showing a sampled depth renderbuffer (vitaGL patch) */
 } MTexture;
 
 #if defined(__vita__) && !defined(MINA_NULL_GL)

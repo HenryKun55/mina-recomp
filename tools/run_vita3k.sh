@@ -1,11 +1,16 @@
 #!/bin/sh
 # Runs the Vita build in Vita3K: installs build-vita/mina.vpk as MINA00001
 # (eboot.bin and sce_sys), links the game data into ux0:data/mina (once),
-# starts Vita3K at the Vita's clock and follows ux0:data/mina/mina.log.
+# starts Vita3K in its PS Vita speed mode (the patched fork) and follows
+# ux0:data/mina/mina.log. Speed mode: CPU at the Vita's clock, 3 cores, the
+# user/cdram/phycont memory budgets, microSD reads, the GPU model calibrated
+# on a Vita 1000 (scale 37), and the guest sampling profiler.
 #
 # usage: tools/run_vita3k.sh [seconds]     (default 120; then this Vita3K is closed)
 # env:   VITA3K   Vita3K binary (default the local source build)
-#        MHZ      emulated CPU clock (default 444)
+#        MHZ      emulated CPU clock (default 444; 0 = full host speed, no speed mode)
+#        GPU_SCALE  GPU model scale (default 37; 0 = off)
+#        PROFILE  guest profile output (default $BUILD/vita3k-profile.txt)
 #        BUILD    Vita build directory (default build-vita)
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -28,7 +33,9 @@ fi
 rm -f "$DATA/mina.log"
 
 pkill -9 -f "Vita3K -r MINA00001" 2>/dev/null
-(VITA3K_CPU_MHZ=${MHZ:-444} "$VITA3K" -r MINA00001 > "$BUILD/vita3k.log" 2>&1 &)
+rm -f "${PROFILE:-$BUILD/vita3k-profile.txt}"
+(VITA3K_CPU_MHZ=${MHZ:-444} VITA3K_GPU_SCALE=${GPU_SCALE:-37} VITA3K_GPU_LOG=1 \
+ VITA3K_PROFILE="${PROFILE:-$BUILD/vita3k-profile.txt}" "$VITA3K" -r MINA00001 > "$BUILD/vita3k.log" 2>&1 &)
 echo "Vita3K started (log: $BUILD/vita3k.log, game log: ux0:data/mina/mina.log)"
 
 waited=0

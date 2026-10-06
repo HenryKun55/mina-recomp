@@ -97,6 +97,34 @@ static void renc_dealloc(void *h)
 
 Class cls_RenderEnc;
 
+/* MINA_FRAMELOG=K: every K-th presented frame, its passes and draws (for
+ * comparing the Vita with the Mac frame by frame) */
+int g_framelog;          /* frame being logged, 0: none */
+/* MINA_SHOW_PASS=n: the color target of the n-th render pass of every frame
+ * is what reaches the screen (debug: see an intermediate layer) */
+MTexture *g_show_tex;
+int g_pass_index;
+static void framelog_pass(REnc *e, uint64_t *color, uint64_t depth, uint64_t stencil)
+{
+    char buf[256];
+    int n = snprintf(buf, sizeof buf, "[frame %d] pass %ux%u:", g_framelog, e->tw, e->th);
+    for (int i = 0; i < MAX_COLOR && n < (int)sizeof buf; i++)
+        if (e->color[i])
+            n += snprintf(buf + n, sizeof buf - n, " c%d fmt %u load %u store %u%s#%04x", i, e->color[i]->format,
+                          (uint32_t)pb_get(color[i], "loadAction", 0), (uint32_t)pb_get(color[i], "storeAction", 1),
+                          e->color[i]->is_drawable ? " (drawable)" : "",
+                          (unsigned)(((uintptr_t)e->color[i] >> 4) & 0xffff));
+    if (e->color[0] && n < (int)sizeof buf)
+        n += snprintf(buf + n, sizeof buf - n, " clear (%g %g %g %g)", pb_getd(color[0], "clearColor", 0, 0.0),
+                      pb_getd(color[0], "clearColor", 1, 0.0), pb_getd(color[0], "clearColor", 2, 0.0),
+                      pb_getd(color[0], "clearColor", 3, 1.0));
+    if (depth && pb_get(depth, "texture", 0))
+        n += snprintf(buf + n, sizeof buf - n, " depth load %u", (uint32_t)pb_get(depth, "loadAction", 0));
+    if (stencil && pb_get(stencil, "texture", 0))
+        n += snprintf(buf + n, sizeof buf - n, " stencil load %u", (uint32_t)pb_get(stencil, "loadAction", 0));
+    rt_log("%s\n", buf);
+}
+
 uint64_t metal_render_encoder(Ctx *c, uint64_t pd)
 {
     (void)c;
@@ -133,8 +161,14 @@ uint64_t metal_render_encoder(Ctx *c, uint64_t pd)
     e->th = first ? first->height >> levels[0] : 1;
     glViewport(0, 0, (GLsizei)e->tw, (GLsizei)e->th);
     glDepthRange(0.0, 1.0);
+#if defined(__vita__)
+    /* a load action clears the whole attachment: no scissor (vitaGL would
+     * clip the clear with the previous framebuffer's size) */
+    glDisable(GL_SCISSOR_TEST);
+#else
     glEnable(GL_SCISSOR_TEST);
     glScissor(0, 0, (GLsizei)e->tw, (GLsizei)e->th);
+#endif
     glDisable(GL_CULL_FACE);
     glDisable(GL_POLYGON_OFFSET_FILL);
     for (int i = 0; i < MAX_COLOR; i++) {
@@ -156,8 +190,24 @@ uint64_t metal_render_encoder(Ctx *c, uint64_t pd)
         GLint s = (GLint)pb_get(stencil, "clearStencil", 0);
         glClearBufferiv(GL_STENCIL, 0, &s);
     }
+#if defined(__vita__)
+    glDepthRange(-1.0, 1.0);      /* the default Metal viewport (see re_setViewport) */
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, 0, (GLsizei)e->tw, (GLsizei)e->th);
+#endif
     e->cull = 0;
     e->winding = 0;
+    if (g_framelog)
+        framelog_pass(e, color, depth, stencil);
+    {
+        static int show = -2;
+        if (show == -2) {
+            const char *v = getenv("MINA_SHOW_PASS");
+            show = v ? atoi(v) : -1;
+        }
+        if (show >= 0 && g_pass_index++ == show && e->color[0])
+            g_show_tex = e->color[0];
+    }
     gl_check("pass begin");
     return o;
 }
@@ -252,7 +302,13 @@ static void re_setViewport(Ctx *c)
     double x = u2d(rt_ld64(G(v))), y = u2d(rt_ld64(G(v + 8))), w = u2d(rt_ld64(G(v + 16)));
     double h = u2d(rt_ld64(G(v + 24))), zn = u2d(rt_ld64(G(v + 32))), zf = u2d(rt_ld64(G(v + 40)));
     glViewport((GLint)x, (GLint)y, (GLsizei)w, (GLsizei)h);
+#if defined(__vita__)
+    /* the CG shaders keep Metal's 0..1 depth: vitaGL's window z is
+     * (f + n) / 2 + z * (f - n) / 2, so this stores zn + z * (zf - zn) */
+    glDepthRange(2.0 * zn - zf, zf);
+#else
     glDepthRange(zn, zf);
+#endif
 }
 /* setScissorRect:(MTLScissorRect) — 32 bytes, passed by pointer */
 static void re_setScissor(Ctx *c)
@@ -395,12 +451,9 @@ static void bind_tex(int unit, uint64_t tex, uint64_t samp)
     }
     MTexture *t = objc_host(tex);
 #if defined(__vita__)
-    if (t->is_rb) {
-        static int n;
-        if (n++ < 5)
-            rt_log("[tex] a %ux%u renderbuffer (format %u, usage %#x) is bound for sampling\n", t->width, t->height,
-                   t->format, t->usage);
-        glBindTexture(GL_TEXTURE_2D, 0);
+    if (t->is_rb) {          /* a depth/stencil renderbuffer: its depth texture */
+        glBindTexture(GL_TEXTURE_2D, t->depth_tex);
+        glBindSampler((GLuint)unit, samp ? ((MSampler *)objc_host(samp))->gl : 0);
         return;
     }
 #endif
@@ -553,6 +606,35 @@ static MPipeline *draw_setup(REnc *e)
     if (!e->pipeline)
         return NULL;
     MPipeline *p = objc_host(e->pipeline);
+    {   /* MINA_SKIP_FS=n,m: draws with these fragment shaders are skipped (debug) */
+        static int init, skip[8], nskip;
+        if (!init) {
+            init = 1;
+            const char *v = getenv("MINA_SKIP_FS");
+            while (v && *v && nskip < 8) {
+                skip[nskip++] = atoi(v);
+                v = strchr(v, ',');
+                if (v)
+                    v++;
+            }
+        }
+        for (int i = 0; i < nskip; i++)
+            if (p->fs == skip[i])
+                return NULL;
+    }
+    {   /* MINA_SHOW_FS=n: the first texture that fragment shader reads goes to the screen */
+        static int show_fs = -2;
+        if (show_fs == -2) {
+            const char *v = getenv("MINA_SHOW_FS");
+            show_fs = v ? atoi(v) : -1;
+        }
+        if (p->fs == show_fs && p->ntex) {
+            int t = p->texb[0].tex & 15;
+            uint64_t to = p->texb[0].stage ? e->ftex[t] : e->vtex[t];
+            if (to)
+                g_show_tex = objc_host(to);
+        }
+    }
 #if defined(__vita__)
     if (getenv("MINA_DRAWLOG")) {
         static uint8_t seen[256][256];
@@ -576,6 +658,51 @@ static MPipeline *draw_setup(REnc *e)
     return p;
 }
 
+static const uint8_t *binding_data(const Binding *b, uint32_t *avail);
+static void framelog_draw(REnc *e, MPipeline *p, const char *kind, uint32_t count)
+{
+    char buf[512];
+    int n = snprintf(buf, sizeof buf, "[frame %d]   %s %u vs %d fs %d", g_framelog, kind, count, p->vs, p->fs);
+    for (int k = 0; k < p->ntex && n < (int)sizeof buf; k++) {
+        int t = p->texb[k].tex & 15;
+        uint64_t to = p->texb[k].stage ? e->ftex[t] : e->vtex[t];
+        MTexture *mt = to ? objc_host(to) : NULL;
+        n += snprintf(buf + n, sizeof buf - n, " t%d:%ux%u/%u%s#%04x", t, mt ? mt->width : 0, mt ? mt->height : 0,
+                      mt ? mt->format : 0, mt && mt->is_rb ? "rb" : "", (unsigned)(((uintptr_t)mt >> 4) & 0xffff));
+    }
+    MDepthStencil *ds = e->ds ? objc_host(e->ds) : NULL;
+    if (ds)
+        n += snprintf(buf + n, sizeof buf - n, " depth cmp %u w %d stencil %d (cmp %u ref %u pass %u)", ds->compare,
+                      ds->write, ds->stencil_enabled, ds->front.compare, e->stencil_ref, ds->front.pass);
+    if (p->color[0].enabled && n < (int)sizeof buf)
+        n += snprintf(buf + n, sizeof buf - n, " blend %u/%u", p->color[0].src_rgb, p->color[0].dst_rgb);
+    if (n < (int)sizeof buf)
+        snprintf(buf + n, sizeof buf - n, " mask %#x", p->color[0].write_mask);
+    rt_log("%s\n", buf);
+    /* MINA_FRAMELOG_FS=n: the fragment constant buffers of that shader too */
+    static int dump_fs = -2;
+    if (dump_fs == -2) {
+        const char *v = getenv("MINA_FRAMELOG_FS");
+        dump_fs = v ? atoi(v) : -1;
+    }
+    if (p->fs == dump_fs) {
+        for (int i = 0; i < MAX_VBUF; i++) {
+            uint32_t avail = 0;
+            const uint8_t *d = binding_data(&e->fb[i], &avail);
+            if (!d || !avail)
+                continue;
+            char line[512];
+            int m = snprintf(line, sizeof line, "[frame %d]     fcb%d:", g_framelog, i);
+            for (uint32_t k = 0; k + 4 <= avail && k < 24 * 4 && m < (int)sizeof line; k += 4) {
+                float f;
+                memcpy(&f, d + k, 4);
+                m += snprintf(line + m, sizeof line - m, " %g", f);
+            }
+            rt_log("%s\n", line);
+        }
+    }
+}
+
 /* drawPrimitives:vertexStart:vertexCount:[instanceCount:] */
 static void draw_arrays(Ctx *c, uint32_t instances)
 {
@@ -587,6 +714,8 @@ static void draw_arrays(Ctx *c, uint32_t instances)
     if (!count || !instances)
         return;
     apply_vertices(e, p, start + count - 1, instances);
+    if (g_framelog)
+        framelog_draw(e, p, "arrays", count);
     if (instances == 1)
         glDrawArrays(gl_prim((uint32_t)MARG(0)), (GLint)start, (GLsizei)count);
     else
@@ -619,6 +748,8 @@ static void draw_indexed(Ctx *c, uint32_t instances)
         }
     }
     apply_vertices(e, p, maxv, instances);
+    if (g_framelog)
+        framelog_draw(e, p, "indexed", count);
     uint32_t ipos;
     if (ib->gpu_only) {
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ib->gl);

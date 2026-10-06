@@ -5,6 +5,9 @@
 #   LOG_ERRORS           GL errors on the console (Vita3K shows sceClibPrintf)
 #   HAVE_SHARK_LOG       shader compiler messages
 # The SDK's libvitaGL.a skips error handling and crashes on this game's draws.
+# tools/vitagl/*.patch: depth/stencil renderbuffers shared by the framebuffers
+# they are attached to (the engine writes a stencil mask with one color target
+# and tests it with another), and the SDK's older vitaShaRK.
 #
 # usage: tools/build_vitagl.sh            (clones vitaGL into deps/ the first time)
 # env:   VITAGL_SRC   a vitaGL source tree to copy instead of cloning
@@ -27,6 +30,13 @@ if [ ! -d "$DEST" ]; then
 fi
 
 cd "$DEST"
+# our changes (tools/vitagl/*.patch), each applied once
+for p in "$ROOT"/tools/vitagl/*.patch; do
+    if git apply --reverse --check "$p" > /dev/null 2>&1; then
+        continue
+    fi
+    git apply "$p" || { echo "cannot apply $p" >&2; exit 1; }
+done
 make clean > /dev/null 2>&1 || true
 PATH="$VITASDK/bin:$PATH" VITASDK="$VITASDK" make -j"$(sysctl -n hw.ncpu 2>/dev/null || echo 4)" \
     STORE_DEPTH_STENCIL=1 LOG_ERRORS=1 HAVE_SHARK_LOG=1 ${VITAGL_FLAGS:-} > build-mina.log 2>&1 \

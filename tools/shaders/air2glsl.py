@@ -965,8 +965,7 @@ class Shader:
 # texture is a uniform <sampler>_texsize the runtime sets when it binds it.
 
 _CG_TYPES = [(r"\bbvec([234])\b", r"bool\1"), (r"\bivec([234])\b", r"int\1"), (r"\bvec([234])\b", r"float\1")]
-_CG_FUNCS = {"mix": "lerp", "fract": "frac", "dFdx": "ddx", "dFdy": "ddy", "inversesqrt": "rsqrt",
-             "texelFetch": "tex2Dfetch"}
+_CG_FUNCS = {"mix": "lerp", "fract": "frac", "dFdx": "ddx", "dFdy": "ddy", "inversesqrt": "rsqrt"}
 
 
 def _cg_types(text):
@@ -1026,6 +1025,10 @@ def glsl_to_cg(glsl, stage):
             if m.group(1) == "sampler2DMS":
                 raise ValueError("multisampled textures have no CG form")
         decls.append(_cg_types(line))
+    # GXM keeps Metal's depth: the runtime maps it with glDepthRange, so z is
+    # not moved to GL's -w..w (GXM clips below 0 like Metal, it seems)
+    head_decls = [d.replace("2.0 * p.z - p.w", "p.z") for d in decls]
+    decls[:] = head_decls
     body = _cg_types(body)
     if stage == 0:
         if "gl_VertexID" in body:
@@ -1034,6 +1037,9 @@ def glsl_to_cg(glsl, stage):
     else:
         for o in outputs:
             body = re.sub(r"\b%s\b" % o, "gl_FragColor", body)
+        # GXM fragment programs have no depth output (vitaGL declares none):
+        # the fragment keeps the depth of its primitive
+        body = re.sub(r"^\s*gl_FragDepth = [^;]*;\n", "", body, flags=re.M)
         if "gl_FragCoord" in body:
             params.append("float4 fragcoord : WPOS")
             body = body.replace("gl_FragCoord", "fragcoord")
@@ -1046,6 +1052,12 @@ def glsl_to_cg(glsl, stage):
             decls.append(decl)
         return "((int2)(%s_texsize))" % m.group(1)
     body = re.sub(r"\btextureSize\((\w+), [^)]*\)", texsize, body)
+    # texelFetch(s, p, lod): tex2D at the texel's center (tex2Dfetch does not
+    # read like GLSL's on the Vita; the textures read this way are nearest)
+    def fetch(m):
+        texsize(m)
+        return "tex2D(%s, (((float2)(%s)) + 0.5) / %s_texsize)" % (m.group(1), m.group(2), m.group(1))
+    body = re.sub(r"\btexelFetch\((\w+), ((?:[^(),]|\([^()]*\))+), [^()]*\)", fetch, body)
     for g, c in _CG_FUNCS.items():
         body = re.sub(r"\b%s\(" % g, c + "(", body)
     # texture(s, uv): tex2D / texCUBE by the sampler's type
