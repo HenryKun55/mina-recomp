@@ -6,6 +6,9 @@
  * present their drawable at commit.
  */
 #include "metal_gl.h"
+#if defined(__vita__)
+#include <psp2/kernel/processmgr.h>
+#endif
 
 #include <SDL.h>
 #include <pthread.h>
@@ -1487,7 +1490,34 @@ void metal_present(uint64_t drawable)
             g_show_tex = NULL;      /* MINA_SHOW_FS: only while that shader runs */
     }
     dump_frame(t);
-    vglSwapBuffers(GL_FALSE);
+    {
+        /* MINA_FPS: every 2 s, frames per second, the time between frames and
+         * how much of it is spent here waiting for the GPU (swap) */
+        static int on = -1, frames;
+        static uint64_t last, window, swap_us, frame_max;
+        if (on < 0)
+            on = getenv("MINA_FPS") != NULL;
+        uint64_t t0 = sceKernelGetProcessTimeWide();
+        vglSwapBuffers(GL_FALSE);
+        if (on) {
+            uint64_t t1 = sceKernelGetProcessTimeWide();
+            swap_us += t1 - t0;
+            if (last && t1 - last > frame_max)
+                frame_max = t1 - last;
+            last = t1;
+            if (!window)
+                window = t1;
+            frames++;
+            if (t1 - window >= 2000000) {
+                rt_log("[fps] %.1f fps, %.1f ms/frame (worst %.1f), %.1f ms of it waiting in swap\n",
+                       frames * 1e6 / (double)(t1 - window), (t1 - window) / 1000.0 / frames, frame_max / 1000.0,
+                       swap_us / 1000.0 / frames);
+                frames = 0;
+                window = t1;
+                swap_us = frame_max = 0;
+            }
+        }
+    }
 #endif
     gpu_unlock();
     return;
