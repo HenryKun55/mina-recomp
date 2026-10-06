@@ -13,7 +13,11 @@ GLenum metal_gl_compare(uint32_t f);
 
 /* ---- streaming vertex/index ring ------------------------------------------------------- */
 
+#if defined(__vita__)
+#define RING_SIZE (8u << 20)      /* GPU memory: a frame streams far less */
+#else
 #define RING_SIZE (64u << 20)
+#endif
 static void gl_check(const char *where);
 static GLuint ring;
 static uint32_t ring_pos;
@@ -167,12 +171,18 @@ static void re_endEncoding(Ctx *c)
     for (int i = 0; i < MAX_COLOR; i++) {
         if (!e->resolve[i])
             continue;
+#if defined(__vita__)
+        if (e->color[i])
+            vita_copy_quad(e->color[i], 0, 0, (float)e->tw, (float)e->th, metal_tex_fbo(e->resolve[i], 0), 0, 0,
+                           (GLsizei)e->tw, (GLsizei)e->th, 0);
+#else
         glBindFramebuffer(GL_READ_FRAMEBUFFER, e->fbo);
         glReadBuffer(GL_COLOR_ATTACHMENT0 + (GLenum)i);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, metal_tex_fbo(e->resolve[i], 0));
         glDisable(GL_SCISSOR_TEST);
         glBlitFramebuffer(0, 0, (GLint)e->tw, (GLint)e->th, 0, 0, (GLint)e->tw, (GLint)e->th,
                           GL_COLOR_BUFFER_BIT, GL_NEAREST);
+#endif
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     gpu_unlock();
@@ -303,7 +313,22 @@ static void apply_state(REnc *e, MPipeline *p)
                      (b->write_mask & 1) != 0);
     }
     MDepthStencil *ds = e->ds ? objc_host(e->ds) : NULL;
-    if (ds && (ds->compare != 7 || ds->write)) {
+#if defined(__vita__)
+    static int no_depth = -1, no_stencil = -1;
+    if (no_depth < 0) {
+        no_depth = getenv("MINA_NO_DEPTH") != NULL;
+        no_stencil = getenv("MINA_NO_STENCIL") != NULL;
+    }
+    if (no_depth && ds && !no_stencil)
+        ds = ds->stencil_enabled ? ds : NULL;
+    if (no_depth && no_stencil)
+        ds = NULL;
+#endif
+    if (ds && (ds->compare != 7 || ds->write)
+#if defined(__vita__)
+        && !no_depth
+#endif
+        ) {
         glEnable(GL_DEPTH_TEST);
         glDepthFunc(metal_gl_compare(ds->compare));
         glDepthMask(ds->write ? GL_TRUE : GL_FALSE);
@@ -311,7 +336,11 @@ static void apply_state(REnc *e, MPipeline *p)
         glDisable(GL_DEPTH_TEST);
         glDepthMask(GL_FALSE);
     }
-    if (ds && ds->stencil_enabled) {
+    if (ds && ds->stencil_enabled
+#if defined(__vita__)
+        && !no_stencil
+#endif
+        ) {
         glEnable(GL_STENCIL_TEST);
         glStencilFuncSeparate(GL_FRONT, metal_gl_compare(ds->front.compare), (GLint)e->stencil_ref, ds->front.read_mask);
         glStencilFuncSeparate(GL_BACK, metal_gl_compare(ds->back.compare), (GLint)e->stencil_ref, ds->back.read_mask);
@@ -365,6 +394,16 @@ static void bind_tex(int unit, uint64_t tex, uint64_t samp)
         return;
     }
     MTexture *t = objc_host(tex);
+#if defined(__vita__)
+    if (t->is_rb) {
+        static int n;
+        if (n++ < 5)
+            rt_log("[tex] a %ux%u renderbuffer (format %u, usage %#x) is bound for sampling\n", t->width, t->height,
+                   t->format, t->usage);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        return;
+    }
+#endif
     glBindTexture(metal_tex_target(t), t->gl);
     glBindSampler((GLuint)unit, samp ? ((MSampler *)objc_host(samp))->gl : 0);
 }
@@ -373,10 +412,15 @@ static void apply_textures(REnc *e, MPipeline *p)
 {
     for (int k = 0; k < p->ntex; k++) {
         int t = p->texb[k].tex & 15, s = p->texb[k].samp;
+        uint64_t tex = p->texb[k].stage ? e->ftex[t] : e->vtex[t];
         if (p->texb[k].stage)
-            bind_tex(p->texb[k].unit, e->ftex[t], s >= 0 ? e->fsamp[s & 15] : 0);
+            bind_tex(p->texb[k].unit, tex, s >= 0 ? e->fsamp[s & 15] : 0);
         else
-            bind_tex(p->texb[k].unit, e->vtex[t], s >= 0 ? e->vsamp[s & 15] : 0);
+            bind_tex(p->texb[k].unit, tex, s >= 0 ? e->vsamp[s & 15] : 0);
+        if (p->texb[k].size_loc >= 0 && tex) {
+            MTexture *mt = objc_host(tex);
+            glUniform2f(p->texb[k].size_loc, (GLfloat)mt->width, (GLfloat)mt->height);
+        }
     }
 }
 
@@ -475,7 +519,12 @@ static void apply_vertices(REnc *e, MPipeline *p, uint32_t max_vertex, uint32_t 
             glVertexAttribIPointer((GLuint)a, vf.size, vf.type, (GLsizei)lay->stride, off);
         else
             glVertexAttribPointer((GLuint)a, vf.size, vf.type, vf.norm, (GLsizei)lay->stride, off);
-        glVertexAttribDivisor((GLuint)a, lay->step_fn == 2 ? (lay->step_rate ? lay->step_rate : 1) : 0);
+        if (lay->step_fn == 2)
+            glVertexAttribDivisor((GLuint)a, lay->step_rate ? lay->step_rate : 1);
+#if !defined(__vita__)       /* vitaGL: divisors are only set where instancing is used */
+        else
+            glVertexAttribDivisor((GLuint)a, 0);
+#endif
     }
 }
 
@@ -504,7 +553,23 @@ static MPipeline *draw_setup(REnc *e)
     if (!e->pipeline)
         return NULL;
     MPipeline *p = objc_host(e->pipeline);
+#if defined(__vita__)
+    if (getenv("MINA_DRAWLOG")) {
+        static uint8_t seen[256][256];
+        if (p->vs >= 0 && p->vs < 256 && p->fs >= 0 && p->fs < 256 && !seen[p->vs][p->fs]++)
+            rt_log("[draw] first draw with vs %d fs %d (%d textures) prog %u\n", p->vs, p->fs, p->ntex, p->prog);
+    }
+#endif
     glUseProgram(p->prog);
+#if defined(__vita__)
+    if (getenv("MINA_DRAWLOG")) {
+        GLint cur = -1;
+        glGetIntegerv(GL_CURRENT_PROGRAM, &cur);
+        static int n;
+        if (cur != (GLint)p->prog && n++ < 10)
+            rt_log("[draw] glUseProgram(%u) left the current program at %d (vs %d fs %d)\n", p->prog, cur, p->vs, p->fs);
+    }
+#endif
     apply_state(e, p);
     apply_uniforms(e, p);
     apply_textures(e, p);
@@ -522,7 +587,10 @@ static void draw_arrays(Ctx *c, uint32_t instances)
     if (!count || !instances)
         return;
     apply_vertices(e, p, start + count - 1, instances);
-    glDrawArraysInstanced(gl_prim((uint32_t)MARG(0)), (GLint)start, (GLsizei)count, (GLsizei)instances);
+    if (instances == 1)
+        glDrawArrays(gl_prim((uint32_t)MARG(0)), (GLint)start, (GLsizei)count);
+    else
+        glDrawArraysInstanced(gl_prim((uint32_t)MARG(0)), (GLint)start, (GLsizei)count, (GLsizei)instances);
     gl_check("drawArrays");
 }
 static void re_drawPrimitives(Ctx *c) { draw_arrays(c, 1); }
@@ -559,8 +627,12 @@ static void draw_indexed(Ctx *c, uint32_t instances)
         ipos = ring_upload(idx, count * isz);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ring);
     }
-    glDrawElementsInstanced(gl_prim((uint32_t)MARG(0)), (GLsizei)count, type ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT,
-                            (const void *)(uintptr_t)ipos, (GLsizei)instances);
+    if (instances == 1)
+        glDrawElements(gl_prim((uint32_t)MARG(0)), (GLsizei)count, type ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT,
+                       (const void *)(uintptr_t)ipos);
+    else
+        glDrawElementsInstanced(gl_prim((uint32_t)MARG(0)), (GLsizei)count, type ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT,
+                                (const void *)(uintptr_t)ipos, (GLsizei)instances);
     gl_check("drawElements");
 }
 static void re_drawIndexed(Ctx *c) { draw_indexed(c, 1); }
@@ -649,21 +721,30 @@ static void be_copyTextureRegion(Ctx *c)
     GLint sx = (GLint)rt_ld64(G(so)), sy = (GLint)rt_ld64(G(so + 8));
     GLint w = (GLint)rt_ld64(G(sz)), h = (GLint)rt_ld64(G(sz + 8));
     GLint dx = (GLint)rt_ld64(G(dor)), dy = (GLint)rt_ld64(G(dor + 8));
+#if defined(__vita__)
+    vita_copy_quad(s, (float)sx, (float)sy, (float)w, (float)h, metal_tex_fbo(d, (int)dlevel), dx, dy, w, h, 0);
+#else
     glBindFramebuffer(GL_READ_FRAMEBUFFER, metal_tex_fbo(s, (int)MARG(2)));
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, metal_tex_fbo(d, (int)dlevel));
     glDisable(GL_SCISSOR_TEST);
     glBlitFramebuffer(sx, sy, sx + w, sy + h, dx, dy, dx + w, dy + h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+#endif
     gl_check("copyTexture");
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 static void be_copyTexture(Ctx *c)
 {
     MTexture *s = objc_host(MARG(0)), *d = objc_host(MARG(1));
+#if defined(__vita__)
+    vita_copy_quad(s, 0, 0, (float)s->width, (float)s->height, metal_tex_fbo(d, 0), 0, 0, (GLsizei)d->width,
+                   (GLsizei)d->height, 0);
+#else
     glBindFramebuffer(GL_READ_FRAMEBUFFER, metal_tex_fbo(s, 0));
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, metal_tex_fbo(d, 0));
     glDisable(GL_SCISSOR_TEST);
     glBlitFramebuffer(0, 0, (GLint)s->width, (GLint)s->height, 0, 0, (GLint)d->width, (GLint)d->height,
                       GL_COLOR_BUFFER_BIT, GL_NEAREST);
+#endif
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 /* copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size: */
@@ -694,7 +775,10 @@ static void be_copyBuffer(Ctx *c)
         gpu_buffer_write(d, dof, G(metal_buf_mem(s) + so), n);
         /* A whole staging buffer uploaded to GPU memory: the game never reads
          * it again (tile levels even keep them all), so its memory goes now. */
-        if (so == 0 && n == s->length && !s->fresh) {
+        static int keep = -1;
+        if (keep < 0)
+            keep = getenv("MINA_KEEP_STAGING") != NULL;
+        if (!keep && so == 0 && n == s->length && !s->fresh) {
             gfree(s->contents);
             s->contents = 0;
         }

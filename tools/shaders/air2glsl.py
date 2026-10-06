@@ -959,11 +959,14 @@ class Shader:
 
 # ---------------------------------------------------------------------------
 # CG for the Vita (vitaGL compiles CG at run time). The GLSL this translator
-# writes has a fixed shape, so it is rewritten line by line.
+# writes has a fixed shape, so it is rewritten line by line. vitaGL puts its
+# own gl_Position (POSITION) and gl_FragColor (COLOR) before every shader, so
+# the outputs are written there; sce_fp_psp2 has no tex2Dsize: the size of a
+# texture is a uniform <sampler>_texsize the runtime sets when it binds it.
 
 _CG_TYPES = [(r"\bbvec([234])\b", r"bool\1"), (r"\bivec([234])\b", r"int\1"), (r"\bvec([234])\b", r"float\1")]
 _CG_FUNCS = {"mix": "lerp", "fract": "frac", "dFdx": "ddx", "dFdy": "ddy", "inversesqrt": "rsqrt",
-             "texelFetch": "tex2Dfetch", "textureSize": "tex2Dsize"}
+             "texelFetch": "tex2Dfetch"}
 
 
 def _cg_types(text):
@@ -995,7 +998,7 @@ def _cg_ctor_casts(text):
 
 def glsl_to_cg(glsl, stage):
     head, body = glsl.split("void main() {\n", 1)
-    params, decls, samplers = [], [], {}
+    params, decls, samplers, outputs = [], [], {}, []
     for line in head.split("\n"):
         line = line.strip()
         if not line or line.startswith("#version"):
@@ -1012,7 +1015,10 @@ def glsl_to_cg(glsl, stage):
             continue
         m = re.match(r"layout\(location = (\d+)\) out vec4 (o\d+);", line)
         if m:
-            params.append("out float4 %s : COLOR%s" % (m.group(2), "" if m.group(1) == "0" else m.group(1)))
+            if m.group(1) == "0":
+                outputs.append(m.group(2))          # written to vitaGL's gl_FragColor
+            else:
+                params.append("out float4 %s : COLOR%s" % (m.group(2), m.group(1)))
             continue
         m = re.match(r"uniform (sampler\w+) (\w+);", line)
         if m:
@@ -1022,18 +1028,24 @@ def glsl_to_cg(glsl, stage):
         decls.append(_cg_types(line))
     body = _cg_types(body)
     if stage == 0:
-        params.append("out float4 vpos : POSITION")
-        body = body.replace("gl_Position", "vpos")
         if "gl_VertexID" in body:
             params.append("int vid : INDEX")
             body = body.replace("gl_VertexID", "vid")
     else:
+        for o in outputs:
+            body = re.sub(r"\b%s\b" % o, "gl_FragColor", body)
         if "gl_FragCoord" in body:
             params.append("float4 fragcoord : WPOS")
             body = body.replace("gl_FragCoord", "fragcoord")
         if "gl_FrontFacing" in body:
             params.append("float face : FACE")
             body = body.replace("gl_FrontFacing", "(face > 0.0)")
+    def texsize(m):
+        decl = "uniform float2 %s_texsize;" % m.group(1)
+        if decl not in decls:
+            decls.append(decl)
+        return "((int2)(%s_texsize))" % m.group(1)
+    body = re.sub(r"\btextureSize\((\w+), [^)]*\)", texsize, body)
     for g, c in _CG_FUNCS.items():
         body = re.sub(r"\b%s\(" % g, c + "(", body)
     # texture(s, uv): tex2D / texCUBE by the sampler's type

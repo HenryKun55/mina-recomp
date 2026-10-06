@@ -27,9 +27,20 @@ static SDL_Window *gl_window;
 
 #if defined(__vita__) && !defined(MINA_NULL_GL)
 /* vitaGL starts on the main thread at boot, before the game takes memory */
+#include <vitashark.h>
+static void shark_log(const char *msg, shark_log_level level, int line)
+{
+    static int n;
+    if (n++ < 200)
+        rt_log("[shacccg] %s (line %d): %s\n", level == SHARK_LOG_ERROR ? "error" : level == SHARK_LOG_WARNING ? "warning" : "info",
+               line, msg);
+}
+
 void metal_vita_init(void)
 {
     vglInitExtended(0x800000, 960, 544, 0x1000000, SCE_GXM_MULTISAMPLE_NONE);
+    shark_install_log_cb(shark_log);
+    shark_set_warnings_level(SHARK_WARN_HIGH);
     static const char *names[] = { "vram", "ram", "phycont", "cdlg", "newlib" };
     for (int k = 0; k < 5; k++)
         rt_log("[vgl] %s: %.1f of %.1f MiB free\n", names[k], vglMemFree((vglMemType)k) / 1048576.0,
@@ -831,8 +842,11 @@ static void link_program(MPipeline *p)
         glGetProgramInfoLog(p->prog, sizeof log, NULL, log);
         rt_fatal("program (vs %d, fs %d) does not link:\n%s", p->vs, p->fs, log);
     }
+#if !defined(__vita__)
+    /* vitaGL frees a deleted shader at once, even when a program uses it */
     glDeleteShader(vs);
     glDeleteShader(fs);
+#endif
     for (int i = 0; i < MAX_VBUF; i++)
         p->vcb[i] = p->fcb[i] = -1;
     p->ntex = 0;
@@ -856,6 +870,11 @@ static void link_program(MPipeline *p)
             } else if (sscanf(name, "fcb%d", &n) == 1 && n < MAX_VBUF) {
                 p->fcb[n] = loc;
                 p->fcb_size[n] = count;
+            } else if (strstr(name, "_texsize") && (name[0] == 'v' || name[0] == 'f') &&
+                       sscanf(name + 1, "tex%d", &n) == 1) {
+                for (int k = 0; k < p->ntex; k++)
+                    if (p->texb[k].stage == (name[0] == 'f') && p->texb[k].tex == n)
+                        p->texb[k].size_loc = loc;
             } else if ((name[0] == 'v' || name[0] == 'f') && sscanf(name + 1, "tex%d", &n) == 1 && p->ntex < 16) {
                 const char *us = strchr(name, '_');
                 int sm = (us && us[1] == 's') ? atoi(us + 2) : -1;
@@ -864,6 +883,7 @@ static void link_program(MPipeline *p)
                 p->texb[k].tex = n;
                 p->texb[k].samp = sm;
                 p->texb[k].unit = k;
+                p->texb[k].size_loc = -1;
                 glUniform1i(loc, k);
             }
         }
@@ -1350,22 +1370,24 @@ static void dr_dealloc(void *h) { objc_release_obj(((MDrawable *)h)->texture); }
 static void dr_texture(Ctx *c) { RET(((MDrawable *)objc_host(SELF))->texture); }
 static void dr_present(Ctx *c) { metal_present(SELF); }
 
-void metal_present(uint64_t drawable)
+#if defined(__vita__) && !defined(MINA_NULL_GL)
+/* A copy of a texture region (GL pixel coordinates of the Metal-sized
+ * texture) to a region of a framebuffer (0: the screen), drawn with a quad:
+ * vitaGL's glBlitFramebuffer draws only one triangle of its quad. flip_y
+ * turns the copy upside down (Metal frames to the screen). */
+void vita_copy_quad(MTexture *src, float sx, float sy, float sw, float sh, GLuint dst_fbo, GLint dx, GLint dy,
+                    GLsizei dw, GLsizei dh, int flip_y)
 {
-    MTexture *t = objc_host(((MDrawable *)objc_host(drawable))->texture);
-    gpu_lock();
-#if defined(__vita__)
-#if !defined(MINA_NULL_GL)
-    /* vitaGL's glBlitFramebuffer draws one triangle of its quad here: the
-     * frame goes to the screen with a quad of our own (Metal row 0 at the top) */
     static GLuint prog;
+    static GLint tex_loc;
     if (!prog) {
+        /* vitaGL declares gl_Position (POSITION) and gl_FragColor (COLOR) itself */
         static const char *vs =
-            "void main(float2 position, float2 texcoord, out float2 vtex : TEXCOORD0, out float4 vpos : POSITION)"
-            " { vtex = texcoord; vpos = float4(position, 0.0, 1.0); }";
+            "void main(float2 position, float2 texcoord, out float2 vtex : TEXCOORD0)"
+            " { vtex = texcoord; gl_Position = float4(position, 0.0, 1.0); }";
         static const char *fs =
             "uniform sampler2D tex;"
-            " void main(float2 vtex : TEXCOORD0, out float4 o0 : COLOR) { o0 = tex2D(tex, vtex); }";
+            " void main(float2 vtex : TEXCOORD0) { gl_FragColor = tex2D(tex, vtex); }";
         GLuint v = glCreateShader(GL_VERTEX_SHADER), f = glCreateShader(GL_FRAGMENT_SHADER);
         glShaderSource(v, 1, &vs, NULL);
         glCompileShader(v);
@@ -1380,12 +1402,16 @@ void metal_present(uint64_t drawable)
         GLint ok = 0;
         glGetProgramiv(prog, GL_LINK_STATUS, &ok);
         if (!ok)
-            rt_fatal("metal: the present shader does not link");
+            rt_fatal("metal: the copy shader does not link");
+        tex_loc = glGetUniformLocation(prog, "tex");
     }
-    static const float pos[12] = { -1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1 };
-    static const float uv[12] = { 0, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 0 };
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glViewport(0, 0, 960, 544);
+    float u0 = sx / (float)src->width, u1 = (sx + sw) / (float)src->width;
+    float v0 = sy / (float)src->height, v1 = (sy + sh) / (float)src->height;
+    float vb = flip_y ? v1 : v0, vt = flip_y ? v0 : v1;
+    const float pos[12] = { -1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1 };
+    const float uv[12] = { u0, vb, u1, vb, u0, vt, u0, vt, u1, vb, u1, vt };
+    glBindFramebuffer(GL_FRAMEBUFFER, dst_fbo);
+    glViewport(dx, dy, dw, dh);
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_CULL_FACE);
     glDisable(GL_BLEND);
@@ -1394,14 +1420,29 @@ void metal_present(uint64_t drawable)
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glUseProgram(prog);
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, t->gl);
-    glUniform1i(glGetUniformLocation(prog, "tex"), 0);
+    glBindTexture(GL_TEXTURE_2D, src->gl);
+    glBindSampler(0, 0);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glUniform1i(tex_loc, 0);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glEnableVertexAttribArray(0);
     glEnableVertexAttribArray(1);
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, pos);
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, uv);
     glDrawArrays(GL_TRIANGLES, 0, 6);
+}
+#endif
+
+void metal_present(uint64_t drawable)
+{
+    MTexture *t = objc_host(((MDrawable *)objc_host(drawable))->texture);
+    gpu_lock();
+#if defined(__vita__)
+#if !defined(MINA_NULL_GL)
+    /* vitaGL's glBlitFramebuffer draws one triangle of its quad here: the
+     * frame goes to the screen with a quad of our own (Metal row 0 at the top) */
+    vita_copy_quad(t, 0, 0, (float)t->width, (float)t->height, 0, 0, 0, 960, 544, 1);
     dump_frame(t);
     vglSwapBuffers(GL_FALSE);
 #endif

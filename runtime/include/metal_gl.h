@@ -65,6 +65,11 @@ typedef struct MTexture {
     uint32_t shift;          /* Vita: the GL texture is 2^shift times smaller (sampled only) */
 } MTexture;
 
+#if defined(__vita__) && !defined(MINA_NULL_GL)
+void vita_copy_quad(MTexture *src, float sx, float sy, float sw, float sh, GLuint dst_fbo, GLint dx, GLint dy,
+                    GLsizei dw, GLsizei dh, int flip_y);
+#endif
+
 typedef struct MSampler {
     uint32_t minf, magf, mipf, s, t, r, aniso, compare;
     float lod_min, lod_max;
@@ -115,7 +120,7 @@ typedef struct MPipeline {
     GLint vcb_size[MAX_VBUF], fcb_size[MAX_VBUF];
     /* texture bindings: stage (0 vertex, 1 fragment), Metal texture and sampler
      * indices (-1: no sampler), GL texture unit */
-    struct { int stage, tex, samp, unit; } texb[16];
+    struct { int stage, tex, samp, unit; GLint size_loc; } texb[16];   /* size_loc: CG <sampler>_texsize */
     int ntex;
     GLuint vao;
 } MPipeline;

@@ -94,8 +94,15 @@ target_compile_definitions(mina PRIVATE ${MINA_DEFS} ${MINA_RUNTIME_DEFS})
 target_compile_options(mina PRIVATE ${MINA_ARCH_FLAGS} -ffp-contract=off -fno-strict-aliasing -Wall -Wno-unused-function)
 
 if(VITA)
-  # MINA_VITAGL_LIB: another libvitaGL.a (a build of its own) instead of the SDK's
-  set(MINA_VITAGL_LIB "vitaGL" CACHE STRING "vitaGL library to link (name or path)")
+  # vitaGL: our build (tools/build_vitagl.sh: deps/vitaGL/libvitaGL.a) when it
+  # exists; the SDK's skips error handling and crashes on this game's draws
+  if(EXISTS "${CMAKE_SOURCE_DIR}/deps/vitaGL/libvitaGL.a")
+    set(MINA_VITAGL_DEFAULT "${CMAKE_SOURCE_DIR}/deps/vitaGL/libvitaGL.a")
+  else()
+    set(MINA_VITAGL_DEFAULT "vitaGL")
+    message(WARNING "deps/vitaGL/libvitaGL.a not found: linking the SDK's vitaGL (run tools/build_vitagl.sh)")
+  endif()
+  set(MINA_VITAGL_LIB "${MINA_VITAGL_DEFAULT}" CACHE STRING "vitaGL library to link (name or path)")
   target_include_directories(mina PRIVATE "$ENV{VITASDK}/arm-vita-eabi/include/SDL2")
   target_link_libraries(mina PRIVATE
     SDL2 ${MINA_VITAGL_LIB} vitashark SceShaccCgExt mathneon taihen_stub
