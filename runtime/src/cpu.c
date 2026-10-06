@@ -170,3 +170,27 @@ void rt_fatal(const char *fmt, ...)
     va_end(ap);
     abort();
 }
+
+/* Names of the guest functions on the host stack (for diagnostics). */
+void guest_backtrace(char *out, size_t cap, int max)
+{
+    out[0] = 0;
+#if !defined(__vita__)
+    void *frames[64];
+    int n = backtrace(frames, 64), k = 0;
+    char **syms = backtrace_symbols(frames, n);
+    size_t len = 0;
+    for (int i = 0; i < n && k < max; i++) {
+        const char *f = strstr(syms[i], " f_");
+        if (!f)
+            continue;
+        uint32_t off = (uint32_t)strtoul(f + 3, NULL, 16), st;
+        len += (size_t)snprintf(out + len, len < cap ? cap - len : 0, "%s%s", k ? " < " : "",
+                                func_name_at(off + GUEST_IMAGE_BASE, &st));
+        k++;
+    }
+    free(syms);
+#else
+    (void)cap; (void)max;
+#endif
+}

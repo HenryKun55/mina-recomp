@@ -8,6 +8,9 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#if !defined(__vita__)
+#include <sys/mman.h>
+#endif
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
@@ -173,12 +176,146 @@ static void imp_sincosf_stret(Ctx *c)
     c->v[1] = vset_f32(cosf(x));
 }
 
+/* ---- lazy files ---------------------------------------------------------------
+ * The engine reads whole files into memory (ycFile::Read: fopen, ftell, malloc,
+ * fread). The music banks (700 MB of Ogg streams behind small metadata) stay on
+ * the card instead:
+ *  - malloc of the bank's size returns a block holding only a prefix (the
+ *    metadata), and fread fills only that prefix;
+ *  - once the bank is parsed, every pointer in the prefix that points at an Ogg
+ *    stream of the bank (checked: "OggS" at that file offset) is moved into a
+ *    window of guest addresses that no allocation ever uses;
+ *  - the Ogg reader and ov_open read window addresses from the file. */
+
+#include <fcntl.h>
+
+#define LAZY_PREFIX (1u << 20)
+#define LAZY_WINDOW_BASE 0x40000000u
+#define LAZY_WINDOW_END 0xA0000000u
+
+typedef struct LazyBlob {
+    char path[512];
+    int fd;
+    uint64_t size;
+    uint32_t base;           /* guest address of the malloc'ed block (0 until allocated) */
+    uint32_t data;           /* where the file's first byte went (the fread target) */
+    uint32_t loaded;         /* bytes of the file actually in memory */
+    uint32_t win;            /* window address of the file's first byte */
+    int fixed;               /* pointers moved into the window */
+} LazyBlob;
+
+static LazyBlob lazy[8];
+static int nlazy;
+static uint32_t next_window = LAZY_WINDOW_BASE;
+static pthread_mutex_t lazy_lock = PTHREAD_MUTEX_INITIALIZER;
+static __thread int lazy_pending = -1;     /* blob whose malloc is expected on this thread */
+
+static int lazy_candidate(const char *path)
+{
+    const char *e = getenv("MINA_LAZY_BANKS");
+    if (e && *e == '0')
+        return 0;
+    /* big sound banks (music): sound effects stay in memory for latency */
+    size_t n = strlen(path);
+    struct stat st;
+    return n >= 10 && strcmp(path + n - 10, ".sndbnk.yc") == 0 && stat(path, &st) == 0 &&
+           st.st_size > (32 << 20);
+}
+
+/* Moves the bank's Ogg pointers into its window (after the engine parsed it). */
+void lazy_fixup(void)
+{
+    pthread_mutex_lock(&lazy_lock);
+    for (int i = 0; i < nlazy; i++) {
+        LazyBlob *b = &lazy[i];
+        if (!b->data || b->fixed)
+            continue;
+        b->fixed = 1;
+        int moved = 0;
+        uint32_t lo = (b->data + 7) & ~7u, hi = b->data + b->loaded;
+        for (uint32_t a = lo; a + 8 <= hi; a += 8) {
+            uint64_t v = rt_ld64(G(a));
+            if (v < b->data || v >= (uint64_t)b->data + b->size)
+                continue;
+            uint64_t off = v - b->data;
+            char magic[4];
+            if (pread(b->fd, magic, 4, (off_t)off) == 4 && memcmp(magic, "OggS", 4) == 0) {
+                rt_st64(G(a), (uint64_t)b->win + off);
+                moved++;
+            }
+        }
+        rt_log("[lazy] %s: %d streams on the card\n", b->path, moved);
+    }
+    pthread_mutex_unlock(&lazy_lock);
+}
+
+int lazy_contains(uint32_t addr) { return addr >= LAZY_WINDOW_BASE && addr < LAZY_WINDOW_END; }
+
+/* Guest Ogg reads: window address -> file */
+int lazy_read(uint32_t addr, void *dst, uint32_t n)
+{
+    if (!lazy_contains(addr))
+        return 0;
+    for (int i = 0; i < nlazy; i++) {
+        LazyBlob *b = &lazy[i];
+        if (addr >= b->win && addr < b->win + b->size) {
+            ssize_t r = pread(b->fd, dst, n, (off_t)(addr - b->win));
+            if (r != (ssize_t)n)
+                rt_log("[lazy] read of %u bytes at %u: %zd\n", n, addr - b->win, r);
+            return 1;
+        }
+    }
+    rt_log("[lazy] window address %#x of no bank\n", addr);
+    memset(dst, 0, n);
+    return 1;
+}
+
+static void lazy_freed(uint32_t a)
+{
+    for (int i = 0; i < nlazy; i++)
+        if (lazy[i].base == a) {
+            lazy[i].base = lazy[i].data = 0;   /* its window slice is never reused */
+            close(lazy[i].fd);
+            lazy[i].fd = -1;
+        }
+}
+
 /* ---- heap ----------------------------------------------------------------- */
 
-static void imp_malloc(Ctx *c) { RET(gmalloc(A0)); }
-static void imp_calloc(Ctx *c) { RET(gcalloc(A0, A1)); }
-static void imp_realloc(Ctx *c) { RET(grealloc((uint32_t)A0, A1)); }
-static void imp_free(Ctx *c) { gfree((uint32_t)A0); }
+static void log_big(Ctx *c, const char *what, uint64_t n)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("MINA_MEMSTAT") != NULL;
+    if (on && n >= (64u << 10)) {
+        char bt[1024];
+        void guest_backtrace(char *out, size_t cap, int max);
+        guest_backtrace(bt, sizeof bt, n >= (4u << 20) ? 4 : 3);
+        rt_log("[alloc] %s %.1f MiB: %s\n", what, n / 1048576.0, bt);
+    }
+}
+static void imp_malloc(Ctx *c)
+{
+    if (lazy_pending >= 0 && A0 >= lazy[lazy_pending].size && A0 <= lazy[lazy_pending].size + 4096) {
+        LazyBlob *b = &lazy[lazy_pending];
+        lazy_pending = -1;
+        b->base = gmalloc(LAZY_PREFIX);
+        b->data = 0;
+        rt_log("[lazy] %s: %.1f MiB stay on the card\n", b->path, b->size / 1048576.0);
+        RET(b->base);
+        return;
+    }
+    log_big(c, "malloc", A0);
+    RET(gmalloc(A0));
+}
+static void imp_calloc(Ctx *c) { log_big(c, "calloc", A0 * A1); RET(gcalloc(A0, A1)); }
+static void imp_realloc(Ctx *c) { log_big(c, "realloc", A1); RET(grealloc((uint32_t)A0, A1)); }
+static void imp_free(Ctx *c)
+{
+    if (nlazy)
+        lazy_freed((uint32_t)A0);
+    gfree((uint32_t)A0);
+}
 
 /* ---- errno ------------------------------------------------------------------ */
 
@@ -506,7 +643,23 @@ static void imp_fopen(Ctx *c)
         RET(0);
         return;
     }
-    RET(wrap_file(f));
+    uint32_t g = wrap_file(f);
+    if (lazy_candidate(path) && nlazy < 8) {
+        LazyBlob *b = &lazy[nlazy];
+        memset(b, 0, sizeof *b);
+        snprintf(b->path, sizeof b->path, "%s", path);
+        b->fd = open(path, O_RDONLY);
+        fseeko(f, 0, SEEK_END);
+        b->size = (uint64_t)ftello(f);
+        fseeko(f, 0, SEEK_SET);
+        b->win = next_window;
+        next_window += (uint32_t)((b->size + (16u << 20)) & ~((16ull << 20) - 1));
+        if (next_window > LAZY_WINDOW_END)
+            rt_fatal("lazy window exhausted");
+        rt_st32(G(g + 4), (uint32_t)nlazy + 1);    /* marks the FILE as lazy */
+        nlazy++;
+    }
+    RET(g);
 }
 static void imp_fclose(Ctx *c)
 {
@@ -515,10 +668,44 @@ static void imp_fclose(Ctx *c)
     if (f) gfree((uint32_t)A0);
     RET((int64_t)r);
 }
-static void imp_fread(Ctx *c) { FILE *f = host_file(A3); RET(f ? fread(G(A0), (size_t)A1, (size_t)A2, f) : 0); }
+static void imp_fread(Ctx *c)
+{
+    FILE *f = host_file(A3);
+    if (!f) {
+        RET(0);
+        return;
+    }
+    uint32_t li = rt_ld32(G(A3 + 4));
+    uint64_t want = A1 * A2;
+    LazyBlob *lb = li ? &lazy[li - 1] : NULL;
+    if (lb && lb->base && A0 >= lb->base && A0 < lb->base + LAZY_PREFIX && want > LAZY_PREFIX / 2) {
+        /* the allocator may put a header first: the file starts at A0 */
+        size_t room = LAZY_PREFIX - (size_t)(A0 - lb->base);
+        size_t got = fread(G(A0), 1, room, f);
+        lb->loaded = (uint32_t)got;
+        lb->fixed = 0;
+        lb->data = (uint32_t)A0;
+        fseeko(f, (off_t)want - (off_t)got, SEEK_CUR);
+        RET(A1 ? want / A1 : 0);
+        return;
+    }
+    RET(fread(G(A0), (size_t)A1, (size_t)A2, f));
+}
 static void imp_fwrite(Ctx *c) { FILE *f = host_file(A3); RET(f ? fwrite(G(A0), (size_t)A1, (size_t)A2, f) : 0); }
 static void imp_fseek(Ctx *c) { FILE *f = host_file(A0); RET(f ? (int64_t)fseeko(f, (off_t)(int64_t)A1, (int)A2) : -1); }
-static void imp_ftell(Ctx *c) { FILE *f = host_file(A0); RET(f ? (int64_t)ftello(f) : -1); }
+static void imp_ftell(Ctx *c)
+{
+    FILE *f = host_file(A0);
+    if (!f) {
+        RET((uint64_t)-1);
+        return;
+    }
+    uint32_t li = rt_ld32(G(A0 + 4));
+    off_t pos = ftello(f);
+    if (li && (uint64_t)pos == lazy[li - 1].size)
+        lazy_pending = (int)li - 1;            /* the next malloc of this size is the blob */
+    RET((int64_t)pos);
+}
 static void imp_fflush(Ctx *c) { FILE *f = host_file(A0); RET(f ? (int64_t)fflush(f) : 0); }
 static void imp_ferror(Ctx *c) { FILE *f = host_file(A0); RET(f ? (int64_t)ferror(f) : 1); }
 static void imp_rewind(Ctx *c) { FILE *f = host_file(A0); if (f) rewind(f); }
@@ -724,6 +911,7 @@ static void imp_mmap(Ctx *c)
         RET((uint64_t)-1);
         return;
     }
+    log_big(c, "mmap", len);
     uint32_t a = gmemalign(16384, len);
     if (!a) {
         RET((uint64_t)-1);

@@ -133,7 +133,7 @@ uint32_t thread_spawn(void (*fn)(Ctx *, void *), void *arg, uint32_t stack_size)
     j->t = t;
     pthread_attr_t ha;
     pthread_attr_init(&ha);
-    pthread_attr_setstacksize(&ha, 1024 * 1024);
+    pthread_attr_setstacksize(&ha, 2 * 1024 * 1024);
     pthread_attr_setdetachstate(&ha, PTHREAD_CREATE_DETACHED);
     pthread_create(&t->host, &ha, host_job_main, j);
     pthread_attr_destroy(&ha);
@@ -197,7 +197,7 @@ static void imp_pthread_create(Ctx *c)
     t->ctx->thread_id = rt_ld32(G(t->id));
     pthread_attr_t ha;
     pthread_attr_init(&ha);
-    pthread_attr_setstacksize(&ha, 1024 * 1024);   /* host frames of the recompiled code */
+    pthread_attr_setstacksize(&ha, 2 * 1024 * 1024);   /* host frames of the recompiled code */
     if (detached)
         pthread_attr_setdetachstate(&ha, PTHREAD_CREATE_DETACHED);
     int r = pthread_create(&t->host, &ha, thread_main, t);
@@ -502,7 +502,7 @@ static void spawn_job(AsyncJob *j)
     pthread_t th;
     pthread_attr_t ha;
     pthread_attr_init(&ha);
-    pthread_attr_setstacksize(&ha, 1024 * 1024);
+    pthread_attr_setstacksize(&ha, 2 * 1024 * 1024);
     pthread_attr_setdetachstate(&ha, PTHREAD_CREATE_DETACHED);
     pthread_create(&th, &ha, async_main, j);
     pthread_attr_destroy(&ha);

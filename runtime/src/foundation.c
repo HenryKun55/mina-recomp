@@ -344,6 +344,8 @@ static Class cls_NSMutableArray = { "NSMutableArray", "NSArray", NULL, NULL, 0, 
 static void imp_NSSearchPathForDirectoriesInDomains(Ctx *c)
 {
     const char *home = getenv("HOME");
+    if (!home)
+        home = "ux0:data/mina/home";
     char path[1024];
     switch ((int)A0) {
     case 14: snprintf(path, sizeof path, "%s/Library/Application Support", home); break;   /* ApplicationSupport */
@@ -450,7 +452,11 @@ static Class cls_NSFileManager = { "NSFileManager", "NSObject", nsfm_i, nsfm_c, 
 
 /* ---- NSBundle / NSProcessInfo ------------------------------------------------------------ */
 
+#if defined(__vita__)
+const char *g_bundle_path = "ux0:data/mina";
+#else
 const char *g_bundle_path = "gamedata/app";
+#endif
 static uint64_t main_bundle, process_info;
 static Class cls_NSBundle, cls_NSProcessInfo;
 

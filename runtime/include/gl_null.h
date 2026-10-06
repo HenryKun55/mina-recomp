@@ -1,0 +1,245 @@
+/*
+ * A null OpenGL: every call the Metal layer makes does nothing (or answers
+ * "complete / compiled / linked"). The first Vita builds run the game logic
+ * with it, to measure CPU and memory before the vitaGL renderer exists.
+ */
+#ifndef MINA_GL_NULL_H
+#define MINA_GL_NULL_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+typedef unsigned int GLenum, GLuint, GLbitfield;
+typedef int GLint, GLsizei;
+typedef unsigned char GLboolean;
+typedef float GLfloat;
+typedef double GLdouble;
+typedef char GLchar;
+typedef ptrdiff_t GLintptr, GLsizeiptr;
+#define GL_TRUE 1
+#define GL_FALSE 0
+
+#define GL_ACTIVE_UNIFORMS 0x8B86
+#define GL_ALWAYS 0x0207
+#define GL_ARRAY_BUFFER 0x8892
+#define GL_BACK 0x0405
+#define GL_BGRA 0x80E1
+#define GL_BLEND 0x0BE2
+#define GL_BYTE 0x1400
+#define GL_CCW 0x0901
+#define GL_CLAMP_TO_BORDER 0x812D
+#define GL_CLAMP_TO_EDGE 0x812F
+#define GL_COLOR 0x1800
+#define GL_COLOR_ATTACHMENT0 0x8CE0
+#define GL_COLOR_BUFFER_BIT 0x00004000
+#define GL_COMPARE_REF_TO_TEXTURE 0x884E
+#define GL_COMPILE_STATUS 0x8B81
+#define GL_COMPRESSED_RGBA_BPTC_UNORM 0x8E8C
+#define GL_COMPRESSED_RGBA_S3TC_DXT1_EXT 0x83F1
+#define GL_COMPRESSED_RGBA_S3TC_DXT3_EXT 0x83F2
+#define GL_COMPRESSED_RGBA_S3TC_DXT5_EXT 0x83F3
+#define GL_CONSTANT_ALPHA 0x8003
+#define GL_CONSTANT_COLOR 0x8001
+#define GL_CULL_FACE 0x0B44
+#define GL_CW 0x0900
+#define GL_DECR 0x1E03
+#define GL_DECR_WRAP 0x8508
+#define GL_DEPTH 0x1801
+#define GL_DEPTH24_STENCIL8 0x88F0
+#define GL_DEPTH32F_STENCIL8 0x8CAD
+#define GL_DEPTH_ATTACHMENT 0x8D00
+#define GL_DEPTH_COMPONENT 0x1902
+#define GL_DEPTH_COMPONENT16 0x81A5
+#define GL_DEPTH_COMPONENT32F 0x8CAC
+#define GL_DEPTH_STENCIL 0x84F9
+#define GL_DEPTH_STENCIL_ATTACHMENT 0x821A
+#define GL_DEPTH_TEST 0x0B71
+#define GL_DRAW_FRAMEBUFFER 0x8CA9
+#define GL_DST_ALPHA 0x0304
+#define GL_DST_COLOR 0x0306
+#define GL_ELEMENT_ARRAY_BUFFER 0x8893
+#define GL_EQUAL 0x0202
+#define GL_FLOAT 0x1406
+#define GL_FLOAT_32_UNSIGNED_INT_24_8_REV 0x8DAD
+#define GL_FRAGMENT_SHADER 0x8B30
+#define GL_FRAMEBUFFER 0x8D40
+#define GL_FRAMEBUFFER_COMPLETE 0x8CD5
+#define GL_FRONT 0x0404
+#define GL_FUNC_ADD 0x8006
+#define GL_FUNC_REVERSE_SUBTRACT 0x800B
+#define GL_FUNC_SUBTRACT 0x800A
+#define GL_GEQUAL 0x0206
+#define GL_GREATER 0x0204
+#define GL_HALF_FLOAT 0x140B
+#define GL_INCR 0x1E02
+#define GL_INCR_WRAP 0x8507
+#define GL_INT 0x1404
+#define GL_INVERT 0x150A
+#define GL_KEEP 0x1E00
+#define GL_LEQUAL 0x0203
+#define GL_LESS 0x0201
+#define GL_LINEAR 0x2601
+#define GL_LINEAR_MIPMAP_LINEAR 0x2703
+#define GL_LINEAR_MIPMAP_NEAREST 0x2701
+#define GL_LINES 0x0001
+#define GL_LINE_STRIP 0x0003
+#define GL_LINK_STATUS 0x8B82
+#define GL_MAX 0x8008
+#define GL_MIN 0x8007
+#define GL_MIRRORED_REPEAT 0x8370
+#define GL_NEAREST 0x2600
+#define GL_NEAREST_MIPMAP_LINEAR 0x2702
+#define GL_NEAREST_MIPMAP_NEAREST 0x2700
+#define GL_NEVER 0x0200
+#define GL_NONE 0
+#define GL_NOTEQUAL 0x0205
+#define GL_NO_ERROR 0
+#define GL_ONE 1
+#define GL_ONE_MINUS_CONSTANT_ALPHA 0x8004
+#define GL_ONE_MINUS_CONSTANT_COLOR 0x8002
+#define GL_ONE_MINUS_DST_ALPHA 0x0305
+#define GL_ONE_MINUS_DST_COLOR 0x0307
+#define GL_ONE_MINUS_SRC_ALPHA 0x0303
+#define GL_ONE_MINUS_SRC_COLOR 0x0301
+#define GL_PACK_ALIGNMENT 0x0D05
+#define GL_PACK_ROW_LENGTH 0x0D02
+#define GL_POINTS 0x0000
+#define GL_POLYGON_OFFSET_FILL 0x8037
+#define GL_R11F_G11F_B10F 0x8C3A
+#define GL_R16F 0x822D
+#define GL_R32F 0x822E
+#define GL_R8 0x8229
+#define GL_READ_FRAMEBUFFER 0x8CA8
+#define GL_RED 0x1903
+#define GL_REPEAT 0x2901
+#define GL_REPLACE 0x1E01
+#define GL_RG 0x8227
+#define GL_RG16F 0x822F
+#define GL_RG32F 0x8230
+#define GL_RG8 0x822B
+#define GL_RGB 0x1907
+#define GL_RGB10_A2 0x8059
+#define GL_RGBA 0x1908
+#define GL_RGBA16 0x805B
+#define GL_RGBA16F 0x881A
+#define GL_RGBA32F 0x8814
+#define GL_RGBA8 0x8058
+#define GL_SCISSOR_TEST 0x0C11
+#define GL_SHORT 0x1402
+#define GL_SRC_ALPHA 0x0302
+#define GL_SRC_ALPHA_SATURATE 0x0308
+#define GL_SRC_COLOR 0x0300
+#define GL_SRGB8_ALPHA8 0x8C43
+#define GL_STENCIL 0x1802
+#define GL_STENCIL_TEST 0x0B90
+#define GL_STREAM_DRAW 0x88E0
+#define GL_TEXTURE0 0x84C0
+#define GL_TEXTURE_2D 0x0DE1
+#define GL_TEXTURE_2D_ARRAY 0x8C1A
+#define GL_TEXTURE_2D_MULTISAMPLE 0x9100
+#define GL_TEXTURE_COMPARE_FUNC 0x884D
+#define GL_TEXTURE_COMPARE_MODE 0x884C
+#define GL_TEXTURE_CUBE_MAP 0x8513
+#define GL_TEXTURE_CUBE_MAP_POSITIVE_X 0x8515
+#define GL_TEXTURE_MAG_FILTER 0x2800
+#define GL_TEXTURE_MAX_LEVEL 0x813D
+#define GL_TEXTURE_MAX_LOD 0x813B
+#define GL_TEXTURE_MIN_FILTER 0x2801
+#define GL_TEXTURE_MIN_LOD 0x813A
+#define GL_TEXTURE_WRAP_R 0x8072
+#define GL_TEXTURE_WRAP_S 0x2802
+#define GL_TEXTURE_WRAP_T 0x2803
+#define GL_TRIANGLES 0x0004
+#define GL_TRIANGLE_STRIP 0x0005
+#define GL_UNPACK_ALIGNMENT 0x0CF5
+#define GL_UNPACK_ROW_LENGTH 0x0CF2
+#define GL_UNSIGNED_BYTE 0x1401
+#define GL_UNSIGNED_INT 0x1405
+#define GL_UNSIGNED_INT_10F_11F_11F_REV 0x8C3B
+#define GL_UNSIGNED_INT_24_8 0x84FA
+#define GL_UNSIGNED_INT_2_10_10_10_REV 0x8368
+#define GL_UNSIGNED_SHORT 0x1403
+#define GL_VERTEX_SHADER 0x8B31
+#define GL_ZERO 0
+
+static GLuint gl_null_next = 1;
+#define glActiveTexture(...) ((void)0)
+#define glAttachShader(...) ((void)0)
+#define glBindBuffer(...) ((void)0)
+#define glBindFramebuffer(...) ((void)0)
+#define glBindSampler(...) ((void)0)
+#define glBindTexture(...) ((void)0)
+#define glBindVertexArray(...) ((void)0)
+#define glBlendEquationSeparatei(...) ((void)0)
+#define glBlendFuncSeparatei(...) ((void)0)
+#define glBlitFramebuffer(...) ((void)0)
+#define glBufferData(...) ((void)0)
+#define glBufferSubData(...) ((void)0)
+static inline GLenum glCheckFramebufferStatus(GLenum t) { (void)t; return GL_FRAMEBUFFER_COMPLETE; }
+#define glClearBufferfv(...) ((void)0)
+#define glClearBufferiv(...) ((void)0)
+#define glColorMaski(...) ((void)0)
+#define glCompileShader(...) ((void)0)
+#define glCompressedTexImage2D(...) ((void)0)
+#define glCompressedTexSubImage2D(...) ((void)0)
+static inline GLuint glCreateProgram(void) { return gl_null_next++; }
+static inline GLuint glCreateShader(GLenum t) { (void)t; return gl_null_next++; }
+#define glCullFace(...) ((void)0)
+#define glDeleteFramebuffers(...) ((void)0)
+#define glDeleteProgram(...) ((void)0)
+#define glDeleteSamplers(...) ((void)0)
+#define glDeleteShader(...) ((void)0)
+#define glDeleteTextures(...) ((void)0)
+#define glDeleteVertexArrays(...) ((void)0)
+#define glDepthFunc(...) ((void)0)
+#define glDepthMask(...) ((void)0)
+#define glDepthRange(...) ((void)0)
+#define glDisable(...) ((void)0)
+#define glDisablei(...) ((void)0)
+#define glDrawArraysInstanced(...) ((void)0)
+#define glDrawBuffers(...) ((void)0)
+#define glDrawElementsInstanced(...) ((void)0)
+#define glEnable(...) ((void)0)
+#define glEnableVertexAttribArray(...) ((void)0)
+#define glEnablei(...) ((void)0)
+#define glFramebufferTexture2D(...) ((void)0)
+#define glFrontFace(...) ((void)0)
+static inline void glGenBuffers(GLsizei n, GLuint *ids) { for (GLsizei i = 0; i < n; i++) ids[i] = gl_null_next++; }
+static inline void glGenFramebuffers(GLsizei n, GLuint *ids) { for (GLsizei i = 0; i < n; i++) ids[i] = gl_null_next++; }
+static inline void glGenSamplers(GLsizei n, GLuint *ids) { for (GLsizei i = 0; i < n; i++) ids[i] = gl_null_next++; }
+static inline void glGenTextures(GLsizei n, GLuint *ids) { for (GLsizei i = 0; i < n; i++) ids[i] = gl_null_next++; }
+static inline void glGenVertexArrays(GLsizei n, GLuint *ids) { for (GLsizei i = 0; i < n; i++) ids[i] = gl_null_next++; }
+#define glGenerateMipmap(...) ((void)0)
+#define glGetActiveUniform(...) ((void)0)
+static inline GLenum glGetError(void) { return 0; }
+#define glGetProgramInfoLog(...) ((void)0)
+static inline void glGetProgramiv(GLuint p, GLenum e, GLint *v) { (void)p; *v = e == GL_ACTIVE_UNIFORMS ? 0 : 1; }
+#define glGetShaderInfoLog(...) ((void)0)
+static inline void glGetShaderiv(GLuint s, GLenum e, GLint *v) { (void)s; (void)e; *v = 1; }
+static inline GLint glGetUniformLocation(GLuint p, const GLchar *n) { (void)p; (void)n; return -1; }
+#define glLinkProgram(...) ((void)0)
+#define glPixelStorei(...) ((void)0)
+#define glPolygonOffset(...) ((void)0)
+#define glReadBuffer(...) ((void)0)
+#define glReadPixels(...) ((void)0)
+#define glSamplerParameterf(...) ((void)0)
+#define glSamplerParameteri(...) ((void)0)
+#define glScissor(...) ((void)0)
+#define glShaderSource(...) ((void)0)
+#define glStencilFuncSeparate(...) ((void)0)
+#define glStencilMask(...) ((void)0)
+#define glStencilMaskSeparate(...) ((void)0)
+#define glStencilOpSeparate(...) ((void)0)
+#define glTexImage2D(...) ((void)0)
+#define glTexImage2DMultisample(...) ((void)0)
+#define glTexParameteri(...) ((void)0)
+#define glTexSubImage2D(...) ((void)0)
+#define glUniform1i(...) ((void)0)
+#define glUniform4fv(...) ((void)0)
+#define glUseProgram(...) ((void)0)
+#define glVertexAttribDivisor(...) ((void)0)
+#define glVertexAttribIPointer(...) ((void)0)
+#define glVertexAttribPointer(...) ((void)0)
+#define glViewport(...) ((void)0)
+
+#endif

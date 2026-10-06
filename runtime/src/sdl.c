@@ -11,6 +11,7 @@
 
 #include <SDL.h>
 #include <SDL_syswm.h>
+#include <math.h>
 #include <string.h>
 
 extern const char *g_bundle_path;
@@ -64,6 +65,9 @@ static void gl_attributes(void)
  * first): it starts on a hidden window and moves to the game's window. */
 static void gl_ensure(void)
 {
+#if defined(__vita__)
+    return;      /* the Vita renderer owns the display (vitaGL), not SDL */
+#endif
     if (gl_context)
         return;
     gl_attributes();
@@ -206,10 +210,18 @@ void nat_SDL_CreateWindow(Ctx *c)
     if (!getenv("MINA_FULLSCREEN"))
         flags &= ~(uint32_t)SDL_WINDOW_FULLSCREEN_DESKTOP;
     gl_attributes();
+#if defined(__vita__)
+    /* no SDL window: the handle stands for the Vita's screen */
+    (void)flags;
+    SDL_Window *w = (SDL_Window *)(uintptr_t)0x56495441u;
+#else
     SDL_Window *w = SDL_CreateWindow(gstr(A0), SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                      (int)A3, (int)A4, flags);
+#endif
+#if !defined(__vita__)
     if (w)
         SDL_RaiseWindow(w);       /* started from a terminal, the app is not active */
+#endif
     if (!w) {
         rt_log("SDL_CreateWindow failed: %s\n", SDL_GetError());
         RET(0);
@@ -236,7 +248,12 @@ void nat_SDL_DestroyWindow(Ctx *c)
 }
 void nat_SDL_GetWindowID(Ctx *c) { RET(SDL_GetWindowID(window_host(A0))); }
 void nat_SDL_GetWindowSize(Ctx *c)
-{ ON_MAIN(nat_SDL_GetWindowSize);
+{
+#if defined(__vita__)
+    put_int(A1, 960);
+    put_int(A2, 544);
+    return;
+#endif ON_MAIN(nat_SDL_GetWindowSize);
     int w = 0, h = 0;
     SDL_GetWindowSize(window_host(A0), &w, &h);
     put_int(A1, w);
@@ -372,8 +389,14 @@ void nat_SDL_FilterEvents(Ctx *c)
 void nat_SDL_RegisterEvents(Ctx *c) { RET(SDL_RegisterEvents((int)A0)); }
 /* MINA_INPUT="8:Return 12:Down 13.5:Return": scripted key taps (seconds since
  * start : SDL key name), injected as real key events for testing. */
+void mem_report(void);
 static void scripted_input(void)
 {
+    static Uint32 last_mem;
+    if (getenv("MINA_MEMSTAT") && SDL_GetTicks() - last_mem > 5000) {
+        last_mem = SDL_GetTicks();
+        mem_report();
+    }
     static int parsed, n, next;
     static struct { Uint32 at; SDL_Scancode sc; int up; } ev[256];
     if (!parsed) {
@@ -550,6 +573,22 @@ static void SDLCALL host_audio(void *ud, Uint8 *stream, int len)
     memset(G(audio_buf), 0, (size_t)len);
     guest_call(c, audio_cb, 3, audio_ud, (uint64_t)audio_buf, (uint64_t)len);
     memcpy(stream, G(audio_buf), (size_t)len);
+    /* MINA_MEMSTAT: output level once a second (checks that music plays) */
+    static double acc;
+    static long nsamp;
+    static Uint32 last;
+    if (getenv("MINA_MEMSTAT")) {
+        const float *f = (const float *)stream;
+        for (int i = 0; i < len / 4; i++)
+            acc += (double)f[i] * f[i];
+        nsamp += len / 4;
+        if (SDL_GetTicks() - last > 1000) {
+            last = SDL_GetTicks();
+            rt_log("[audio] rms %.4f\n", nsamp ? sqrt(acc / (double)nsamp) : 0.0);
+            acc = 0;
+            nsamp = 0;
+        }
+    }
 }
 
 static void spec_from_guest(SDL_AudioSpec *s, uint64_t g)

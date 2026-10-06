@@ -14,7 +14,9 @@
 
 #include "objc_rt.h"
 
-#if defined(__APPLE__)
+#if defined(MINA_NULL_GL)
+#include "gl_null.h"
+#elif defined(__APPLE__)
 #define GL_SILENCE_DEPRECATION
 #include <OpenGL/gl3.h>
 #else

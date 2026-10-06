@@ -16,11 +16,20 @@ static uint32_t guest_strv(int n, char **v)
     return arr;
 }
 
+#if defined(__vita__)
+/* the recompiled code keeps its frames on the host stack: give it room */
+int sceUserMainThreadStackSize = 8 * 1024 * 1024;
+#endif
+
 int main(int argc, char **argv)
 {
     const char *exe = getenv("MINA_EXE");
     if (!exe)
+#if defined(__vita__)
+        exe = "ux0:data/mina/Contents/MacOS/MinaTheHollower";
+#else
         exe = "gamedata/app/Contents/MacOS/MinaTheHollower";
+#endif
     if (getenv("MINA_TRACE"))
         g_trace_imports = 1;
 

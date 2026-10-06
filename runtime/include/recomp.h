@@ -96,7 +96,8 @@ void rt_bad_jump(Ctx *c, uint32_t pc, uint64_t target) __attribute__((noreturn))
 /* ---- memory ------------------------------------------------------------ */
 
 #ifndef GA
-#define GA(a) (gm + (uint32_t)(a))
+/* uintptr_t arithmetic: on the Vita guest addresses wrap modulo 2^32 around g_mem */
+#define GA(a) ((uint8_t *)((uintptr_t)gm + (uint32_t)(a)))
 #endif
 
 static inline uint32_t rt_ld8(const uint8_t *p) { return *p; }
@@ -122,7 +123,7 @@ static inline void rt_st128(uint8_t *p, V128 v) { memcpy(p, &v, 16); }
 #define ST128(a, v) rt_st128(GA(a), (v))
 
 /* Host pointer of a guest address (for the runtime and the natives). */
-static inline void *G(uint64_t a) { return g_mem + (uint32_t)a; }
+static inline void *G(uint64_t a) { return (void *)((uintptr_t)g_mem + (uint32_t)a); }
 
 /* ---- atomics (guest threads are host threads) -------------------------- */
 

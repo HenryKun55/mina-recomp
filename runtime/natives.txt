@@ -60,3 +60,9 @@ _SDL_WaitEvent
 _SDL_WarpMouseGlobal
 _SDL_free
 _SDL_memset
+
+# Audio (runtime/src/audio.c)
+__ZN7ycAudio7Decoder9ycOggReadEPvmmS1_
+_ov_open_callbacks
+__ZN7ycAudio11FileManager10LoadEventsEPNS_10BankHandleEP15ycAudioItemBaseb
+__ZN7ycAudio11FileManager11CacheEventsEPKNS_10BankHandleEP15ycAudioItemBaseb

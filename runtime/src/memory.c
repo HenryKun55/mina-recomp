@@ -12,18 +12,109 @@
 
 uint8_t *g_mem;
 
-#define HEAP_BASE   0x07000000u
+/* Mac heap above the lazy-bank window (0x40000000-0xA0000000, see libc.c) */
+#define HEAP_BASE   0xA0000000u
+#define HEAP_END    0xF8000000u
+
 #if defined(__vita__)
-#define HEAP_END    0x10000000u   /* placeholder: the Vita build sizes it at init */
-#else
-#define HEAP_END    0xF0000000u
-#endif
+/* Vita: the image is one host block and g_mem = block - GUEST_IMAGE_BASE.
+ * Pointers are 32-bit, so every host pointer p is the guest address
+ * p - g_mem (mod 2^32): the guest heap is newlib's malloc. */
+#include <malloc.h>
+int _newlib_heap_size_user = 300 * 1024 * 1024;
 
 void mem_init(void)
 {
-#if defined(__vita__)
-    rt_fatal("mem_init: Vita memory model not done yet");
+    uint32_t end = GUEST_IMAGE_BASE;
+    for (uint32_t k = 0; k < g_segment_count; k++)
+        if (g_segments[k].addr + g_segments[k].size > end)
+            end = g_segments[k].addr + g_segments[k].size;
+    uint8_t *block = memalign(16384, end - GUEST_IMAGE_BASE);
+    if (!block)
+        rt_fatal("cannot allocate the image (%u bytes)", end - GUEST_IMAGE_BASE);
+    g_mem = (uint8_t *)((uintptr_t)block - GUEST_IMAGE_BASE);
+}
+
+uint32_t rt_alloc(uint32_t size, uint32_t align)
+{
+    void *p = memalign(align < 8 ? 8 : align, size);
+    if (!p)
+        rt_fatal("runtime allocation of %u bytes failed", size);
+    memset(p, 0, size);
+    return guest_addr(p);
+}
+
+static uint64_t heap_in_use;
+
+uint32_t gmalloc(uint64_t size)
+{
+    if (size > 0x20000000ull)
+        return 0;
+    void *p = memalign(16, size ? (size_t)size : 1);
+    if (!p) {
+        rt_log("guest heap: %llu bytes not available\n", (unsigned long long)size);
+        return 0;
+    }
+    heap_in_use += malloc_usable_size(p);
+    return guest_addr(p);
+}
+void gfree(uint32_t a)
+{
+    if (!a)
+        return;
+    heap_in_use -= malloc_usable_size(G(a));
+    free(G(a));
+}
+uint64_t gmalloc_usable(uint32_t a) { return malloc_usable_size(G(a)); }
+uint32_t gcalloc(uint64_t n, uint64_t size)
+{
+    uint64_t total = n * size;
+    uint32_t a = gmalloc(total);
+    if (a)
+        memset(G(a), 0, (size_t)total);
+    return a;
+}
+uint32_t grealloc(uint32_t a, uint64_t size)
+{
+    if (!a)
+        return gmalloc(size);
+    if (!size) {
+        gfree(a);
+        return 0;
+    }
+    size_t old = malloc_usable_size(G(a));
+    uint32_t b = gmalloc(size);
+    if (!b)
+        return 0;
+    memcpy(G(b), G(a), old < size ? old : (size_t)size);
+    gfree(a);
+    return b;
+}
+uint32_t gmemalign(uint64_t align, uint64_t size)
+{
+    void *p = memalign((size_t)align, (size_t)size);
+    if (!p)
+        return 0;
+    heap_in_use += malloc_usable_size(p);
+    return guest_addr(p);
+}
+uint32_t gstrdup(const char *s)
+{
+    size_t n = strlen(s) + 1;
+    uint32_t a = gmalloc(n);
+    memcpy(G(a), s, n);
+    return a;
+}
+void mem_report(void)
+{
+    struct mallinfo mi = mallinfo();
+    rt_log("[mem] guest heap %.1f MiB, newlib arena %.1f MiB\n", heap_in_use / 1048576.0, mi.arena / 1048576.0);
+}
+
 #else
+
+void mem_init(void)
+{
     void *p = mmap(NULL, 0x100000000ull, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (p == MAP_FAILED)
         rt_fatal("cannot reserve the guest address space");
@@ -32,7 +123,8 @@ void mem_init(void)
      * OS); the first 64 KiB stay unmapped so null pointers fault. */
     if (mprotect(g_mem + GUEST_NULL_GUARD, HEAP_END - GUEST_NULL_GUARD, PROT_READ | PROT_WRITE) != 0)
         rt_fatal("cannot map the guest address space");
-#endif
+    /* the lazy-bank window is never memory: a stray access faults */
+    mprotect(g_mem + 0x40000000u, 0x60000000u, PROT_NONE);
 }
 
 /* ---- runtime area -------------------------------------------------------- */
@@ -220,3 +312,15 @@ uint32_t gstrdup(const char *s)
     memcpy(G(a), s, n);
     return a;
 }
+
+/* MINA_MEMSTAT: heap figures for the memory budget (Vita) */
+void mem_report(void)
+{
+    static uint64_t peak;
+    if (heap_in_use > peak)
+        peak = heap_in_use;
+    rt_log("[mem] heap in use %.1f MiB (peak %.1f), heap span %.1f MiB\n", heap_in_use / 1048576.0,
+           peak / 1048576.0, (heap_top - HEAP_BASE) / 1048576.0);
+}
+
+#endif

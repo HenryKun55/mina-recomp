@@ -26,7 +26,7 @@ uint32_t rt_alloc(uint32_t size, uint32_t align);
 /* A NUL-terminated copy of a host string in guest memory (gmalloc'ed). */
 uint32_t gstrdup(const char *s);
 
-static inline uint32_t guest_addr(const void *p) { return (uint32_t)((const uint8_t *)p - g_mem); }
+static inline uint32_t guest_addr(const void *p) { return (uint32_t)((uintptr_t)p - (uintptr_t)g_mem); }
 static inline const char *gstr(uint64_t a) { return a ? (const char *)G(a) : NULL; }
 
 /* ---- loader ---------------------------------------------------------- */

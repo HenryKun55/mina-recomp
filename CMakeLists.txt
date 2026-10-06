@@ -1,5 +1,14 @@
 cmake_minimum_required(VERSION 3.20)
+if(DEFINED ENV{VITASDK} AND CMAKE_TOOLCHAIN_FILE MATCHES "vita")
+  set(VITA ON)
+endif()
 project(mina-recomp C)
+if(VITA)
+  include("$ENV{VITASDK}/share/vita.cmake" REQUIRED)
+  set(VITA_APP_NAME "Mina the Hollower")
+  set(VITA_TITLEID "MINA00001")
+  set(VITA_VERSION "00.01")
+endif()
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_EXTENSIONS ON)
@@ -47,20 +56,47 @@ if(NOT SHADER_RESULT EQUAL 0)
 endif()
 list(TRANSFORM GEN_FILES PREPEND "${GEN_DIR}/")
 
+if(VITA)
+  # Cortex-A9: no FMA (fused multiply-add rounds once more), NEON for the vector helpers
+  set(MINA_ARCH_FLAGS -march=armv7-a -mtune=cortex-a9 -mfpu=neon -mfloat-abi=hard -mthumb -O2)
+  set(MINA_DEFS MINA_FAST_FMA)
+  option(MINA_VITA_NULL_GL "Vita build without a renderer (game logic only)" ON)
+  if(MINA_VITA_NULL_GL)
+    list(APPEND MINA_DEFS MINA_NULL_GL)
+  endif()
+else()
+  set(MINA_ARCH_FLAGS)
+  set(MINA_DEFS)
+endif()
+
 add_library(mina_gen OBJECT ${GEN_FILES} ${GEN_DIR}/tables.c)
 target_include_directories(mina_gen PRIVATE runtime/include ${GEN_DIR})
-target_compile_options(mina_gen PRIVATE -ffp-contract=off -fno-strict-aliasing
+target_compile_definitions(mina_gen PRIVATE ${MINA_DEFS})
+target_compile_options(mina_gen PRIVATE ${MINA_ARCH_FLAGS} -ffp-contract=off -fno-strict-aliasing
   -Wno-unused-label -Wno-unused-variable -Wno-unused-but-set-variable)
 
 # ---- runtime ----------------------------------------------------------------
 file(GLOB RUNTIME_SOURCES runtime/src/*.c)
 add_executable(mina ${RUNTIME_SOURCES} ${GEN_DIR}/shaders.c $<TARGET_OBJECTS:mina_gen>)
 target_include_directories(mina PRIVATE runtime/include ${GEN_DIR})
-target_compile_options(mina PRIVATE -ffp-contract=off -fno-strict-aliasing -Wall -Wno-unused-function)
+target_compile_definitions(mina PRIVATE ${MINA_DEFS})
+target_compile_options(mina PRIVATE ${MINA_ARCH_FLAGS} -ffp-contract=off -fno-strict-aliasing -Wall -Wno-unused-function)
 
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(SDL2 REQUIRED IMPORTED_TARGET sdl2)
-target_link_libraries(mina PRIVATE PkgConfig::SDL2 m pthread)
-if(APPLE)
-  target_link_libraries(mina PRIVATE "-framework OpenGL")
+if(VITA)
+  target_include_directories(mina PRIVATE "$ENV{VITASDK}/arm-vita-eabi/include/SDL2")
+  target_link_libraries(mina PRIVATE
+    SDL2 vitaGL vitashark SceShaccCgExt mathneon taihen_stub
+    SceShaccCg_stub SceKernelDmacMgr_stub SceCtrl_stub SceTouch_stub SceHid_stub SceMotion_stub
+    SceAudio_stub SceAudioIn_stub SceDisplay_stub SceGxm_stub SceCommonDialog_stub SceSysmodule_stub
+    ScePower_stub SceAppMgr_stub SceAppUtil_stub SceIme_stub SceLibKernel_stub SceProcessmgr_stub
+    SceIofilemgr_stub stdc++ pthread m c)
+  vita_create_self(eboot.bin mina UNSAFE)
+  vita_create_vpk(mina.vpk ${VITA_TITLEID} eboot.bin VERSION ${VITA_VERSION} NAME "${VITA_APP_NAME}")
+else()
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(SDL2 REQUIRED IMPORTED_TARGET sdl2)
+  target_link_libraries(mina PRIVATE PkgConfig::SDL2 m pthread)
+  if(APPLE)
+    target_link_libraries(mina PRIVATE "-framework OpenGL")
+  endif()
 endif()

@@ -28,6 +28,9 @@ static SDL_Window *gl_window;
 void gpu_lock(void)
 {
     pthread_mutex_lock(&gpu_mutex);
+#if defined(__vita__)
+    return;
+#endif
     SDL_Window *w = sdl_main_window();
     if (!gl_owned || !pthread_equal(gl_owner, pthread_self()) || w != gl_window) {
         gl_window = w;
@@ -349,6 +352,8 @@ static void d_newBufferWithLength(Ctx *c)
     b->length = (uint32_t)MARG(0);
     b->options = (uint32_t)MARG(1);
     b->contents = gcalloc(1, b->length ? b->length : 16);
+    if (getenv("MINA_MEMSTAT") && b->length >= (4u << 20))
+        rt_log("[alloc] MTLBuffer %.1f MiB\n", b->length / 1048576.0);
     RET(o);
 }
 static void d_newBufferWithBytes(Ctx *c)
@@ -1032,6 +1037,11 @@ uint64_t metal_layer_for_window(SDL_Window *w)
 
 static void layer_size(uint32_t *w, uint32_t *h)
 {
+#if defined(__vita__)
+    *w = 960;
+    *h = 544;
+    return;
+#endif
     int iw, ih;
     SDL_GL_GetDrawableSize(sdl_main_window(), &iw, &ih);
     *w = (uint32_t)iw;
@@ -1042,6 +1052,10 @@ static void l_setPixelFormat(Ctx *c) { ((MLayer *)objc_host(SELF))->format = (ui
 static void l_pixelFormat(Ctx *c) { RET(((MLayer *)objc_host(SELF))->format); }
 static void l_contentsScale(Ctx *c)
 {
+#if defined(__vita__)
+    RETD(1.0);
+    return;
+#endif
     int lw, lh, pw, ph;
     SDL_GetWindowSize(sdl_main_window(), &lw, &lh);
     SDL_GL_GetDrawableSize(sdl_main_window(), &pw, &ph);
@@ -1083,6 +1097,10 @@ void metal_present(uint64_t drawable)
 {
     MTexture *t = objc_host(((MDrawable *)objc_host(drawable))->texture);
     gpu_lock();
+#if defined(__vita__)
+    gpu_unlock();
+    return;
+#endif
     int w, h;
     SDL_GL_GetDrawableSize(sdl_main_window(), &w, &h);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, tex_fbo(t, 0));
