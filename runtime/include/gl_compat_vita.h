@@ -21,6 +21,8 @@
 #endif
 #ifndef GL_DEPTH32F_STENCIL8
 #define GL_DEPTH32F_STENCIL8 0x8CAD
+#endif
+#ifndef GL_FLOAT_32_UNSIGNED_INT_24_8_REV
 #define GL_FLOAT_32_UNSIGNED_INT_24_8_REV 0x8DAD
 #endif
 #ifndef GL_SRGB8_ALPHA8
@@ -66,6 +68,26 @@
 #define GL_TEXTURE_MAX_LOD 0x813B
 #endif
 
+/* GLES3 / desktop enums vitaGL's header lacks (the formats fall back at run time) */
+#ifndef GL_R16F
+#define GL_R16F 0x822D
+#define GL_RG8 0x822B
+#define GL_R32F 0x822E
+#define GL_RG16F 0x822F
+#define GL_RG32F 0x8230
+#define GL_RGBA32F 0x8814
+#endif
+#ifndef GL_DEPTH_STENCIL
+#define GL_DEPTH_STENCIL 0x84F9
+#define GL_UNSIGNED_INT_24_8 0x84FA
+#endif
+#ifndef GL_CONSTANT_COLOR
+#define GL_CONSTANT_COLOR 0x8001
+#define GL_ONE_MINUS_CONSTANT_COLOR 0x8002
+#define GL_CONSTANT_ALPHA 0x8003
+#define GL_ONE_MINUS_CONSTANT_ALPHA 0x8004
+#endif
+
 static inline void mina_clear_color(GLint i, const GLfloat *c)
 {
     (void)i;
@@ -99,5 +121,7 @@ static inline void glClearBufferiv(GLenum buf, GLint i, const GLint *v)
 #define glVertexAttribIPointer(i, s, t, st, p) glVertexAttribPointer((i), (s), (t), GL_FALSE, (st), (p))
 #define glTexImage2DMultisample(t, s, f, w, h, fx) ((void)0)
 #define glPixelStorei(p, v) ((void)(p), (void)(v))
+/* compressed textures are uploaded a whole level at a time */
+#define glCompressedTexSubImage2D(t, l, x, y, w, h, f, sz, d) glCompressedTexImage2D((t), (l), (f), (w), (h), 0, (sz), (d))
 
 #endif

@@ -380,14 +380,14 @@ static void imp_pthread_key_create(Ctx *c)
 {
     pthread_key_t k;
     int r = pthread_key_create(&k, NULL);   /* guest destructors are not run */
-    rt_st64(G(A0), (uint64_t)k);
+    rt_st64(G(A0), (uint64_t)(uintptr_t)k);
     RET(r);
 }
-static void imp_pthread_key_delete(Ctx *c) { RET(pthread_key_delete((pthread_key_t)A0)); }
-static void imp_pthread_getspecific(Ctx *c) { RET((uint64_t)(uintptr_t)pthread_getspecific((pthread_key_t)A0)); }
+static void imp_pthread_key_delete(Ctx *c) { RET(pthread_key_delete((pthread_key_t)(uintptr_t)A0)); }
+static void imp_pthread_getspecific(Ctx *c) { RET((uint64_t)(uintptr_t)pthread_getspecific((pthread_key_t)(uintptr_t)A0)); }
 static void imp_pthread_setspecific(Ctx *c)
 {
-    RET(pthread_setspecific((pthread_key_t)A0, (void *)(uintptr_t)A1));
+    RET(pthread_setspecific((pthread_key_t)(uintptr_t)A0, (void *)(uintptr_t)A1));
 }
 
 /* ---- semaphores (libdispatch) ------------------------------------------------- */

@@ -253,7 +253,8 @@ void nat_SDL_GetWindowSize(Ctx *c)
     put_int(A1, 960);
     put_int(A2, 544);
     return;
-#endif ON_MAIN(nat_SDL_GetWindowSize);
+#endif
+    ON_MAIN(nat_SDL_GetWindowSize);
     int w = 0, h = 0;
     SDL_GetWindowSize(window_host(A0), &w, &h);
     put_int(A1, w);
