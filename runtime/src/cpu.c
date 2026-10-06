@@ -3,6 +3,9 @@
 
 #include <pthread.h>
 #include <string.h>
+#if !defined(__vita__)
+#include <execinfo.h>
+#endif
 
 static uint32_t *hash_addr;
 static GuestFn *hash_fn;
@@ -109,6 +112,23 @@ static void report(Ctx *c, uint32_t pc)
         fprintf(stderr, "\n");
     }
     fprintf(stderr, "  sp=%016llx\n", (unsigned long long)c->sp);
+#if !defined(__vita__)
+    /* host frames of generated functions (f_<offset>) name the guest call chain */
+    void *frames[64];
+    int n = backtrace(frames, 64);
+    char **syms = backtrace_symbols(frames, n);
+    fprintf(stderr, "  guest call chain:\n");
+    for (int i = 0; i < n; i++) {
+        const char *f = strstr(syms[i], " f_");
+        if (getenv("MINA_BT")) fprintf(stderr, "    [%s]\n", syms[i]);
+        if (!f)
+            continue;
+        uint32_t off = (uint32_t)strtoul(f + 3, NULL, 16), st;
+        const char *nm = func_name_at(off + GUEST_IMAGE_BASE, &st);
+        fprintf(stderr, "    %#x %s\n", off + GUEST_IMAGE_BASE, nm);
+    }
+    free(syms);
+#endif
 }
 
 void rt_unimpl(Ctx *c, uint32_t pc, const char *what)

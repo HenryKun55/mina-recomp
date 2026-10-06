@@ -142,6 +142,26 @@ uint32_t thread_spawn(void (*fn)(Ctx *, void *), void *arg, uint32_t stack_size)
 
 int thread_is_main(Ctx *c) { return c->thread_id == 1; }
 
+/* Context of the calling host thread, created on first use for threads the
+ * guest did not start (SDL's audio thread, callbacks). */
+Ctx *host_thread_ctx(void)
+{
+    if (tl_ctx)
+        return tl_ctx;
+    GThread *t = calloc(1, sizeof *t);
+    t->host = pthread_self();
+    t->ctx = new_ctx(512 * 1024);
+    t->ctx->thread = t;
+    t->id = rt_alloc(64, 16);
+    pthread_mutex_lock(&threads_lock);
+    rt_st32(G(t->id), next_thread_id++);
+    pthread_mutex_unlock(&threads_lock);
+    rt_st64(G(t->id + 8), (uint64_t)(uintptr_t)t);
+    t->ctx->thread_id = rt_ld32(G(t->id));
+    tl_ctx = t->ctx;
+    return tl_ctx;
+}
+
 static void imp_pthread_attr_init(Ctx *c)
 {
     memset(G(A0), 0, 64);
@@ -488,14 +508,55 @@ static void spawn_job(AsyncJob *j)
     pthread_attr_destroy(&ha);
 }
 
+/* The main queue: blocks wait here until the main thread drains them (it
+ * does so around its SDL event waits, see sdl.c). */
+static pthread_mutex_t mainq_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t mainq[256];
+static int mainq_n;
+void (*g_mainq_wake)(void);
+
+void mainq_drain(Ctx *c)
+{
+    for (;;) {
+        pthread_mutex_lock(&mainq_lock);
+        if (!mainq_n) {
+            pthread_mutex_unlock(&mainq_lock);
+            return;
+        }
+        uint32_t b = mainq[0];
+        memmove(mainq, mainq + 1, (size_t)(--mainq_n) * sizeof mainq[0]);
+        pthread_mutex_unlock(&mainq_lock);
+        run_block(c, b);
+        gfree(b);
+    }
+}
+
+uint64_t block_copy(Ctx *c, uint64_t block);
+
 static void imp_dispatch_async(Ctx *c)
 {
+    uint64_t queue = A0;
+    uint32_t b = (uint32_t)block_copy(c, A1);
+    if (queue == import_data("__dispatch_main_q")) {
+        pthread_mutex_lock(&mainq_lock);
+        if (mainq_n == 256)
+            rt_fatal("main queue full");
+        mainq[mainq_n++] = b;
+        pthread_mutex_unlock(&mainq_lock);
+        if (g_mainq_wake)
+            g_mainq_wake();
+        return;
+    }
     AsyncJob *j = calloc(1, sizeof *j);
-    j->block = (uint32_t)A1;
+    j->block = b;
     spawn_job(j);
 }
 
-static void imp_dispatch_sync(Ctx *c) { run_block(c, (uint32_t)A1); }
+static void imp_dispatch_sync(Ctx *c)
+{
+    /* the caller waits anyway: run it here (main-queue work has no thread affinity for us) */
+    run_block(c, (uint32_t)A1);
+}
 
 static void imp_dispatch_once_f(Ctx *c)
 {
@@ -544,7 +605,7 @@ static void imp_dispatch_group_async(Ctx *c)
     g->pending++;
     pthread_mutex_unlock(&g->m);
     AsyncJob *j = calloc(1, sizeof *j);
-    j->block = (uint32_t)A2;
+    j->block = (uint32_t)block_copy(c, A2);
     j->group = (uint32_t)A0;
     spawn_job(j);
 }

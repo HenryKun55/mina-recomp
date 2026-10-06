@@ -30,6 +30,7 @@ struct Class {
     const Method *cmethods;      /* host class methods */
     uint32_t host_size;          /* bytes of host state per instance (0: none) */
     DeallocFn dealloc;           /* frees host resources inside the state */
+    GuestFn fallback;            /* handles any selector the tables miss (x1 = sel) */
     /* filled at registration */
     Class *super;
     uint32_t obj;                /* guest class object */
@@ -67,6 +68,7 @@ uint64_t objc_send(Ctx *c, uint64_t recv, const char *sel, int nargs, ...);
 
 /* Blocks: invoke(block, ...) */
 uint64_t block_call(Ctx *c, uint64_t block, int nargs, ...);
+uint64_t block_copy(Ctx *c, uint64_t block);
 
 /* Host method helpers */
 #define SELF (c->x[0])

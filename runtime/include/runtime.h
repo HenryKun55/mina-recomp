@@ -98,6 +98,7 @@ void threads_init_main(Ctx *c);
 /* Runs fn(ctx, arg) on a new guest thread; returns its pthread_t. */
 uint32_t thread_spawn(void (*fn)(Ctx *, void *), void *arg, uint32_t stack_size);
 int thread_is_main(Ctx *c);
+Ctx *host_thread_ctx(void);
 Ctx *thread_ctx(void);
 uint32_t tls_block(Ctx *c);
 

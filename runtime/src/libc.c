@@ -160,6 +160,12 @@ static void imp_pow(Ctx *c) { RETD(pow(DARG(0), DARG(1))); }
 static void imp_fmod(Ctx *c) { RETD(fmod(DARG(0), DARG(1))); }
 static void imp_ldexp(Ctx *c) { RETD(ldexp(DARG(0), (int)A0)); }
 static void imp_exp10(Ctx *c) { RETD(pow(10.0, DARG(0))); }
+static void imp_sincos_stret(Ctx *c)
+{
+    double x = DARG(0);
+    c->v[0] = vset_f64(sin(x));
+    c->v[1] = vset_f64(cos(x));
+}
 static void imp_sincosf_stret(Ctx *c)
 {
     float x = FARG(0);
@@ -820,8 +826,45 @@ static void imp_pure_virtual(Ctx *c) { (void)c; rt_fatal("pure virtual call"); }
 static void imp_unwind_resume(Ctx *c) { (void)c; rt_fatal("_Unwind_Resume (C++ exception)"); }
 static void imp_operator_delete(Ctx *c) { gfree((uint32_t)A0); }
 
-/* Blocks: _Block_object_assign(dst, src, flags) for captured objects. */
-static void imp_block_object_assign(Ctx *c) { rt_st64(G(A0), A1); }
+/* _Block_object_assign(dst, src, flags), called by block copy helpers.
+ * __block variables (BYREF) move to the heap: {isa, forwarding, flags, size,
+ * [keep, destroy helpers], value...}; the stack copy forwards to the heap one. */
+uint64_t block_copy(Ctx *c, uint64_t block);
+uint64_t objc_retain_obj(uint64_t a);
+static void imp_block_object_assign(Ctx *c)
+{
+    uint64_t dst = A0, src = A1;
+    uint32_t flags = (uint32_t)A2;
+    if (!src) {
+        rt_st64(G(dst), 0);
+        return;
+    }
+    if (flags & 8) {                                    /* BLOCK_FIELD_IS_BYREF */
+        uint64_t fwd = rt_ld64(G(src + 8));
+        if (fwd != src) {                               /* already on the heap */
+            rt_st64(G(dst), fwd);
+            return;
+        }
+        uint32_t bflags = rt_ld32(G(src + 16)), size = rt_ld32(G(src + 20));
+        uint32_t heap = gmalloc(size);
+        memcpy(G(heap), G(src), size);
+        rt_st64(G(heap + 8), heap);
+        rt_st64(G(src + 8), heap);
+        if (bflags & (1u << 25)) {
+            uint64_t keep = rt_ld64(G(src + 24));
+            guest_call(c, keep, 2, (uint64_t)heap, src);
+        }
+        rt_st64(G(dst), heap);
+        return;
+    }
+    if ((flags & 7) == 7) {                             /* BLOCK_FIELD_IS_BLOCK */
+        rt_st64(G(dst), block_copy(c, src));
+        return;
+    }
+    if ((flags & 3) == 3 && !(flags & 16))              /* object, not weak */
+        objc_retain_obj(src);
+    rt_st64(G(dst), src);
+}
 
 static void imp_setjmp(Ctx *c) { RET(0); }
 static void imp_longjmp(Ctx *c) { (void)c; rt_fatal("guest longjmp is not supported"); }
@@ -879,6 +922,7 @@ const ImportImpl g_impl_libc[] = {
     { "_ldexp", imp_ldexp, 0, NULL },
     { "___exp10", imp_exp10, 0, NULL },
     { "___sincosf_stret", imp_sincosf_stret, 0, NULL },
+    { "___sincos_stret", imp_sincos_stret, 0, NULL },
     { "_malloc", imp_malloc, 0, NULL },
     { "_calloc", imp_calloc, 0, NULL },
     { "_realloc", imp_realloc, 0, NULL },
@@ -948,6 +992,7 @@ const ImportImpl g_impl_libc[] = {
     { "_setjmp", imp_setjmp, 0, NULL },
     { "_longjmp", imp_longjmp, 0, NULL },
     { "___availability_version_check", imp_ret1, 0, NULL },
+    { "__availability_version_check", imp_ret1, 0, NULL },
     { "_os_log_create", imp_ret1, 0, NULL },
     { "_os_signpost_enabled", imp_ret0, 0, NULL },
     { "_os_signpost_id_generate", imp_ret1, 0, NULL },

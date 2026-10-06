@@ -311,11 +311,29 @@ static void a_lastObject(Ctx *c)
     RET(a->n ? a->items[a->n - 1] : 0);
 }
 static void a_addObject(Ctx *c) { ns_array_add(SELF, MARG(0)); }
+/* countByEnumeratingWithState:objects:count: — NSFastEnumerationState
+ * {state, itemsPtr, mutationsPtr, extra[5]}; items are copied into the buffer. */
+static void a_countByEnumerating(Ctx *c)
+{
+    NSArr *a = objc_host(SELF);
+    uint64_t st = MARG(0), buf = MARG(1), len = MARG(2);
+    uint64_t start = rt_ld64(G(st));
+    uint64_t n = 0;
+    while (start + n < a->n && n < len) {
+        rt_st64(G(buf + 8 * n), a->items[start + n]);
+        n++;
+    }
+    rt_st64(G(st), start + n);
+    rt_st64(G(st + 8), buf);
+    rt_st64(G(st + 16), st + 24);      /* mutations pointer: a stable word */
+    RET(n);
+}
 static void a_array(Ctx *c) { RET(objc_autorelease_obj(ns_array_new())); }
 static const Method nsarray_i[] = {
     { "count", a_count }, { "objectAtIndex:", a_objectAtIndex },
     { "objectAtIndexedSubscript:", a_objectAtIndex }, { "firstObject", a_firstObject },
     { "lastObject", a_lastObject }, { "addObject:", a_addObject },
+    { "countByEnumeratingWithState:objects:count:", a_countByEnumerating },
     { NULL, NULL },
 };
 static const Method nsarray_c[] = { { "array", a_array }, { NULL, NULL } };

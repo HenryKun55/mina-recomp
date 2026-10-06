@@ -1,8 +1,1236 @@
-/* Metal on OpenGL (filled in as the renderer comes up). */
-#include "objc_rt.h"
+/*
+ * Metal on OpenGL. See runtime/include/metal_gl.h for the model.
+ *
+ * Encoders execute GL immediately (holding the GPU lock from creation to
+ * endEncoding); command buffers only run their completion handlers and
+ * present their drawable at commit.
+ */
+#include "metal_gl.h"
 
-Class *const g_classes_metal[] = { NULL };
+#include <SDL.h>
+#include <pthread.h>
+#include <string.h>
+
+SDL_Window *sdl_main_window(void);
+SDL_GLContext sdl_gl_context(void);
+const char *ns_cstr(uint64_t s);
+uint64_t ns_string_auto(const char *s);
+uint64_t ns_array_new(void);
+void ns_array_add(uint64_t arr, uint64_t item);
+
+/* ---- GPU lock -------------------------------------------------------------------- */
+
+static pthread_mutex_t gpu_mutex = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
+static pthread_t gl_owner;
+static int gl_owned;
+static SDL_Window *gl_window;
+
+void gpu_lock(void)
+{
+    pthread_mutex_lock(&gpu_mutex);
+    SDL_Window *w = sdl_main_window();
+    if (!gl_owned || !pthread_equal(gl_owner, pthread_self()) || w != gl_window) {
+        gl_window = w;
+        if (SDL_GL_MakeCurrent(sdl_main_window(), sdl_gl_context()) != 0)
+            rt_fatal("SDL_GL_MakeCurrent: %s", SDL_GetError());
+        gl_owner = pthread_self();
+        gl_owned = 1;
+    }
+}
+void gpu_unlock(void) { pthread_mutex_unlock(&gpu_mutex); }
+
+/* ---- property bags --------------------------------------------------------------------- */
+
+static Class cls_PropBag;
+
+static PropBag *bag(uint64_t obj) { return objc_host(obj); }
+
+static int pb_find(PropBag *b, const char *key)
+{
+    for (int i = 0; i < b->n; i++)
+        if (strcmp(b->p[i].key, key) == 0)
+            return i;
+    return -1;
+}
+static int pb_slot(PropBag *b, const char *key)
+{
+    int i = pb_find(b, key);
+    if (i >= 0)
+        return i;
+    if (b->n >= PB_MAX)
+        rt_fatal("property bag full (%s)", key);
+    i = b->n++;
+    b->p[i].key = strdup(key);
+    b->p[i].v = 0;
+    memset(b->p[i].d, 0, sizeof b->p[i].d);
+    return i;
+}
+uint64_t pb_get(uint64_t obj, const char *key, uint64_t def)
+{
+    PropBag *b = obj ? bag(obj) : NULL;
+    int i = b ? pb_find(b, key) : -1;
+    return i < 0 ? def : b->p[i].v;
+}
+double pb_getd(uint64_t obj, const char *key, int k, double def)
+{
+    PropBag *b = obj ? bag(obj) : NULL;
+    int i = b ? pb_find(b, key) : -1;
+    return i < 0 ? def : b->p[i].d[k];
+}
+void pb_set(uint64_t obj, const char *key, uint64_t v) { bag(obj)->p[pb_slot(bag(obj), key)].v = v; }
+
+static void bag_dealloc(void *h)
+{
+    PropBag *b = h;
+    for (int i = 0; i < b->n; i++) {
+        if (b->p[i].key[0] == '@')
+            objc_release_obj(b->p[i].v);
+        free((void *)b->p[i].key);
+    }
+}
+
+static const char *const fp_props[] = { "clearColor", "clearDepth", "lodMinClamp", "lodMaxClamp", NULL };
+
+/* setFoo: / isFoo / foo */
+static void bag_fallback(Ctx *c)
+{
+    const char *sel = gstr(c->x[1]);
+    char key[96];
+    size_t n = strlen(sel);
+    if (strncmp(sel, "set", 3) == 0 && n > 4 && strchr(sel, ':') == sel + n - 1) {
+        snprintf(key, sizeof key, "%c%.*s", sel[3] + ('a' - 'A') * (sel[3] >= 'A' && sel[3] <= 'Z'),
+                 (int)(n - 5), sel + 4);
+        PropBag *b = bag(SELF);
+        int i = pb_slot(b, key);
+        int fp = 0;
+        for (const char *const *p = fp_props; *p; p++)
+            if (strcmp(*p, key) == 0)
+                fp = 1;
+        if (fp) {
+            for (int k = 0; k < 4; k++)
+                b->p[i].d[k] = strcmp(key, "lodMinClamp") == 0 || strcmp(key, "lodMaxClamp") == 0
+                                   ? (double)c->v[k].f[0] : c->v[k].df[0];
+        } else {
+            b->p[i].v = MARG(0);
+        }
+        return;
+    }
+    if (strchr(sel, ':')) {
+        rt_log("metal: unhandled %s on %s\n", sel, objc_class_of(SELF)->name);
+        RET(0);
+        return;
+    }
+    if (strncmp(sel, "is", 2) == 0 && sel[2] >= 'A' && sel[2] <= 'Z')
+        snprintf(key, sizeof key, "%c%s", sel[2] + ('a' - 'A'), sel + 3);
+    else
+        snprintf(key, sizeof key, "%s", sel);
+    PropBag *b = bag(SELF);
+    int i = pb_find(b, key);
+    RET(i < 0 ? 0 : b->p[i].v);
+    if (i >= 0)
+        for (int k = 0; k < 4; k++)
+            c->v[k] = vset_f64(b->p[i].d[k]);
+}
+
+/* children: getters that return a sub-descriptor */
+typedef struct ChildDef {
+    Class *owner;
+    const char *key;
+    Class *child;
+    Class *elem;             /* for arrays */
+} ChildDef;
+static ChildDef children[32];
+static int nchildren;
+
+uint64_t pb_child(uint64_t obj, const char *key, Class *cls)
+{
+    char k[64];
+    snprintf(k, sizeof k, "@%s", key);
+    PropBag *b = bag(obj);
+    int i = pb_find(b, k);
+    if (i >= 0)
+        return b->p[i].v;
+    uint64_t ch = objc_new_object(cls);
+    b->p[pb_slot(b, k)].v = ch;
+    return ch;
+}
+
+static void bag_child_getter(Ctx *c)
+{
+    const char *sel = gstr(c->x[1]);
+    Class *k = objc_class_of(SELF);
+    for (int i = 0; i < nchildren; i++) {
+        for (Class *o = k; o; o = o->super)
+            if (children[i].owner == o && strcmp(children[i].key, sel) == 0) {
+                uint64_t ch = pb_child(SELF, sel, children[i].child);
+                if (children[i].elem)
+                    pb_set(ch, "__elem", (uint64_t)(uintptr_t)children[i].elem);
+                RET(ch);
+                return;
+            }
+    }
+    bag_fallback(c);
+}
+
+static void array_object_at(Ctx *c)
+{
+    char k[32];
+    snprintf(k, sizeof k, "%llu", (unsigned long long)MARG(0));
+    Class *elem = (Class *)(uintptr_t)pb_get(SELF, "__elem", 0);
+    RET(pb_child(SELF, k, elem));
+}
+static void array_set_object(Ctx *c)
+{
+    char k[32];
+    snprintf(k, sizeof k, "@%llu", (unsigned long long)MARG(1));
+    PropBag *b = bag(SELF);
+    int i = pb_slot(b, k);
+    objc_retain_obj(MARG(0));
+    if (b->p[i].v)
+        objc_release_obj(b->p[i].v);
+    b->p[i].v = MARG(0);
+}
+
+/* element of a descriptor array if it exists (no creation) */
+static uint64_t pb_elem(uint64_t arr, int i)
+{
+    char k[32];
+    snprintf(k, sizeof k, "@%d", i);
+    return arr ? pb_get(arr, k, 0) : 0;
+}
+static uint64_t pb_existing_child(uint64_t obj, const char *key)
+{
+    char k[64];
+    snprintf(k, sizeof k, "@%s", key);
+    return obj ? pb_get(obj, k, 0) : 0;
+}
+
+static const Method bag_methods[] = { { NULL, NULL } };
+static const Method array_methods[] = {
+    { "objectAtIndexedSubscript:", array_object_at }, { "setObject:atIndexedSubscript:", array_set_object },
+    { NULL, NULL },
+};
+static Class cls_PropBag = { "MTLPropBag", "NSObject", bag_methods, NULL, sizeof(PropBag), bag_dealloc, bag_child_getter };
+static Class cls_BagArray = { "MTLBagArray", "MTLPropBag", array_methods, NULL, 0, NULL };
+
+#define BAG_CLASS(var, name) static Class var = { name, "MTLPropBag", NULL, NULL, 0, NULL }
+BAG_CLASS(cls_TextureDesc, "MTLTextureDescriptor");
+BAG_CLASS(cls_SamplerDesc, "MTLSamplerDescriptor");
+BAG_CLASS(cls_DepthStencilDesc, "MTLDepthStencilDescriptor");
+BAG_CLASS(cls_StencilDesc, "MTLStencilDescriptor");
+BAG_CLASS(cls_PipelineDesc, "MTLRenderPipelineDescriptor");
+BAG_CLASS(cls_PipelineColorDesc, "MTLRenderPipelineColorAttachmentDescriptor");
+BAG_CLASS(cls_VertexDesc, "MTLVertexDescriptor");
+BAG_CLASS(cls_VertexAttrDesc, "MTLVertexAttributeDescriptor");
+BAG_CLASS(cls_VertexLayoutDesc, "MTLVertexBufferLayoutDescriptor");
+BAG_CLASS(cls_PassDesc, "MTLRenderPassDescriptor");
+BAG_CLASS(cls_PassColorDesc, "MTLRenderPassColorAttachmentDescriptor");
+BAG_CLASS(cls_PassDepthDesc, "MTLRenderPassDepthAttachmentDescriptor");
+BAG_CLASS(cls_PassStencilDesc, "MTLRenderPassStencilAttachmentDescriptor");
+
+static void define_children(void)
+{
+    ChildDef defs[] = {
+        { &cls_DepthStencilDesc, "frontFaceStencil", &cls_StencilDesc, NULL },
+        { &cls_DepthStencilDesc, "backFaceStencil", &cls_StencilDesc, NULL },
+        { &cls_PipelineDesc, "vertexDescriptor", &cls_VertexDesc, NULL },
+        { &cls_PipelineDesc, "colorAttachments", &cls_BagArray, &cls_PipelineColorDesc },
+        { &cls_VertexDesc, "attributes", &cls_BagArray, &cls_VertexAttrDesc },
+        { &cls_VertexDesc, "layouts", &cls_BagArray, &cls_VertexLayoutDesc },
+        { &cls_PassDesc, "colorAttachments", &cls_BagArray, &cls_PassColorDesc },
+        { &cls_PassDesc, "depthAttachment", &cls_PassDepthDesc, NULL },
+        { &cls_PassDesc, "stencilAttachment", &cls_PassStencilDesc, NULL },
+    };
+    memcpy(children, defs, sizeof defs);
+    nchildren = (int)(sizeof defs / sizeof defs[0]);
+}
+
+/* +[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:width:height:mipmapped:] */
+static void td_texture2D(Ctx *c)
+{
+    uint64_t d = objc_new_object(&cls_TextureDesc);
+    pb_set(d, "pixelFormat", MARG(0));
+    pb_set(d, "width", MARG(1));
+    pb_set(d, "height", MARG(2));
+    uint32_t mips = 1;
+    if (MARG(3) & 1) {
+        uint64_t m = MARG(1) > MARG(2) ? MARG(1) : MARG(2);
+        while (m > 1) { m >>= 1; mips++; }
+    }
+    pb_set(d, "mipmapLevelCount", mips);
+    RET(objc_autorelease_obj(d));
+}
+static void pd_renderPassDescriptor(Ctx *c) { RET(objc_autorelease_obj(objc_new_object(&cls_PassDesc))); }
+static const Method td_cmethods[] = {
+    { "texture2DDescriptorWithPixelFormat:width:height:mipmapped:", td_texture2D }, { NULL, NULL },
+};
+static const Method pd_cmethods[] = { { "renderPassDescriptor", pd_renderPassDescriptor }, { NULL, NULL } };
+
+/* ---- formats ----------------------------------------------------------------------------- */
+
+typedef struct GLFmt {
+    GLenum internal, format, type;
+    int bpp;                 /* bytes per pixel (0: block compressed) */
+    int block_bytes;         /* bytes per 4x4 block */
+    int depth, stencil, srgb;
+} GLFmt;
+
+#ifndef GL_COMPRESSED_RGBA_S3TC_DXT1_EXT
+#define GL_COMPRESSED_RGBA_S3TC_DXT1_EXT 0x83F1
+#define GL_COMPRESSED_RGBA_S3TC_DXT3_EXT 0x83F2
+#define GL_COMPRESSED_RGBA_S3TC_DXT5_EXT 0x83F3
+#endif
+#ifndef GL_COMPRESSED_RGBA_BPTC_UNORM
+#define GL_COMPRESSED_RGBA_BPTC_UNORM 0x8E8C
+#endif
+
+static int gl_format(uint32_t mtl, GLFmt *f)
+{
+    memset(f, 0, sizeof *f);
+    switch (mtl) {
+    case 1:   *f = (GLFmt){ GL_R8, GL_RED, GL_UNSIGNED_BYTE, 1 }; return 1;           /* A8Unorm */
+    case 10:  *f = (GLFmt){ GL_R8, GL_RED, GL_UNSIGNED_BYTE, 1 }; return 1;
+    case 25:  *f = (GLFmt){ GL_R16F, GL_RED, GL_HALF_FLOAT, 2 }; return 1;
+    case 30:  *f = (GLFmt){ GL_RG8, GL_RG, GL_UNSIGNED_BYTE, 2 }; return 1;
+    case 55:  *f = (GLFmt){ GL_R32F, GL_RED, GL_FLOAT, 4 }; return 1;
+    case 65:  *f = (GLFmt){ GL_RG16F, GL_RG, GL_HALF_FLOAT, 4 }; return 1;
+    case 70:  *f = (GLFmt){ GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, 4 }; return 1;
+    case 71:  *f = (GLFmt){ GL_SRGB8_ALPHA8, GL_RGBA, GL_UNSIGNED_BYTE, 4, 0, 0, 0, 1 }; return 1;
+    case 80:  *f = (GLFmt){ GL_RGBA8, GL_BGRA, GL_UNSIGNED_BYTE, 4 }; return 1;
+    case 81:  *f = (GLFmt){ GL_SRGB8_ALPHA8, GL_BGRA, GL_UNSIGNED_BYTE, 4, 0, 0, 0, 1 }; return 1;
+    case 90:  *f = (GLFmt){ GL_RGB10_A2, GL_RGBA, GL_UNSIGNED_INT_2_10_10_10_REV, 4 }; return 1;
+    case 92:  *f = (GLFmt){ GL_R11F_G11F_B10F, GL_RGB, GL_UNSIGNED_INT_10F_11F_11F_REV, 4 }; return 1;
+    case 105: *f = (GLFmt){ GL_RG32F, GL_RG, GL_FLOAT, 8 }; return 1;
+    case 110: *f = (GLFmt){ GL_RGBA16, GL_RGBA, GL_UNSIGNED_SHORT, 8 }; return 1;
+    case 115: *f = (GLFmt){ GL_RGBA16F, GL_RGBA, GL_HALF_FLOAT, 8 }; return 1;
+    case 125: *f = (GLFmt){ GL_RGBA32F, GL_RGBA, GL_FLOAT, 16 }; return 1;
+    case 130: case 131: *f = (GLFmt){ GL_COMPRESSED_RGBA_S3TC_DXT1_EXT, 0, 0, 0, 8 }; return 1;
+    case 132: case 133: *f = (GLFmt){ GL_COMPRESSED_RGBA_S3TC_DXT3_EXT, 0, 0, 0, 16 }; return 1;
+    case 134: case 135: *f = (GLFmt){ GL_COMPRESSED_RGBA_S3TC_DXT5_EXT, 0, 0, 0, 16 }; return 1;
+    case 152: case 153: *f = (GLFmt){ GL_COMPRESSED_RGBA_BPTC_UNORM, 0, 0, 0, 16 }; return 1;
+    case 250: *f = (GLFmt){ GL_DEPTH_COMPONENT16, GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT, 2, 0, 1 }; return 1;
+    case 252: *f = (GLFmt){ GL_DEPTH_COMPONENT32F, GL_DEPTH_COMPONENT, GL_FLOAT, 4, 0, 1 }; return 1;
+    case 253: *f = (GLFmt){ GL_DEPTH24_STENCIL8, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, 4, 0, 1, 1 }; return 1;
+    case 255: *f = (GLFmt){ GL_DEPTH24_STENCIL8, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, 4, 0, 1, 1 }; return 1;
+    case 260: *f = (GLFmt){ GL_DEPTH32F_STENCIL8, GL_DEPTH_STENCIL, GL_FLOAT_32_UNSIGNED_INT_24_8_REV, 8, 0, 1, 1 }; return 1;
+    }
+    return 0;
+}
+
+/* ---- device ------------------------------------------------------------------------------- */
+
+static Class cls_Device, cls_Queue, cls_CmdBuf, cls_Buffer, cls_Texture,
+    cls_Sampler, cls_DepthStencil, cls_Library, cls_Function, cls_Pipeline, cls_Layer, cls_Drawable;
+
+static uint64_t device;
+
+static void imp_MTLCreateSystemDefaultDevice(Ctx *c)
+{
+    if (!device)
+        device = objc_new_object(&cls_Device);
+    RET(objc_retain_obj(device));
+}
+
+static void d_name(Ctx *c) { RET(ns_string_auto("OpenGL (mina-recomp)")); }
+static void d_newCommandQueue(Ctx *c) { RET(objc_new_object(&cls_Queue)); }
+static void d_supportsSampleCount(Ctx *c) { RET(MARG(0) == 1 || MARG(0) == 2 || MARG(0) == 4); }
+static void d_true(Ctx *c) { RET(1); }
+static void d_maxBufferLength(Ctx *c) { RET(256u << 20); }
+
+static void buf_dealloc(void *h)
+{
+    MBuffer *b = h;
+    gfree(b->contents);
+}
+static void d_newBufferWithLength(Ctx *c)
+{
+    uint64_t o = objc_new_object(&cls_Buffer);
+    MBuffer *b = objc_host(o);
+    b->length = (uint32_t)MARG(0);
+    b->options = (uint32_t)MARG(1);
+    b->contents = gcalloc(1, b->length ? b->length : 16);
+    RET(o);
+}
+static void d_newBufferWithBytes(Ctx *c)
+{
+    uint64_t o = objc_new_object(&cls_Buffer);
+    MBuffer *b = objc_host(o);
+    b->length = (uint32_t)MARG(1);
+    b->options = (uint32_t)MARG(2);
+    b->contents = gcalloc(1, b->length ? b->length : 16);
+    memcpy(G(b->contents), G(MARG(0)), b->length);
+    RET(o);
+}
+
+static void tex_dealloc(void *h)
+{
+    MTexture *t = h;
+    gpu_lock();
+    if (t->gl) glDeleteTextures(1, &t->gl);
+    if (t->fbo_cache) glDeleteFramebuffers(1, &t->fbo_cache);
+    gpu_unlock();
+    gfree(t->staging);
+}
+
+static GLenum tex_target(const MTexture *t)
+{
+    if (t->type == 4) return GL_TEXTURE_2D_MULTISAMPLE;
+    if (t->type == 5) return GL_TEXTURE_CUBE_MAP;
+    if (t->type == 3) return GL_TEXTURE_2D_ARRAY;
+    return GL_TEXTURE_2D;
+}
+
+static void tex_create_gl(MTexture *t)
+{
+    GLFmt f;
+    if (!gl_format(t->format, &f))
+        rt_fatal("metal: unsupported pixel format %u", t->format);
+    GLenum target = tex_target(t);
+    glGenTextures(1, &t->gl);
+    glBindTexture(target, t->gl);
+    if (target == GL_TEXTURE_2D_MULTISAMPLE) {
+        glTexImage2DMultisample(target, (GLsizei)t->samples, f.internal, (GLsizei)t->width, (GLsizei)t->height, GL_TRUE);
+        return;
+    }
+    if (target == GL_TEXTURE_2D_ARRAY)
+        rt_fatal("metal: 2D array textures are not supported yet");
+    for (uint32_t level = 0; level < t->mips; level++) {
+        GLsizei w = (GLsizei)(t->width >> level ? t->width >> level : 1);
+        GLsizei h = (GLsizei)(t->height >> level ? t->height >> level : 1);
+        int faces = target == GL_TEXTURE_CUBE_MAP ? 6 : 1;
+        for (int face = 0; face < faces; face++) {
+            GLenum tt = target == GL_TEXTURE_CUBE_MAP ? (GLenum)(GL_TEXTURE_CUBE_MAP_POSITIVE_X + face) : target;
+            if (f.block_bytes) {
+                GLsizei size = ((w + 3) / 4) * ((h + 3) / 4) * f.block_bytes;
+                glCompressedTexImage2D(tt, (GLint)level, f.internal, w, h, 0, size, NULL);
+            } else {
+                glTexImage2D(tt, (GLint)level, (GLint)f.internal, w, h, 0, f.format, f.type, NULL);
+            }
+        }
+    }
+    glTexParameteri(target, GL_TEXTURE_MAX_LEVEL, (GLint)(t->mips - 1));
+    glTexParameteri(target, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(target, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+}
+
+uint64_t metal_new_texture(uint32_t type, uint32_t fmt, uint32_t w, uint32_t h, uint32_t mips, uint32_t samples,
+                           uint32_t usage, uint32_t storage)
+{
+    uint64_t o = objc_new_object(&cls_Texture);
+    MTexture *t = objc_host(o);
+    t->type = type;
+    t->format = fmt;
+    t->width = w ? w : 1;
+    t->height = h ? h : 1;
+    t->depth = 1;
+    t->mips = mips ? mips : 1;
+    t->samples = samples ? samples : 1;
+    t->usage = usage;
+    t->storage = storage;
+    if (t->samples > 1 && t->type == 2)
+        t->type = 4;
+    gpu_lock();
+    tex_create_gl(t);
+    gpu_unlock();
+    return o;
+}
+
+static void d_newTextureWithDescriptor(Ctx *c)
+{
+    uint64_t d = MARG(0);
+    RET(metal_new_texture((uint32_t)pb_get(d, "textureType", 2), (uint32_t)pb_get(d, "pixelFormat", 70),
+                          (uint32_t)pb_get(d, "width", 1), (uint32_t)pb_get(d, "height", 1),
+                          (uint32_t)pb_get(d, "mipmapLevelCount", 1), (uint32_t)pb_get(d, "sampleCount", 1),
+                          (uint32_t)pb_get(d, "usage", 1), (uint32_t)pb_get(d, "storageMode", 0)));
+}
+
+static GLint gl_wrap(uint32_t m)
+{
+    switch (m) {
+    case 2: return GL_REPEAT;
+    case 3: return GL_MIRRORED_REPEAT;
+    case 4: case 5: return GL_CLAMP_TO_BORDER;
+    default: return GL_CLAMP_TO_EDGE;
+    }
+}
+static GLenum gl_compare(uint32_t f)
+{
+    static const GLenum t[] = { GL_NEVER, GL_LESS, GL_EQUAL, GL_LEQUAL, GL_GREATER, GL_NOTEQUAL, GL_GEQUAL, GL_ALWAYS };
+    return f < 8 ? t[f] : GL_ALWAYS;
+}
+
+static void sampler_dealloc(void *h)
+{
+    MSampler *s = h;
+    gpu_lock();
+    if (s->gl) glDeleteSamplers(1, &s->gl);
+    gpu_unlock();
+}
+static void d_newSamplerState(Ctx *c)
+{
+    uint64_t d = MARG(0);
+    uint64_t o = objc_new_object(&cls_Sampler);
+    MSampler *s = objc_host(o);
+    s->minf = (uint32_t)pb_get(d, "minFilter", 0);
+    s->magf = (uint32_t)pb_get(d, "magFilter", 0);
+    s->mipf = (uint32_t)pb_get(d, "mipFilter", 0);
+    s->s = (uint32_t)pb_get(d, "sAddressMode", 0);
+    s->t = (uint32_t)pb_get(d, "tAddressMode", 0);
+    s->r = (uint32_t)pb_get(d, "rAddressMode", 0);
+    s->aniso = (uint32_t)pb_get(d, "maxAnisotropy", 1);
+    s->compare = (uint32_t)pb_get(d, "compareFunction", 0);
+    s->lod_min = (float)pb_getd(d, "lodMinClamp", 0, 0.0);
+    s->lod_max = (float)pb_getd(d, "lodMaxClamp", 0, 1000.0);
+    gpu_lock();
+    glGenSamplers(1, &s->gl);
+    GLint minf;
+    if (s->mipf == 0) minf = s->minf ? GL_LINEAR : GL_NEAREST;
+    else if (s->mipf == 1) minf = s->minf ? GL_LINEAR_MIPMAP_NEAREST : GL_NEAREST_MIPMAP_NEAREST;
+    else minf = s->minf ? GL_LINEAR_MIPMAP_LINEAR : GL_NEAREST_MIPMAP_LINEAR;
+    glSamplerParameteri(s->gl, GL_TEXTURE_MIN_FILTER, minf);
+    glSamplerParameteri(s->gl, GL_TEXTURE_MAG_FILTER, s->magf ? GL_LINEAR : GL_NEAREST);
+    glSamplerParameteri(s->gl, GL_TEXTURE_WRAP_S, gl_wrap(s->s));
+    glSamplerParameteri(s->gl, GL_TEXTURE_WRAP_T, gl_wrap(s->t));
+    glSamplerParameteri(s->gl, GL_TEXTURE_WRAP_R, gl_wrap(s->r));
+    if (s->lod_max > 0)
+        glSamplerParameterf(s->gl, GL_TEXTURE_MAX_LOD, s->lod_max);
+    glSamplerParameterf(s->gl, GL_TEXTURE_MIN_LOD, s->lod_min);
+    if (s->compare) {
+        glSamplerParameteri(s->gl, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
+        glSamplerParameteri(s->gl, GL_TEXTURE_COMPARE_FUNC, (GLint)gl_compare(s->compare));
+    }
+    gpu_unlock();
+    RET(o);
+}
+
+static void read_stencil(uint64_t d, MStencil *s)
+{
+    s->compare = (uint32_t)pb_get(d, "stencilCompareFunction", 7);
+    s->fail = (uint32_t)pb_get(d, "stencilFailureOperation", 0);
+    s->depth_fail = (uint32_t)pb_get(d, "depthFailureOperation", 0);
+    s->pass = (uint32_t)pb_get(d, "depthStencilPassOperation", 0);
+    s->read_mask = (uint32_t)pb_get(d, "readMask", 0xFFFFFFFFu);
+    s->write_mask = (uint32_t)pb_get(d, "writeMask", 0xFFFFFFFFu);
+}
+static void d_newDepthStencilState(Ctx *c)
+{
+    uint64_t d = MARG(0);
+    uint64_t o = objc_new_object(&cls_DepthStencil);
+    MDepthStencil *s = objc_host(o);
+    s->compare = (uint32_t)pb_get(d, "depthCompareFunction", 7);
+    s->write = (uint32_t)pb_get(d, "depthWriteEnabled", 0) & 1;
+    uint64_t f = pb_existing_child(d, "frontFaceStencil"), b = pb_existing_child(d, "backFaceStencil");
+    s->stencil_enabled = f || b;
+    read_stencil(f, &s->front);
+    read_stencil(b ? b : f, &s->back);
+    RET(o);
+}
+
+/* ---- libraries, functions, pipelines -------------------------------------------------------- */
+
+typedef struct MLib {
+    int vs, fs;              /* shader indices found in this library (-1: none) */
+} MLib;
+typedef struct MFunc {
+    int shader;
+    int stage;
+} MFunc;
+
+static uint64_t fnv64(const uint8_t *p, size_t n)
+{
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; i++)
+        h = (h ^ p[i]) * 1099511628211ull;
+    return h;
+}
+
+static void d_newLibraryWithData(Ctx *c)
+{
+    /* dispatch_data_t from dispatch_data_create: +16 bytes, +24 size */
+    uint64_t data = MARG(0);
+    uint32_t bytes = (uint32_t)rt_ld64(G(data + 16));
+    uint32_t size = (uint32_t)rt_ld64(G(data + 24));
+    uint64_t h = fnv64(G(bytes), size);
+    uint64_t o = objc_new_object(&cls_Library);
+    MLib *l = objc_host(o);
+    l->vs = l->fs = -1;
+    for (int i = 0; i < g_shader_count; i++)
+        if (g_shaders[i].hash == h) {
+            if (g_shaders[i].stage == 0) l->vs = i;
+            else l->fs = i;
+        }
+    if (l->vs < 0 && l->fs < 0)
+        rt_log("metal: library %016llx (%u bytes) has no translated shader\n", (unsigned long long)h, size);
+    RET(o);
+}
+static void lib_newFunctionWithName(Ctx *c)
+{
+    MLib *l = objc_host(SELF);
+    const char *name = ns_cstr(MARG(0));
+    int vertex = name && strstr(name, "vertex") != NULL;
+    int idx = vertex ? l->vs : l->fs;
+    if (idx < 0) {
+        RET(0);
+        return;
+    }
+    uint64_t o = objc_new_object(&cls_Function);
+    MFunc *f = objc_host(o);
+    f->shader = idx;
+    f->stage = vertex ? 0 : 1;
+    RET(o);
+}
+
+static GLuint compile(GLenum type, const char *src, int index)
+{
+    GLuint s = glCreateShader(type);
+    glShaderSource(s, 1, &src, NULL);
+    glCompileShader(s);
+    GLint ok;
+    glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[4096];
+        glGetShaderInfoLog(s, sizeof log, NULL, log);
+        rt_fatal("shader %d does not compile:\n%s\n%s", index, log, src);
+    }
+    return s;
+}
+
+static void pipe_dealloc(void *h)
+{
+    MPipeline *p = h;
+    gpu_lock();
+    if (p->prog) glDeleteProgram(p->prog);
+    if (p->vao) glDeleteVertexArrays(1, &p->vao);
+    gpu_unlock();
+}
+
+/* GLSL 3.30 wants the interpolation qualifiers of the two stages to match:
+ * copy the fragment shader's (flat / noperspective) onto the vertex outputs. */
+static char *patch_vertex_outputs(const char *vs, const char *fs)
+{
+    size_t cap = strlen(vs) + 1024;
+    char *out = malloc(cap);
+    strcpy(out, vs);
+    const char *quals[] = { "flat ", "noperspective " };
+    for (int q = 0; q < 2; q++) {
+        const char *p = fs;
+        while ((p = strstr(p, quals[q])) != NULL) {
+            const char *in = p + strlen(quals[q]);
+            if (strncmp(in, "in ", 3) != 0) { p = in; continue; }
+            const char *nm = strstr(in, "v_");
+            const char *end = nm ? strchr(nm, ';') : NULL;
+            if (!nm || !end) break;
+            char name[96];
+            snprintf(name, sizeof name, "%.*s;", (int)(end - nm), nm);
+            /* find "out <type> name;" in the vertex shader */
+            char *o = out;
+            while ((o = strstr(o, "out ")) != NULL) {
+                char *semi = strchr(o, ';');
+                char *v = strstr(o, " v_");
+                if (semi && v && v < semi && strncmp(v + 1, name, strlen(name)) == 0 &&
+                    (o == out || o[-1] == '\n')) {
+                    size_t ql = strlen(quals[q]);
+                    memmove(o + ql, o, strlen(o) + 1);
+                    memcpy(o, quals[q], ql);
+                    break;
+                }
+                o += 4;
+            }
+            p = end;
+        }
+    }
+    return out;
+}
+
+static void link_program(MPipeline *p)
+{
+    const char *fsrc = p->fs >= 0 ? g_shaders[p->fs].glsl : "#version 330 core\nvoid main() {}\n";
+    if (getenv("MINA_DEBUG_FS"))
+        fsrc = "#version 330 core\nlayout(location = 0) out vec4 o0;\nvoid main() { o0 = vec4(1.0, 0.0, 1.0, 1.0); }\n";
+    char *vsrc = patch_vertex_outputs(g_shaders[p->vs].glsl, fsrc);
+    GLuint vs = compile(GL_VERTEX_SHADER, vsrc, p->vs);
+    GLuint fs = compile(GL_FRAGMENT_SHADER, fsrc, p->fs);
+    free(vsrc);
+    p->prog = glCreateProgram();
+    glAttachShader(p->prog, vs);
+    glAttachShader(p->prog, fs);
+    glLinkProgram(p->prog);
+    GLint ok;
+    glGetProgramiv(p->prog, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[4096];
+        glGetProgramInfoLog(p->prog, sizeof log, NULL, log);
+        rt_fatal("program (vs %d, fs %d) does not link:\n%s", p->vs, p->fs, log);
+    }
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    for (int i = 0; i < MAX_VBUF; i++)
+        p->vcb[i] = p->fcb[i] = -1;
+    p->ntex = 0;
+    /* uniforms: vcb<N>[K], fcb<N>[K], vtex<T>_s<S>, ftex<T>_s<S>, _r, _ms */
+    GLint count;
+    glGetProgramiv(p->prog, GL_ACTIVE_UNIFORMS, &count);
+    glUseProgram(p->prog);
+    for (GLint u = 0; u < count; u++) {
+        char name[128];
+        GLint size;
+        GLenum type;
+        glGetActiveUniform(p->prog, (GLuint)u, sizeof name, NULL, &size, &type, name);
+        GLint loc = glGetUniformLocation(p->prog, name);
+        int n;
+        if (sscanf(name, "vcb%d", &n) == 1 && n < MAX_VBUF) {
+            p->vcb[n] = loc;
+            p->vcb_size[n] = size;
+        } else if (sscanf(name, "fcb%d", &n) == 1 && n < MAX_VBUF) {
+            p->fcb[n] = loc;
+            p->fcb_size[n] = size;
+        } else if ((name[0] == 'v' || name[0] == 'f') && sscanf(name + 1, "tex%d", &n) == 1 && p->ntex < 16) {
+            const char *us = strchr(name, '_');
+            int s = (us && us[1] == 's') ? atoi(us + 2) : -1;
+            int k = p->ntex++;
+            p->texb[k].stage = name[0] == 'f';
+            p->texb[k].tex = n;
+            p->texb[k].samp = s;
+            p->texb[k].unit = k;
+            glUniform1i(loc, k);
+        }
+    }
+    glGenVertexArrays(1, &p->vao);
+}
+
+/* ---- pipeline reflection: what the engine binds per draw ---------------------------- */
+
+typedef struct MArg {
+    uint32_t type, index, size;     /* type: 0 buffer, 2 texture, 3 sampler */
+} MArg;
+typedef struct MRefl {
+    uint64_t vargs, fargs;          /* NSArray of MTLArgument */
+} MRefl;
+static Class cls_Refl, cls_Arg;
+
+static void arg_isActive(Ctx *c) { RET(1); }
+static void arg_type(Ctx *c) { RET(((MArg *)objc_host(SELF))->type); }
+static void arg_index(Ctx *c) { RET(((MArg *)objc_host(SELF))->index); }
+static void arg_size(Ctx *c) { RET(((MArg *)objc_host(SELF))->size); }
+static void arg_name(Ctx *c) { RET(ns_string_auto("arg")); }
+static void refl_dealloc(void *h)
+{
+    objc_release_obj(((MRefl *)h)->vargs);
+    objc_release_obj(((MRefl *)h)->fargs);
+}
+static void refl_vargs(Ctx *c) { RET(((MRefl *)objc_host(SELF))->vargs); }
+static void refl_fargs(Ctx *c) { RET(((MRefl *)objc_host(SELF))->fargs); }
+static const Method arg_m[] = {
+    { "isActive", arg_isActive }, { "type", arg_type }, { "index", arg_index },
+    { "bufferDataSize", arg_size }, { "name", arg_name }, { NULL, NULL },
+};
+static const Method refl_m[] = {
+    { "vertexArguments", refl_vargs }, { "fragmentArguments", refl_fargs }, { NULL, NULL },
+};
+static Class cls_Arg = { "MTLArgument_GL", "NSObject", arg_m, NULL, sizeof(MArg), NULL };
+static Class cls_Refl = { "MTLRenderPipelineReflection_GL", "NSObject", refl_m, NULL, sizeof(MRefl), refl_dealloc };
+
+static void add_arg(uint64_t arr, uint32_t type, uint32_t index, uint32_t size)
+{
+    uint64_t a = objc_new_object(&cls_Arg);
+    MArg *m = objc_host(a);
+    m->type = type;
+    m->index = index;
+    m->size = size;
+    ns_array_add(arr, a);
+    objc_release_obj(a);
+}
+
+static uint64_t make_reflection(const MPipeline *p)
+{
+    uint64_t r = objc_new_object(&cls_Refl);
+    MRefl *m = objc_host(r);
+    m->vargs = ns_array_new();
+    m->fargs = ns_array_new();
+    for (int i = 0; i < MAX_VBUF; i++) {
+        if (p->vcb[i] >= 0)
+            add_arg(m->vargs, 0, (uint32_t)i, (uint32_t)p->vcb_size[i] * 16);
+        if (p->fcb[i] >= 0)
+            add_arg(m->fargs, 0, (uint32_t)i, (uint32_t)p->fcb_size[i] * 16);
+    }
+    for (int k = 0; k < p->ntex; k++) {
+        uint64_t arr = p->texb[k].stage ? m->fargs : m->vargs;
+        add_arg(arr, 2, (uint32_t)p->texb[k].tex, 0);
+        if (p->texb[k].samp >= 0)
+            add_arg(arr, 3, (uint32_t)p->texb[k].samp, 0);
+    }
+    return objc_autorelease_obj(r);
+}
+
+static void d_newRenderPipelineState(Ctx *c)
+{
+    uint64_t reflection_out = strstr(gstr(c->x[1]), "reflection:") ? MARG(2) : 0;
+    uint64_t d = MARG(0);
+    uint64_t o = objc_new_object(&cls_Pipeline);
+    MPipeline *p = objc_host(o);
+    uint64_t vf = pb_get(d, "vertexFunction", 0), ff = pb_get(d, "fragmentFunction", 0);
+    p->vs = vf ? ((MFunc *)objc_host(vf))->shader : -1;
+    p->fs = ff ? ((MFunc *)objc_host(ff))->shader : -1;
+    if (p->vs < 0)
+        rt_fatal("metal: pipeline without a vertex function");
+    uint64_t vd = pb_existing_child(d, "vertexDescriptor");
+    uint64_t attrs = pb_existing_child(vd, "attributes"), layouts = pb_existing_child(vd, "layouts");
+    for (int i = 0; i < MAX_ATTRS; i++) {
+        uint64_t a = pb_elem(attrs, i);
+        if (!a || !pb_get(a, "format", 0))
+            continue;
+        p->attrs[i].format = (uint32_t)pb_get(a, "format", 0);
+        p->attrs[i].offset = (uint32_t)pb_get(a, "offset", 0);
+        p->attrs[i].buffer = (uint32_t)pb_get(a, "bufferIndex", 0);
+        p->attr_mask |= 1u << i;
+    }
+    for (int i = 0; i < MAX_VBUF; i++) {
+        uint64_t l = pb_elem(layouts, i);
+        p->layouts[i].stride = (uint32_t)pb_get(l, "stride", 0);
+        p->layouts[i].step_fn = (uint32_t)pb_get(l, "stepFunction", 1);
+        p->layouts[i].step_rate = (uint32_t)pb_get(l, "stepRate", 1);
+    }
+    uint64_t colors = pb_existing_child(d, "colorAttachments");
+    for (int i = 0; i < MAX_COLOR; i++) {
+        uint64_t a = pb_elem(colors, i);
+        MBlend *b = &p->color[i];
+        b->format = (uint32_t)pb_get(a, "pixelFormat", 0);
+        b->enabled = (uint32_t)pb_get(a, "blendingEnabled", 0) & 1;
+        b->write_mask = (uint32_t)pb_get(a, "writeMask", 0xF);
+        b->rgb_op = (uint32_t)pb_get(a, "rgbBlendOperation", 0);
+        b->alpha_op = (uint32_t)pb_get(a, "alphaBlendOperation", 0);
+        b->src_rgb = (uint32_t)pb_get(a, "sourceRGBBlendFactor", 1);
+        b->dst_rgb = (uint32_t)pb_get(a, "destinationRGBBlendFactor", 0);
+        b->src_a = (uint32_t)pb_get(a, "sourceAlphaBlendFactor", 1);
+        b->dst_a = (uint32_t)pb_get(a, "destinationAlphaBlendFactor", 0);
+    }
+    p->depth_format = (uint32_t)pb_get(d, "depthAttachmentPixelFormat", 0);
+    p->stencil_format = (uint32_t)pb_get(d, "stencilAttachmentPixelFormat", 0);
+    p->samples = (uint32_t)pb_get(d, "rasterSampleCount", pb_get(d, "sampleCount", 1));
+    gpu_lock();
+    link_program(p);
+    gpu_unlock();
+    if (reflection_out)
+        rt_st64(G(reflection_out), make_reflection(p));
+    RET(o);
+}
+
+/* ---- buffers, textures, others: properties ------------------------------------------------- */
+
+static void b_contents(Ctx *c) { RET(((MBuffer *)objc_host(SELF))->contents); }
+static void b_length(Ctx *c) { RET(((MBuffer *)objc_host(SELF))->length); }
+static void b_didModifyRange(Ctx *c) { (void)c; }
+
+static void t_width(Ctx *c) { RET(((MTexture *)objc_host(SELF))->width); }
+static void t_height(Ctx *c) { RET(((MTexture *)objc_host(SELF))->height); }
+static void t_depth(Ctx *c) { RET(1); }
+static void t_pixelFormat(Ctx *c) { RET(((MTexture *)objc_host(SELF))->format); }
+static void t_textureType(Ctx *c) { RET(((MTexture *)objc_host(SELF))->type); }
+static void t_mipmapLevelCount(Ctx *c) { RET(((MTexture *)objc_host(SELF))->mips); }
+static void t_sampleCount(Ctx *c) { RET(((MTexture *)objc_host(SELF))->samples); }
+static void t_usage(Ctx *c) { RET(((MTexture *)objc_host(SELF))->usage); }
+
+static GLuint tex_fbo(MTexture *t, int level);
+
+/* replaceRegion:mipmapLevel:withBytes:bytesPerRow: (region passed by pointer) */
+static void tex_upload(MTexture *t, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t level,
+                       uint32_t slice, const uint8_t *src, uint32_t bpr)
+{
+    GLFmt f;
+    gl_format(t->format, &f);
+    GLenum target = tex_target(t);
+    GLenum tt = target == GL_TEXTURE_CUBE_MAP ? (GLenum)(GL_TEXTURE_CUBE_MAP_POSITIVE_X + slice) : target;
+    glBindTexture(target, t->gl);
+    if (f.block_bytes) {
+        GLsizei size = (GLsizei)(((w + 3) / 4) * ((h + 3) / 4) * (uint32_t)f.block_bytes);
+        glCompressedTexSubImage2D(tt, (GLint)level, (GLint)x, (GLint)y, (GLsizei)w, (GLsizei)h, f.internal, size, src);
+        return;
+    }
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, f.bpp ? (GLint)(bpr / (uint32_t)f.bpp) : 0);
+    glTexSubImage2D(tt, (GLint)level, (GLint)x, (GLint)y, (GLsizei)w, (GLsizei)h, f.format, f.type, src);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+}
+static void t_replaceRegion(Ctx *c)
+{
+    MTexture *t = objc_host(SELF);
+    uint64_t r = MARG(0);   /* MTLRegion: origin{x,y,z}, size{w,h,d} */
+    gpu_lock();
+    tex_upload(t, (uint32_t)rt_ld64(G(r)), (uint32_t)rt_ld64(G(r + 8)), (uint32_t)rt_ld64(G(r + 24)),
+               (uint32_t)rt_ld64(G(r + 32)), (uint32_t)MARG(1), 0, G(MARG(2)), (uint32_t)MARG(3));
+    gpu_unlock();
+}
+/* getBytes:bytesPerRow:fromRegion:mipmapLevel: */
+static void t_getBytes(Ctx *c)
+{
+    MTexture *t = objc_host(SELF);
+    uint64_t r = MARG(2);
+    uint32_t x = (uint32_t)rt_ld64(G(r)), y = (uint32_t)rt_ld64(G(r + 8));
+    uint32_t w = (uint32_t)rt_ld64(G(r + 24)), h = (uint32_t)rt_ld64(G(r + 32));
+    GLFmt f;
+    gl_format(t->format, &f);
+    gpu_lock();
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, tex_fbo(t, (int)MARG(3)));
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glPixelStorei(GL_PACK_ROW_LENGTH, f.bpp ? (GLint)(MARG(1) / (uint64_t)f.bpp) : 0);
+    glReadPixels((GLint)x, (GLint)y, (GLsizei)w, (GLsizei)h, f.format, f.type, G(MARG(0)));
+    glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    gpu_unlock();
+}
+
+static void obj_label(Ctx *c) { RET(0); }
+static void obj_nop(Ctx *c) { (void)c; }
+static void obj_device(Ctx *c) { RET(device); }
+
+/* ---- render targets ----------------------------------------------------------------------- */
+
+static GLuint tex_fbo(MTexture *t, int level)
+{
+    if (t->fbo_cache && level == 0)
+        return t->fbo_cache;
+    GLuint fbo;
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    GLFmt f;
+    gl_format(t->format, &f);
+    GLenum att = f.depth ? (f.stencil ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT) : GL_COLOR_ATTACHMENT0;
+    glFramebufferTexture2D(GL_FRAMEBUFFER, att, tex_target(t), t->gl, level);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (level == 0)
+        t->fbo_cache = fbo;
+    return fbo;
+}
+
+/* FBO cache keyed by attachments */
+typedef struct FboEnt {
+    GLuint tex[MAX_COLOR + 1];
+    int level[MAX_COLOR + 1];
+    GLuint fbo;
+} FboEnt;
+static FboEnt fbos[256];
+static int nfbos;
+
+static GLuint pass_fbo(MTexture **color, const int *levels, MTexture *depth, MTexture *stencil)
+{
+    FboEnt key;
+    memset(&key, 0, sizeof key);
+    for (int i = 0; i < MAX_COLOR; i++) {
+        key.tex[i] = color[i] ? color[i]->gl : 0;
+        key.level[i] = color[i] ? levels[i] : 0;
+    }
+    key.tex[MAX_COLOR] = depth ? depth->gl : (stencil ? stencil->gl : 0);
+    for (int i = 0; i < nfbos; i++)
+        if (memcmp(fbos[i].tex, key.tex, sizeof key.tex) == 0 && memcmp(fbos[i].level, key.level, sizeof key.level) == 0)
+            return fbos[i].fbo;
+    GLuint fbo;
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    GLenum bufs[MAX_COLOR];
+    int nb = 0;
+    for (int i = 0; i < MAX_COLOR; i++) {
+        if (color[i]) {
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + (GLenum)i, tex_target(color[i]),
+                                   color[i]->gl, levels[i]);
+            bufs[i] = GL_COLOR_ATTACHMENT0 + (GLenum)i;
+            nb = i + 1;
+        } else {
+            bufs[i] = GL_NONE;
+        }
+    }
+    glDrawBuffers(nb ? nb : 1, nb ? bufs : (GLenum[]){ GL_NONE });
+    MTexture *ds = depth ? depth : stencil;
+    if (ds) {
+        GLFmt f;
+        gl_format(ds->format, &f);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, f.stencil ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT,
+                               tex_target(ds), ds->gl, 0);
+    }
+    GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (st != GL_FRAMEBUFFER_COMPLETE)
+        rt_log("metal: incomplete framebuffer (%#x)\n", st);
+    if (nfbos < (int)(sizeof fbos / sizeof fbos[0])) {
+        key.fbo = fbo;
+        fbos[nfbos++] = key;
+    }
+    return fbo;
+}
+
+/* ---- command queue / buffer ------------------------------------------------------------------ */
+
+typedef struct MCmdBuf {
+    uint64_t handlers[8];
+    int nhandlers;
+    uint64_t present;        /* drawable */
+    int committed;
+} MCmdBuf;
+
+static void q_commandBuffer(Ctx *c) { RET(objc_autorelease_obj(objc_new_object(&cls_CmdBuf))); }
+
+static void cb_addCompletedHandler(Ctx *c)
+{
+    MCmdBuf *cb = objc_host(SELF);
+    if (cb->nhandlers < 8) {
+        cb->handlers[cb->nhandlers++] = block_copy(c, MARG(0));
+    }
+}
+static void cb_presentDrawable(Ctx *c)
+{
+    MCmdBuf *cb = objc_host(SELF);
+    cb->present = objc_retain_obj(MARG(0));
+}
+
+void metal_present(uint64_t drawable);
+
+static void cb_commit(Ctx *c)
+{
+    uint64_t self = SELF;
+    MCmdBuf *cb = objc_host(self);
+    cb->committed = 1;
+    if (cb->present) {
+        metal_present(cb->present);
+        objc_release_obj(cb->present);
+        cb->present = 0;
+    }
+    for (int i = 0; i < cb->nhandlers; i++) {
+        block_call(c, cb->handlers[i], 1, self);
+        gfree((uint32_t)cb->handlers[i]);
+    }
+    cb->nhandlers = 0;
+}
+static void cb_status(Ctx *c) { RET(((MCmdBuf *)objc_host(SELF))->committed ? 4 : 0); }
+
+uint64_t metal_render_encoder(Ctx *c, uint64_t passdesc);
+uint64_t metal_blit_encoder(Ctx *c);
+static void cb_renderEncoder(Ctx *c) { RET(metal_render_encoder(c, MARG(0))); }
+static void cb_blitEncoder(Ctx *c) { RET(metal_blit_encoder(c)); }
+
+/* ---- CAMetalLayer / drawable ---------------------------------------------------------------------- */
+
+typedef struct MLayer {
+    uint32_t format;
+    uint64_t textures[3];
+    int next;
+    uint32_t w, h;
+} MLayer;
+typedef struct MDrawable {
+    uint64_t texture;
+} MDrawable;
+
+static uint64_t the_layer;
+
+uint64_t metal_layer_for_window(SDL_Window *w)
+{
+    (void)w;
+    if (!the_layer) {
+        the_layer = objc_new_object(&cls_Layer);
+        MLayer *l = objc_host(the_layer);
+        l->format = 80;
+    }
+    return the_layer;
+}
+
+static void layer_size(uint32_t *w, uint32_t *h)
+{
+    int iw, ih;
+    SDL_GL_GetDrawableSize(sdl_main_window(), &iw, &ih);
+    *w = (uint32_t)iw;
+    *h = (uint32_t)ih;
+}
+
+static void l_setPixelFormat(Ctx *c) { ((MLayer *)objc_host(SELF))->format = (uint32_t)MARG(0); }
+static void l_pixelFormat(Ctx *c) { RET(((MLayer *)objc_host(SELF))->format); }
+static void l_contentsScale(Ctx *c)
+{
+    int lw, lh, pw, ph;
+    SDL_GetWindowSize(sdl_main_window(), &lw, &lh);
+    SDL_GL_GetDrawableSize(sdl_main_window(), &pw, &ph);
+    RETD(lw ? (double)pw / lw : 1.0);
+}
+static void l_drawableSize(Ctx *c)
+{
+    uint32_t w, h;
+    layer_size(&w, &h);
+    c->v[0] = vset_f64(w);
+    c->v[1] = vset_f64(h);
+}
+static void l_nextDrawable(Ctx *c)
+{
+    MLayer *l = objc_host(SELF);
+    uint32_t w, h;
+    layer_size(&w, &h);
+    if (w != l->w || h != l->h) {
+        for (int i = 0; i < 3; i++)
+            if (l->textures[i])
+                objc_release_obj(l->textures[i]);
+        for (int i = 0; i < 3; i++) {
+            l->textures[i] = metal_new_texture(2, l->format, w, h, 1, 1, 4, 2);
+            ((MTexture *)objc_host(l->textures[i]))->is_drawable = 1;
+        }
+        l->w = w;
+        l->h = h;
+    }
+    uint64_t d = objc_new_object(&cls_Drawable);
+    ((MDrawable *)objc_host(d))->texture = objc_retain_obj(l->textures[l->next]);
+    l->next = (l->next + 1) % 3;
+    RET(objc_autorelease_obj(d));
+}
+static void dr_dealloc(void *h) { objc_release_obj(((MDrawable *)h)->texture); }
+static void dr_texture(Ctx *c) { RET(((MDrawable *)objc_host(SELF))->texture); }
+static void dr_present(Ctx *c) { metal_present(SELF); }
+
+void metal_present(uint64_t drawable)
+{
+    MTexture *t = objc_host(((MDrawable *)objc_host(drawable))->texture);
+    gpu_lock();
+    int w, h;
+    SDL_GL_GetDrawableSize(sdl_main_window(), &w, &h);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, tex_fbo(t, 0));
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glDisable(GL_SCISSOR_TEST);
+    /* Metal layout (row 0 at the top) to the window (row 0 at the bottom) */
+    glBlitFramebuffer(0, 0, (GLint)t->width, (GLint)t->height, 0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    /* MINA_DUMP=path: every 60th presented frame is written there (PPM) */
+    static int frame;
+    const char *dump = getenv("MINA_DUMP");
+    if (dump && ++frame % 60 == 0) {
+        uint8_t *px = malloc((size_t)t->width * t->height * 4);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, tex_fbo(t, 0));
+        glReadPixels(0, 0, (GLsizei)t->width, (GLsizei)t->height, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+        FILE *f = fopen(dump, "wb");
+        if (f) {
+            fprintf(f, "P6 %u %u 255\n", t->width, t->height);
+            for (uint32_t i = 0; i < t->width * t->height; i++)
+                fwrite(px + 4 * i, 1, 3, f);
+            fclose(f);
+        }
+        free(px);
+    }
+    SDL_GL_SwapWindow(sdl_main_window());
+    gpu_unlock();
+}
+
+/* ---- class tables ---------------------------------------------------------------------------- */
+
+static const Method device_m[] = {
+    { "name", d_name }, { "newCommandQueue", d_newCommandQueue },
+    { "newCommandQueueWithMaxCommandBufferCount:", d_newCommandQueue },
+    { "newBufferWithLength:options:", d_newBufferWithLength },
+    { "newBufferWithBytes:length:options:", d_newBufferWithBytes },
+    { "newTextureWithDescriptor:", d_newTextureWithDescriptor },
+    { "newSamplerStateWithDescriptor:", d_newSamplerState },
+    { "newDepthStencilStateWithDescriptor:", d_newDepthStencilState },
+    { "newLibraryWithData:error:", d_newLibraryWithData },
+    { "newRenderPipelineStateWithDescriptor:error:", d_newRenderPipelineState },
+    { "newRenderPipelineStateWithDescriptor:options:reflection:error:", d_newRenderPipelineState },
+    { "supportsTextureSampleCount:", d_supportsSampleCount }, { "supportsFamily:", d_true },
+    { "maxBufferLength", d_maxBufferLength }, { "hasUnifiedMemory", d_true },
+    { NULL, NULL },
+};
+static const Method queue_m[] = {
+    { "commandBuffer", q_commandBuffer }, { "commandBufferWithUnretainedReferences", q_commandBuffer },
+    { "setLabel:", obj_nop }, { "label", obj_label }, { "device", obj_device },
+    { NULL, NULL },
+};
+static const Method cmdbuf_m[] = {
+    { "addCompletedHandler:", cb_addCompletedHandler }, { "presentDrawable:", cb_presentDrawable },
+    { "commit", cb_commit }, { "waitUntilCompleted", obj_nop }, { "waitUntilScheduled", obj_nop },
+    { "enqueue", obj_nop }, { "status", cb_status }, { "setLabel:", obj_nop }, { "label", obj_label },
+    { "renderCommandEncoderWithDescriptor:", cb_renderEncoder }, { "blitCommandEncoder", cb_blitEncoder },
+    { NULL, NULL },
+};
+static const Method buffer_m[] = {
+    { "contents", b_contents }, { "length", b_length }, { "didModifyRange:", b_didModifyRange },
+    { "setLabel:", obj_nop }, { "label", obj_label }, { "device", obj_device },
+    { NULL, NULL },
+};
+static const Method texture_m[] = {
+    { "width", t_width }, { "height", t_height }, { "depth", t_depth }, { "pixelFormat", t_pixelFormat },
+    { "textureType", t_textureType }, { "mipmapLevelCount", t_mipmapLevelCount },
+    { "sampleCount", t_sampleCount }, { "usage", t_usage }, { "arrayLength", t_depth },
+    { "replaceRegion:mipmapLevel:withBytes:bytesPerRow:", t_replaceRegion },
+    { "getBytes:bytesPerRow:fromRegion:mipmapLevel:", t_getBytes },
+    { "setLabel:", obj_nop }, { "label", obj_label }, { "device", obj_device },
+    { NULL, NULL },
+};
+static const Method simple_m[] = {
+    { "setLabel:", obj_nop }, { "label", obj_label }, { "device", obj_device }, { NULL, NULL },
+};
+static const Method library_m[] = {
+    { "newFunctionWithName:", lib_newFunctionWithName }, { "setLabel:", obj_nop }, { "label", obj_label },
+    { NULL, NULL },
+};
+static const Method layer_m[] = {
+    { "setPixelFormat:", l_setPixelFormat }, { "pixelFormat", l_pixelFormat },
+    { "contentsScale", l_contentsScale }, { "drawableSize", l_drawableSize }, { "nextDrawable", l_nextDrawable },
+    { "setDevice:", obj_nop }, { "setFramebufferOnly:", obj_nop }, { "setMagnificationFilter:", obj_nop },
+    { "setDisplaySyncEnabled:", obj_nop }, { "setDrawableSize:", obj_nop }, { "setMaximumDrawableCount:", obj_nop },
+    { "setContentsScale:", obj_nop }, { "setOpaque:", obj_nop }, { "device", obj_device },
+    { NULL, NULL },
+};
+static const Method drawable_m[] = { { "texture", dr_texture }, { "present", dr_present }, { NULL, NULL } };
+
+static Class cls_Device = { "MTLDevice_GL", "NSObject", device_m, NULL, 0, NULL };
+static Class cls_Queue = { "MTLCommandQueue_GL", "NSObject", queue_m, NULL, 0, NULL };
+static Class cls_CmdBuf = { "MTLCommandBuffer_GL", "NSObject", cmdbuf_m, NULL, sizeof(MCmdBuf), NULL };
+static Class cls_Buffer = { "MTLBuffer_GL", "NSObject", buffer_m, NULL, sizeof(MBuffer), buf_dealloc };
+static Class cls_Texture = { "MTLTexture_GL", "NSObject", texture_m, NULL, sizeof(MTexture), tex_dealloc };
+static Class cls_Sampler = { "MTLSamplerState_GL", "NSObject", simple_m, NULL, sizeof(MSampler), sampler_dealloc };
+static Class cls_DepthStencil = { "MTLDepthStencilState_GL", "NSObject", simple_m, NULL, sizeof(MDepthStencil), NULL };
+static Class cls_Library = { "MTLLibrary_GL", "NSObject", library_m, NULL, sizeof(MLib), NULL };
+static Class cls_Function = { "MTLFunction_GL", "NSObject", simple_m, NULL, sizeof(MFunc), NULL };
+static Class cls_Pipeline = { "MTLRenderPipelineState_GL", "NSObject", simple_m, NULL, sizeof(MPipeline), pipe_dealloc };
+static Class cls_Layer = { "CAMetalLayer", "NSObject", layer_m, NULL, sizeof(MLayer), NULL };
+static Class cls_Drawable = { "CAMetalDrawable_GL", "NSObject", drawable_m, NULL, sizeof(MDrawable), dr_dealloc };
+
+extern Class cls_RenderEnc, cls_BlitEnc;
+
+Class *metal_class_texture(void) { return &cls_Texture; }
+Class *metal_class_buffer(void) { return &cls_Buffer; }
+
+void metal_init_classes(void);
+Class *const g_classes_metal[] = {
+    &cls_PropBag, &cls_BagArray, &cls_TextureDesc, &cls_SamplerDesc, &cls_DepthStencilDesc, &cls_StencilDesc,
+    &cls_PipelineDesc, &cls_PipelineColorDesc, &cls_VertexDesc, &cls_VertexAttrDesc, &cls_VertexLayoutDesc,
+    &cls_PassDesc, &cls_PassColorDesc, &cls_PassDepthDesc, &cls_PassStencilDesc,
+    &cls_Device, &cls_Queue, &cls_CmdBuf, &cls_Buffer, &cls_Texture, &cls_Sampler, &cls_DepthStencil,
+    &cls_Library, &cls_Function, &cls_Pipeline, &cls_Layer, &cls_Drawable, &cls_RenderEnc, &cls_BlitEnc,
+    &cls_Arg, &cls_Refl,
+    NULL,
+};
+
+void metal_init(void)
+{
+    define_children();
+    cls_TextureDesc.cmethods = td_cmethods;
+    cls_PassDesc.cmethods = pd_cmethods;
+}
+
+/* MTLRenderPassDescriptor helpers for the encoder */
+void metal_pass_info(uint64_t pd, uint64_t *color, uint64_t *depth, uint64_t *stencil)
+{
+    uint64_t colors = pb_existing_child(pd, "colorAttachments");
+    for (int i = 0; i < MAX_COLOR; i++)
+        color[i] = pb_elem(colors, i);
+    *depth = pb_existing_child(pd, "depthAttachment");
+    *stencil = pb_existing_child(pd, "stencilAttachment");
+}
+GLuint metal_pass_fbo(MTexture **color, const int *levels, MTexture *depth, MTexture *stencil)
+{
+    return pass_fbo(color, levels, depth, stencil);
+}
+GLuint metal_tex_fbo(MTexture *t, int level) { return tex_fbo(t, level); }
+void metal_tex_upload(MTexture *t, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t level, uint32_t slice,
+                      const uint8_t *src, uint32_t bpr)
+{
+    tex_upload(t, x, y, w, h, level, slice, src, bpr);
+}
+GLenum metal_tex_target(const MTexture *t) { return tex_target(t); }
+GLenum metal_gl_compare(uint32_t f) { return gl_compare(f); }
 
 const ImportImpl g_impl_metal[] = {
+    { "_MTLCreateSystemDefaultDevice", imp_MTLCreateSystemDefaultDevice, 0, NULL },
     { NULL, NULL, 0, NULL },
 };

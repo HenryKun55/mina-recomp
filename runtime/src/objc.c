@@ -321,6 +321,14 @@ static int lookup(Class *k, int meta, uint32_t sel, Imp *out)
             return 1;
         }
     }
+    if (!meta) {
+        for (Class *c = k; c; c = c->super)
+            if (!c->guest && c->fallback) {
+                out->host = c->fallback;
+                out->guest = 0;
+                return 1;
+            }
+    }
     if (meta) {
         /* class objects also answer the root class's instance methods */
         Class *root = objc_class_named("NSObject");
@@ -476,6 +484,27 @@ uint64_t block_call(Ctx *c, uint64_t block, int nargs, ...)
     rt_call(c, rt_ld64(G(block + 16)));
     c->sp = sp;
     return c->x[0];
+}
+
+/* Block_copy: blocks built on the stack are copied to the heap before they
+ * outlive their frame. Layout: isa, flags (i32), reserved, invoke, descriptor
+ * {reserved, size, copy helper, dispose helper}. */
+uint64_t block_copy(Ctx *c, uint64_t block)
+{
+    if (!block)
+        return 0;
+    uint32_t flags = rt_ld32(G(block + 8));
+    uint64_t desc = rt_ld64(G(block + 24));
+    uint64_t size = rt_ld64(G(desc + 8));
+    if (size < 32 || size > 4096)
+        rt_fatal("block_copy: odd block size %llu", (unsigned long long)size);
+    uint32_t heap = gmalloc(size);
+    memcpy(G(heap), G(block), size);
+    if (flags & (1u << 25)) {                 /* BLOCK_HAS_COPY_DISPOSE */
+        uint64_t copy = rt_ld64(G(desc + 16));
+        guest_call(c, copy, 2, (uint64_t)heap, block);
+    }
+    return heap;
 }
 
 /* ---- objects ---------------------------------------------------------------------- */

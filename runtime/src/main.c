@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 Ctx *threads_main_ctx(uint32_t stack_size);
+void metal_init(void);
 void run_atexit(Ctx *c);
 
 static uint32_t guest_strv(int n, char **v)
@@ -27,6 +28,7 @@ int main(int argc, char **argv)
     imports_init();
     loader_load(exe);
     cpu_init();
+    metal_init();
     objc_init();
 
     Ctx *c = threads_main_ctx(8u << 20);

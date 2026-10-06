@@ -209,7 +209,10 @@ class Func:
         n = self.bound_before(self.index[load.addr], load.rm)
         size, signed = load.size, load.signed
         targets = []
-        limit = n if n is not None else 4096
+        if n is not None and n < 0:          # upper limit: read until a target leaves the function
+            limit, n = -n, None
+        else:
+            limit = n if n is not None else 4096
         for e in range(limit):
             raw = self.p.read(tab + e * size, size)
             v = int.from_bytes(raw, "little", signed=bool(signed))
@@ -227,17 +230,17 @@ class Func:
         return targets or None
 
     def const_before(self, i, reg):
-        """Constant value of `reg` before instruction i (adrp/add/adr chains)."""
-        for k in range(i - 1, max(-1, i - 40), -1):
+        """Constant value of `reg` before instruction i (adrp/add/adr chains);
+        None if it is redefined by anything else."""
+        add = 0
+        for k in range(i - 1, max(-1, i - 256), -1):
             ins = self.insns[k]
             if ins.op == "addsub_imm" and ins.rd == reg and not ins.s and not ins.sub and ins.rn == reg:
-                base = self.const_before(k, reg)
-                return None if base is None else base + ins.imm
-            if ins.op == "adrp" and ins.rd == reg:
-                return ins.target
-            if ins.op == "adr" and ins.rd == reg:
-                return ins.target
-            if getattr_rd(ins) == reg:
+                add += ins.imm
+                continue
+            if ins.op in ("adrp", "adr") and ins.rd == reg:
+                return ins.target + add
+            if reg in writes(ins):
                 return None
         return None
 
@@ -259,9 +262,15 @@ class Func:
                         n = self.bound_before(j + 1, reg, depth + 1)
                         if n is not None:
                             found.append(n)
-                return max(found) if found and len(found) else None
+                return max(found, key=abs) if found else None
             if ins.op == "addsub_imm" and ins.s and ins.sub and ins.rd == ZR and ins.rn == reg:
-                return ins.imm + 1
+                # a bound check is cmp #n followed by b.hi (n+1 entries) or b.hs (n)
+                nxt = self.insns[k + 1] if k + 1 < len(self.insns) else None
+                if nxt is not None and nxt.op == "bcond" and nxt.cond in (8, 2):
+                    return ins.imm + 1 if nxt.cond == 8 else ins.imm
+                continue
+            if ins.op == "logic_imm" and ins.opc == "and" and ins.rd == reg and ins.imm < 1024 and ins.imm & (ins.imm + 1) == 0:
+                return -(ins.imm + 1)      # an upper limit only (may be a zero-extension)
             if ins.op == "logic_reg" and ins.opc == "orr" and ins.rn == ZR and ins.rd == reg \
                     and ins.amount == 0:
                 reg = ins.rm

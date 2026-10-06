@@ -33,6 +33,18 @@ if(NOT GEN_RESULT EQUAL 0)
   message(FATAL_ERROR "recompilation failed")
 endif()
 file(STRINGS "${GEN_DIR}/files.txt" GEN_FILES)
+
+# Shaders: the game's metallibs translated to GLSL (needs llvm-dis: brew install llvm)
+get_filename_component(MINA_DATA "${MINA_EXE}/../../Resources/data" ABSOLUTE)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  ${CMAKE_SOURCE_DIR}/tools/shaders/air2glsl.py ${MINA_DATA}/shaders.pak.yc)
+execute_process(
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/shaders/air2glsl.py
+          ${MINA_DATA}/shaders.pak.yc ${GEN_DIR}/shaders.c
+  RESULT_VARIABLE SHADER_RESULT)
+if(NOT SHADER_RESULT EQUAL 0)
+  message(FATAL_ERROR "shader translation failed")
+endif()
 list(TRANSFORM GEN_FILES PREPEND "${GEN_DIR}/")
 
 add_library(mina_gen OBJECT ${GEN_FILES} ${GEN_DIR}/tables.c)
@@ -42,7 +54,7 @@ target_compile_options(mina_gen PRIVATE -ffp-contract=off -fno-strict-aliasing
 
 # ---- runtime ----------------------------------------------------------------
 file(GLOB RUNTIME_SOURCES runtime/src/*.c)
-add_executable(mina ${RUNTIME_SOURCES} $<TARGET_OBJECTS:mina_gen>)
+add_executable(mina ${RUNTIME_SOURCES} ${GEN_DIR}/shaders.c $<TARGET_OBJECTS:mina_gen>)
 target_include_directories(mina PRIVATE runtime/include ${GEN_DIR})
 target_compile_options(mina PRIVATE -ffp-contract=off -fno-strict-aliasing -Wall -Wno-unused-function)
 
