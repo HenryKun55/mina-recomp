@@ -64,6 +64,8 @@ typedef struct MTexture {
     int is_rb;               /* a renderbuffer (Vita depth/stencil), not a texture */
     uint32_t shift;          /* Vita: the GL texture is 2^shift times smaller (sampled only) */
     GLuint depth_tex;        /* Vita: a texture showing a sampled depth renderbuffer (vitaGL patch) */
+    int clear_valid;         /* holds clear_value everywhere (cleared, nothing drawn or copied since) */
+    float clear_value[4];    /* color, or depth and stencil */
 } MTexture;
 
 #if defined(__vita__) && !defined(MINA_NULL_GL)
@@ -131,6 +133,7 @@ typedef struct ShaderSrc {
     uint64_t hash;           /* FNV-1a 64 of the metallib */
     int stage;
     const char *glsl;
+    int discards_clear0;     /* fragment: discards where texture 0's alpha is 0 (a cleared layer draws nothing) */
 } ShaderSrc;
 extern const ShaderSrc g_shaders[];
 extern const int g_shader_count;

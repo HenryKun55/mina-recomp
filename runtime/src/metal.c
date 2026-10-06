@@ -1059,6 +1059,7 @@ static GLuint tex_fbo(MTexture *t, int level);
 static void tex_upload(MTexture *t, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t level,
                        uint32_t slice, const uint8_t *src, uint32_t bpr)
 {
+    t->clear_valid = 0;
     GLFmt f;
     gl_format(t->format, &f);
     GLenum target = tex_target(t);

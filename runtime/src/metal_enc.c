@@ -64,6 +64,19 @@ typedef struct REnc {
     uint32_t stencil_ref;
     uint32_t cull, winding;
     int ended;
+    /* the pass starts lazily (pass_begin) at its first draw: a pass that
+     * draws nothing only clears, and not even that when its targets already
+     * hold those values (MTexture.clear_valid) */
+    int begun, levels[MAX_COLOR];
+    MTexture *dtex, *stex;
+    unsigned clear_mask;                 /* color attachments with loadAction clear */
+    float clear_color[MAX_COLOR][4];
+    int clear_depth, clear_stencil;
+    float depth_value;
+    int stencil_value;
+    int vp_set, sc_set;
+    double vp[6];
+    int sc[4];
 } REnc;
 
 static void bind_release(Binding *b)
@@ -125,6 +138,104 @@ static void framelog_pass(REnc *e, uint64_t *color, uint64_t depth, uint64_t ste
     rt_log("%s\n", buf);
 }
 
+static void apply_viewport(REnc *e)
+{
+    const double *v = e->vp;
+    glViewport((GLint)v[0], (GLint)v[1], (GLsizei)v[2], (GLsizei)v[3]);
+#if defined(__vita__)
+    /* the CG shaders keep Metal's 0..1 depth: vitaGL's window z is
+     * (f + n) / 2 + z * (f - n) / 2, so this stores zn + z * (zf - zn) */
+    glDepthRange(2.0 * v[4] - v[5], v[5]);
+#else
+    glDepthRange(v[4], v[5]);
+#endif
+}
+
+/* The pass's framebuffer, clears and recorded viewport/scissor: at its first
+ * draw, or at its end when it only clears. */
+static void pass_begin(REnc *e)
+{
+    e->begun = 1;
+    e->fbo = metal_pass_fbo(e->color, e->levels, e->dtex, e->stex);
+    glBindFramebuffer(GL_FRAMEBUFFER, e->fbo);
+    glViewport(0, 0, (GLsizei)e->tw, (GLsizei)e->th);
+    glDepthRange(0.0, 1.0);
+#if defined(__vita__)
+    /* a load action clears the whole attachment: no scissor (vitaGL would
+     * clip the clear with the previous framebuffer's size) */
+    glDisable(GL_SCISSOR_TEST);
+#else
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, 0, (GLsizei)e->tw, (GLsizei)e->th);
+#endif
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_POLYGON_OFFSET_FILL);
+    for (int i = 0; i < MAX_COLOR; i++) {
+        if (e->color[i])
+            e->color[i]->clear_valid = 0;        /* drawn from now on */
+        if (!(e->clear_mask & (1u << i)))
+            continue;
+        glColorMaski((GLuint)i, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glClearBufferfv(GL_COLOR, i, e->clear_color[i]);
+    }
+    if (e->dtex)
+        e->dtex->clear_valid = 0;
+    if (e->clear_depth) {
+        glDepthMask(GL_TRUE);
+        glClearBufferfv(GL_DEPTH, 0, &e->depth_value);
+    }
+    if (e->clear_stencil) {
+        glStencilMask(0xFF);
+        glClearBufferiv(GL_STENCIL, 0, &e->stencil_value);
+    }
+#if defined(__vita__)
+    glDepthRange(-1.0, 1.0);      /* the default Metal viewport (see apply_viewport) */
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, 0, (GLsizei)e->tw, (GLsizei)e->th);
+#endif
+    if (e->vp_set)
+        apply_viewport(e);
+    if (e->sc_set)
+        glScissor(e->sc[0], e->sc[1], e->sc[2], e->sc[3]);
+    gl_check("pass begin");
+}
+
+static int skipping(void);
+
+/* An empty pass: its clears only matter if the targets do not already hold them. */
+static void pass_end_empty(REnc *e)
+{
+    int needed = 0;
+    for (int i = 0; i < MAX_COLOR; i++) {
+        MTexture *t = e->color[i];
+        if (t && (e->clear_mask & (1u << i)) &&
+            !(t->clear_valid && memcmp(t->clear_value, e->clear_color[i], sizeof t->clear_value) == 0))
+            needed = 1;
+        if (e->resolve[i])
+            needed = 1;
+    }
+    if (e->clear_depth || e->clear_stencil) {
+        MTexture *d = e->dtex ? e->dtex : e->stex;
+        if (d && !(d->clear_valid && d->clear_value[0] == e->depth_value &&
+                   d->clear_value[1] == (float)e->stencil_value))
+            needed = 1;
+    }
+    if (!needed && skipping())
+        return;
+    pass_begin(e);
+    for (int i = 0; i < MAX_COLOR; i++)
+        if (e->color[i] && (e->clear_mask & (1u << i))) {
+            e->color[i]->clear_valid = 1;
+            memcpy(e->color[i]->clear_value, e->clear_color[i], sizeof e->color[i]->clear_value);
+        }
+    MTexture *d = e->dtex ? e->dtex : e->stex;
+    if (d && e->clear_depth && e->clear_stencil) {
+        d->clear_valid = 1;
+        d->clear_value[0] = e->depth_value;
+        d->clear_value[1] = (float)e->stencil_value;
+    }
+}
+
 uint64_t metal_render_encoder(Ctx *c, uint64_t pd)
 {
     (void)c;
@@ -152,49 +263,29 @@ uint64_t metal_render_encoder(Ctx *c, uint64_t pd)
     MTexture *dtex = dt ? objc_host(dt) : NULL, *stex = st ? objc_host(st) : NULL;
 
     gpu_lock();
-    e->fbo = metal_pass_fbo(e->color, levels, dtex, stex);
-    glBindFramebuffer(GL_FRAMEBUFFER, e->fbo);
     MTexture *first = e->color[0] ? e->color[0] : (dtex ? dtex : stex);
     for (int i = 0; !first && i < MAX_COLOR; i++)
         first = e->color[i];
     e->tw = first ? first->width >> levels[0] : 1;
     e->th = first ? first->height >> levels[0] : 1;
-    glViewport(0, 0, (GLsizei)e->tw, (GLsizei)e->th);
-    glDepthRange(0.0, 1.0);
-#if defined(__vita__)
-    /* a load action clears the whole attachment: no scissor (vitaGL would
-     * clip the clear with the previous framebuffer's size) */
-    glDisable(GL_SCISSOR_TEST);
-#else
-    glEnable(GL_SCISSOR_TEST);
-    glScissor(0, 0, (GLsizei)e->tw, (GLsizei)e->th);
-#endif
-    glDisable(GL_CULL_FACE);
-    glDisable(GL_POLYGON_OFFSET_FILL);
+    memcpy(e->levels, levels, sizeof e->levels);
+    e->dtex = dtex;
+    e->stex = stex;
     for (int i = 0; i < MAX_COLOR; i++) {
         if (!e->color[i] || pb_get(color[i], "loadAction", 0) != 2)
             continue;
-        GLfloat cc[4];
+        e->clear_mask |= 1u << i;
         for (int k = 0; k < 4; k++)
-            cc[k] = (GLfloat)pb_getd(color[i], "clearColor", k, k == 3 ? 1.0 : 0.0);
-        glColorMaski((GLuint)i, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-        glClearBufferfv(GL_COLOR, i, cc);
+            e->clear_color[i][k] = (float)pb_getd(color[i], "clearColor", k, k == 3 ? 1.0 : 0.0);
     }
     if (dtex && pb_get(depth, "loadAction", 0) == 2) {
-        glDepthMask(GL_TRUE);
-        GLfloat d = (GLfloat)pb_getd(depth, "clearDepth", 0, 1.0);
-        glClearBufferfv(GL_DEPTH, 0, &d);
+        e->clear_depth = 1;
+        e->depth_value = (float)pb_getd(depth, "clearDepth", 0, 1.0);
     }
     if (stex && pb_get(stencil, "loadAction", 0) == 2) {
-        glStencilMask(0xFF);
-        GLint s = (GLint)pb_get(stencil, "clearStencil", 0);
-        glClearBufferiv(GL_STENCIL, 0, &s);
+        e->clear_stencil = 1;
+        e->stencil_value = (int)pb_get(stencil, "clearStencil", 0);
     }
-#if defined(__vita__)
-    glDepthRange(-1.0, 1.0);      /* the default Metal viewport (see re_setViewport) */
-    glEnable(GL_SCISSOR_TEST);
-    glScissor(0, 0, (GLsizei)e->tw, (GLsizei)e->th);
-#endif
     e->cull = 0;
     e->winding = 0;
     if (g_framelog)
@@ -218,7 +309,9 @@ static void re_endEncoding(Ctx *c)
     if (e->ended)
         return;
     e->ended = 1;
-    for (int i = 0; i < MAX_COLOR; i++) {
+    if (!e->begun)
+        pass_end_empty(e);
+    for (int i = 0; i < MAX_COLOR && e->begun; i++) {
         if (!e->resolve[i])
             continue;
 #if defined(__vita__)
@@ -301,20 +394,23 @@ static void re_setViewport(Ctx *c)
     uint64_t v = MARG(0);
     double x = u2d(rt_ld64(G(v))), y = u2d(rt_ld64(G(v + 8))), w = u2d(rt_ld64(G(v + 16)));
     double h = u2d(rt_ld64(G(v + 24))), zn = u2d(rt_ld64(G(v + 32))), zf = u2d(rt_ld64(G(v + 40)));
-    glViewport((GLint)x, (GLint)y, (GLsizei)w, (GLsizei)h);
-#if defined(__vita__)
-    /* the CG shaders keep Metal's 0..1 depth: vitaGL's window z is
-     * (f + n) / 2 + z * (f - n) / 2, so this stores zn + z * (zf - zn) */
-    glDepthRange(2.0 * zn - zf, zf);
-#else
-    glDepthRange(zn, zf);
-#endif
+    REnc *e = objc_host(SELF);
+    double vp[6] = { x, y, w, h, zn, zf };
+    memcpy(e->vp, vp, sizeof vp);
+    e->vp_set = 1;
+    if (e->begun)
+        apply_viewport(e);
 }
 /* setScissorRect:(MTLScissorRect) — 32 bytes, passed by pointer */
 static void re_setScissor(Ctx *c)
 {
     uint64_t r = MARG(0);
-    glScissor((GLint)rt_ld64(G(r)), (GLint)rt_ld64(G(r + 8)), (GLsizei)rt_ld64(G(r + 16)), (GLsizei)rt_ld64(G(r + 24)));
+    REnc *e = objc_host(SELF);
+    for (int k = 0; k < 4; k++)
+        e->sc[k] = (int)rt_ld64(G(r + 8 * k));
+    e->sc_set = 1;
+    if (e->begun)
+        glScissor(e->sc[0], e->sc[1], e->sc[2], e->sc[3]);
 }
 static void re_setDepthBias(Ctx *c)
 {
@@ -601,11 +697,38 @@ static void gl_check(const char *where)
             rt_log("GL error %#x after %s\n", err, where);
 }
 
+/* A draw that changes nothing: a shader that discards where texture 0 is
+ * transparent, reading a texture still cleared to transparent (an empty layer). */
+static int no_skip = -1;      /* MINA_NO_SKIP: every pass and draw runs (to compare) */
+static int skipping(void)
+{
+    if (no_skip < 0)
+        no_skip = getenv("MINA_NO_SKIP") != NULL;
+    return !no_skip;
+}
+
+static int draw_is_noop(REnc *e, MPipeline *p)
+{
+    if (!skipping() || p->fs < 0 || !g_shaders[p->fs].discards_clear0)
+        return 0;
+    for (int k = 0; k < p->ntex; k++)
+        if (p->texb[k].stage == 1 && p->texb[k].tex == 0) {
+            uint64_t to = e->ftex[0];
+            MTexture *t = to ? objc_host(to) : NULL;
+            return t && t->clear_valid && t->clear_value[3] == 0.0f;
+        }
+    return 0;
+}
+
 static MPipeline *draw_setup(REnc *e)
 {
     if (!e->pipeline)
         return NULL;
     MPipeline *p = objc_host(e->pipeline);
+    if (draw_is_noop(e, p))
+        return NULL;
+    if (!e->begun)
+        pass_begin(e);
     {   /* MINA_SKIP_FS=n,m: draws with these fragment shaders are skipped (debug) */
         static int init, skip[8], nskip;
         if (!init) {
@@ -846,6 +969,7 @@ static void be_copyBufferToTexture(Ctx *c)
 static void be_copyTextureRegion(Ctx *c)
 {
     MTexture *s = objc_host(MARG(0)), *d = objc_host(MARG(5));
+    d->clear_valid = 0;
     uint64_t so = MARG(3), sz = MARG(4), sp = c->sp;
     uint32_t dlevel = (uint32_t)rt_ld64(G(sp + 8));
     uint64_t dor = rt_ld64(G(sp + 16));
@@ -866,6 +990,7 @@ static void be_copyTextureRegion(Ctx *c)
 static void be_copyTexture(Ctx *c)
 {
     MTexture *s = objc_host(MARG(0)), *d = objc_host(MARG(1));
+    d->clear_valid = 0;
 #if defined(__vita__)
     vita_copy_quad(s, 0, 0, (float)s->width, (float)s->height, metal_tex_fbo(d, 0), 0, 0, (GLsizei)d->width,
                    (GLsizei)d->height, 0);
