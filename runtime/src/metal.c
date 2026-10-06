@@ -38,6 +38,8 @@ static void shark_log(const char *msg, shark_log_level level, int line)
 
 void metal_vita_init(void)
 {
+    void mem_free_report(void);
+    mem_free_report();           /* before vitaGL takes its share */
     vglInitExtended(0x800000, 960, 544, 0x1000000, SCE_GXM_MULTISAMPLE_NONE);
     shark_install_log_cb(shark_log);
     shark_set_warnings_level(SHARK_WARN_HIGH);
@@ -45,6 +47,7 @@ void metal_vita_init(void)
     for (int k = 0; k < 5; k++)
         rt_log("[vgl] %s: %.1f of %.1f MiB free\n", names[k], vglMemFree((vglMemType)k) / 1048576.0,
                vglMemTotal((vglMemType)k) / 1048576.0);
+    mem_free_report();
 }
 #endif
 

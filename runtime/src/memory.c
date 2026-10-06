@@ -163,12 +163,26 @@ uint32_t gstrdup(const char *s)
     memcpy(G(a), s, n);
     return a;
 }
+/* what the system still has (thread stacks and vitaGL's memory come from it) */
+#include <psp2/kernel/sysmem.h>
+void mem_free_report(void)
+{
+    SceKernelFreeMemorySizeInfo info;
+    info.size = sizeof info;
+    if (sceKernelGetFreeMemorySize(&info) == 0)
+        rt_log("[mem] system free: user %.1f MiB, cdram %.1f MiB, phycont %.1f MiB\n", info.size_user / 1048576.0,
+               info.size_cdram / 1048576.0, info.size_phycont / 1048576.0);
+}
+
 void mem_report(void)
 {
     struct mallinfo mi = mallinfo();
     rt_log("[mem] guest heap %.1f MiB, newlib arena %.1f MiB (in use %.1f, free %.1f, largest free %.1f), image %.1f MiB\n",
            heap_in_use / 1048576.0, mi.arena / 1048576.0, mi.uordblks / 1048576.0, mi.fordblks / 1048576.0,
            mi.keepcost / 1048576.0, image_size / 1048576.0);
+    mem_free_report();
+    void threads_stack_report(void);
+    threads_stack_report();
 }
 
 #else

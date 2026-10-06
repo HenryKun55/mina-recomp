@@ -54,7 +54,9 @@ static __thread Ctx *tl_ctx;
 /* Host stack of a guest thread: the recompiled functions keep the guest
  * registers in C locals, and on the Vita every 64-bit register is two. */
 #if defined(__vita__)
-#define HOST_STACK (4 * 1024 * 1024)
+/* 512 KiB (59 KiB used at most, measured): the real Vita has far less free memory than Vita3K (4 MiB stacks
+ * ran out after five threads there); MINA_MEMSTAT reports what is used */
+#define HOST_STACK (512 * 1024)
 #else
 #define HOST_STACK (2 * 1024 * 1024)
 #endif
@@ -139,12 +141,57 @@ static GThread *thread_of_id(uint64_t id)
     return (GThread *)(uintptr_t)rt_ld64(G(id + 8));
 }
 
+/* Host stack watermarks (Vita, MINA_MEMSTAT): each thread paints its stack
+ * below the entry frame and the report finds the deepest byte touched. */
+#if defined(__vita__)
+#define STACK_PAINT 0xA5u
+static struct { const uint8_t *lo; uint32_t size; uint32_t id; } stacks[64];
+static int nstacks;
+
+static void stack_paint(uint32_t id)
+{
+    if (!getenv("MINA_MEMSTAT"))
+        return;
+    uint8_t here;
+    uint8_t *top = &here - 512;              /* below this frame and its callees */
+    uint32_t size = HOST_STACK - 32 * 1024;  /* pthread's own use stays above */
+    uint8_t *lo = top - size;
+    for (uint8_t *q = lo; q < top; q++)
+        *q = STACK_PAINT;
+    pthread_mutex_lock(&threads_lock);
+    if (nstacks < 64) {
+        stacks[nstacks].lo = lo;
+        stacks[nstacks].size = size;
+        stacks[nstacks].id = id;
+        nstacks++;
+    }
+    pthread_mutex_unlock(&threads_lock);
+}
+
+void threads_stack_report(void)
+{
+    pthread_mutex_lock(&threads_lock);
+    for (int i = 0; i < nstacks; i++) {
+        uint32_t k = 0;
+        while (k < stacks[i].size && stacks[i].lo[k] == STACK_PAINT)
+            k++;
+        rt_log("[stack] thread %u: %u KiB of %u KiB host stack used\n", stacks[i].id, (stacks[i].size - k) >> 10,
+               stacks[i].size >> 10);
+    }
+    pthread_mutex_unlock(&threads_lock);
+}
+#else
+static void stack_paint(uint32_t id) { (void)id; }
+void threads_stack_report(void) {}
+#endif
+
 static void *thread_main(void *p)
 {
     GThread *t = p;
     if (tl_ctx)
         rt_log("[thread] new host thread already has a ctx %p (stale TLS)\n", (void *)tl_ctx);
     tl_ctx = t->ctx;
+    stack_paint(t->ctx->thread_id);
     if (g_trace_imports)
         rt_log("[thread] %u (pthread) host sp %p, guest stack %#x..%#x (host %p), ctx %p\n", t->ctx->thread_id,
                (void *)&t, t->ctx->stack_lo, t->ctx->stack_hi, G(t->ctx->stack_lo), (void *)t->ctx);
@@ -170,6 +217,7 @@ static void *host_job_main(void *p)
     if (tl_ctx)
         rt_log("[thread] new host thread already has a ctx %p (stale TLS)\n", (void *)tl_ctx);
     tl_ctx = j->t->ctx;
+    stack_paint(j->t->ctx->thread_id);
     if (g_trace_imports)
         rt_log("[thread] %u host sp %p, guest stack %#x..%#x (host %p), ctx %p\n", j->t->ctx->thread_id,
                (void *)&j, j->t->ctx->stack_lo, j->t->ctx->stack_hi, G(j->t->ctx->stack_lo), (void *)j->t->ctx);
@@ -199,8 +247,10 @@ uint32_t thread_spawn(void (*fn)(Ctx *, void *), void *arg, uint32_t stack_size)
     pthread_attr_init(&ha);
     pthread_attr_setstacksize(&ha, HOST_STACK);
     pthread_attr_setdetachstate(&ha, PTHREAD_CREATE_DETACHED);
-    pthread_create(&t->host, &ha, host_job_main, j);
+    int r = pthread_create(&t->host, &ha, host_job_main, j);
     pthread_attr_destroy(&ha);
+    if (r)
+        rt_fatal("cannot start thread %u (pthread_create: %d): out of memory for its stack?", t->ctx->thread_id, r);
     return t->id;
 }
 
@@ -268,6 +318,8 @@ static void imp_pthread_create(Ctx *c)
         pthread_attr_setdetachstate(&ha, PTHREAD_CREATE_DETACHED);
     int r = pthread_create(&t->host, &ha, thread_main, t);
     pthread_attr_destroy(&ha);
+    if (r)
+        rt_log("pthread_create failed (%d): out of memory for a thread stack?\n", r);
     if (out)
         rt_st64(G(out), t->id);
     RET(r);
@@ -583,8 +635,10 @@ static void spawn_job(AsyncJob *j)
     pthread_attr_init(&ha);
     pthread_attr_setstacksize(&ha, HOST_STACK);
     pthread_attr_setdetachstate(&ha, PTHREAD_CREATE_DETACHED);
-    pthread_create(&th, &ha, async_main, j);
+    int r = pthread_create(&th, &ha, async_main, j);
     pthread_attr_destroy(&ha);
+    if (r)
+        rt_fatal("cannot start a dispatch thread (pthread_create: %d): out of memory for its stack?", r);
 }
 
 /* The main queue: blocks wait here until the main thread drains them (it

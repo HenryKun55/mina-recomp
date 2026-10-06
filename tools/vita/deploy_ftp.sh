@@ -3,7 +3,7 @@
 # VitaShell turns it on; port 1337).
 #
 # usage: tools/vita/deploy_ftp.sh IP [vpk] [eboot] [data] [log]   (default: vpk data)
-#   vpk    build-vita/mina.vpk -> ux0:data/mina.vpk (install it once with VitaShell:
+#   vpk    build-vita/mina.vpk -> ux0:mina.vpk (install it once with VitaShell:
 #          that creates the bubble)
 #   eboot  build-vita/eboot.bin -> ux0:app/MINA00001/eboot.bin (an installed game,
 #          after each build)
@@ -31,9 +31,9 @@ remote_size() {
 for what in "$@"; do
     case $what in
     vpk)
-        echo "mina.vpk -> ux0:data/mina.vpk"
-        put "$BUILD/mina.vpk" "ux0:/data/mina.vpk"
-        echo "  install it with VitaShell (ux0:data/mina.vpk, X)"
+        echo "mina.vpk -> ux0:mina.vpk"
+        put "$BUILD/mina.vpk" "ux0:/mina.vpk"
+        echo "  install it with VitaShell (ux0:mina.vpk, X)"
         ;;
     eboot)
         echo "eboot.bin -> ux0:app/MINA00001/eboot.bin"
