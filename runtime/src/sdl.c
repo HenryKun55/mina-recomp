@@ -201,6 +201,27 @@ void nat_SDL_ShowSimpleMessageBox(Ctx *c)
 
 /* ---- windows ---------------------------------------------------------------------- */
 
+#if defined(__vita__)
+/* The Vita has no SDL window (the guest's handle stands for the 960x544
+ * screen): the window calls answer for the screen instead of reaching SDL. */
+#define SDL_GetWindowID(w) ((Uint32)1)
+#define SDL_GetWindowPosition(w, x, y) (*(x) = 0, *(y) = 0)
+#define SDL_SetWindowSize(w, x, y) ((void)0)
+#define SDL_SetWindowPosition(w, x, y) ((void)0)
+#define SDL_ShowWindow(w) ((void)0)
+#define SDL_HideWindow(w) ((void)0)
+#define SDL_RaiseWindow(w) ((void)0)
+#define SDL_SetWindowTitle(w, t) ((void)(t))
+#define SDL_SetWindowFullscreen(w, f) 0
+#define SDL_SetWindowBordered(w, b) ((void)0)
+#define SDL_SetWindowResizable(w, r) ((void)0)
+#define SDL_SetWindowAlwaysOnTop(w, t) ((void)0)
+#define SDL_SetWindowMinimumSize(w, x, y) ((void)0)
+#define SDL_SetWindowOpacity(w, o) ((void)(o), 0)
+#define SDL_GetWindowDisplayIndex(w) 0
+#define SDL_DestroyWindow(w) ((void)0)
+#endif
+
 void nat_SDL_CreateWindow(Ctx *c)
 { ON_MAIN(nat_SDL_CreateWindow); if (g_trace_imports) rt_log("[win] CreateWindow(%#llx %lld %lld %lld %lld %#llx)\n", (unsigned long long)A0, (long long)A1, (long long)A2, (long long)A3, (long long)A4, (unsigned long long)A5);
     uint32_t flags = (uint32_t)A5;

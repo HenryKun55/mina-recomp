@@ -1175,8 +1175,9 @@ static void cb_status(Ctx *c) { RET(((MCmdBuf *)objc_host(SELF))->committed ? 4 
 
 uint64_t metal_render_encoder(Ctx *c, uint64_t passdesc);
 uint64_t metal_blit_encoder(Ctx *c);
-static void cb_renderEncoder(Ctx *c) { RET(metal_render_encoder(c, MARG(0))); }
-static void cb_blitEncoder(Ctx *c) { RET(metal_blit_encoder(c)); }
+/* not new/alloc/copy: the encoders come autoreleased, as in Cocoa */
+static void cb_renderEncoder(Ctx *c) { RET(objc_autorelease_obj(metal_render_encoder(c, MARG(0)))); }
+static void cb_blitEncoder(Ctx *c) { RET(objc_autorelease_obj(metal_blit_encoder(c))); }
 
 /* ---- CAMetalLayer / drawable ---------------------------------------------------------------------- */
 

@@ -955,6 +955,7 @@ typedef struct Reservation {
     uint32_t base, real, len, committed;
 } Reservation;
 static Reservation reservations[32];
+static pthread_mutex_t spare_lock = PTHREAD_MUTEX_INITIALIZER;
 static int nres;
 
 static uint32_t reservation_real_size(uint64_t len)
@@ -979,7 +980,22 @@ static void imp_mmap(Ctx *c)
     }
     log_big(c, "mmap", len);
     uint32_t real = prot == 0 ? reservation_real_size(len) : (uint32_t)len;
-    uint32_t a = gmemalign(16384, real);
+    /* first from the image's spare memory (the tail of the mixer's sources,
+     * see gen.py), which costs nothing more; munmap leaves it alone */
+    static uint32_t spare_top;
+    uint32_t a = 0;
+    pthread_mutex_lock(&spare_lock);
+    if (!spare_top)
+        spare_top = (g_spare_lo + 16383u) & ~16383u;
+    if (spare_top + (uint64_t)real <= g_spare_hi) {
+        a = spare_top;
+        spare_top = (spare_top + real + 16383u) & ~16383u;
+    }
+    pthread_mutex_unlock(&spare_lock);
+    if (a)
+        memset(G(a), 0, real);
+    else
+        a = gmemalign(16384, real);
     if (g_trace_imports || !a)
         rt_log("[mmap] %llu bytes (prot %d, real %u) -> %#x\n", (unsigned long long)len, prot, real, a);
     if (!a) {
@@ -987,7 +1003,7 @@ static void imp_mmap(Ctx *c)
         return;
     }
     int gmalloc_was_fresh(void);
-    if (!gmalloc_was_fresh())
+    if (!(a >= g_spare_lo && a < g_spare_hi) && !gmalloc_was_fresh())
         memset(G(a), 0, real);     /* fresh memory is already zero (and stays untouched) */
     if (prot == 0 && nres < 32) {
         reservations[nres].base = a;
@@ -998,7 +1014,13 @@ static void imp_mmap(Ctx *c)
     }
     RET(a);
 }
-static void imp_munmap(Ctx *c) { gfree((uint32_t)A0); RET(0); }
+static void imp_munmap(Ctx *c)
+{
+    uint32_t a = (uint32_t)A0;
+    if (!(a >= g_spare_lo && a < g_spare_hi))
+        gfree(a);
+    RET(0);
+}
 static void imp_mprotect(Ctx *c)
 {
     uint32_t a = (uint32_t)A0;

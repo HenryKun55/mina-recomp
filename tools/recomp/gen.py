@@ -150,12 +150,64 @@ class Program:
 # Per-function analysis and lowering
 
 
+# Lean-memory patches: instruction immediates changed at recompile time.
+# ycAudio::Mixer::s_sources is {0xc00 header, 256 CircBufs of {0x20 header,
+# 0x40000 bytes of float}, entries of 0x68 bytes at +0x4002c00}: 64 MiB of
+# bss. The code builds the CircBuf stride, the capacity and the loop bounds
+# with movz/movk of the high half; the offsets of the entries after the array
+# stay as they are. With AUDIO_RING bytes per ring (~0.17 s of stereo float
+# at 0x10000) the sources take 16 MiB and the rest of the array is never
+# touched: the runtime reuses it (g_spare_lo/hi).
+AUDIO_RING = 0x10000
+_STRIDE, _OLD_STRIDE = AUDIO_RING + 0x20, 0x40020
+
+
+def _hi(v):
+    return (v >> 16) & 0xffff
+
+
+PATCH_HI16 = {   # address: (high half in the game, high half here)
+    # stride 0x40020
+    0x1000cb3bc: (0x4, _hi(_STRIDE)),                      # Decoder::ThreadMain
+    0x1000cb9a8: (0x4, _hi(_STRIDE)),                      # Decoder::DecodeCtx
+    0x1000d02ec: (0x4, _hi(_STRIDE)),                      # Mixer::$_0::~$_0
+    0x1000d0424: (0x4, _hi(_STRIDE)), 0x1000d04c0: (0x4, _hi(_STRIDE)),   # Mixer::ThreadMain
+    0x1000d09bc: (0x4, _hi(_STRIDE)), 0x1000d1384: (0x4, _hi(_STRIDE)),   # Mixer::MixTrack
+    0x100c786bc: (0x4, _hi(_STRIDE)),                      # static init
+    # capacity 0x40000
+    0x1000cb3cc: (0x4, _hi(AUDIO_RING)),                   # Decoder::ThreadMain
+    0x100c786b4: (0x4, _hi(AUDIO_RING)),                   # static init
+    # static init: end of the CircBufs, 0xc00 + 256 * stride
+    0x100c786c4: (0x400, _hi(0xc00 + 256 * _STRIDE)),
+    # ~$_0 walks back from the last CircBuf (+0x18) by -stride, 256 times
+    0x1000d02d0: (0x3fc, _hi(0xc00 + 255 * _STRIDE + 0x18)),
+    0x1000d02dc: (0xfbff, _hi(-256 * _STRIDE & 0xffffffff)),
+    0x1000d02e4: (0xfffb, _hi(-_STRIDE & 0xffffffff)),
+}
+assert (0xc00 + 255 * _STRIDE + 0x18) & 0xffff == 0x2bf8
+assert -256 * _STRIDE & 0xffff == 0xe000 and -_STRIDE & 0xffff == 0xffe0
+_patched = set()
+
+
+def patch_word(addr, w):
+    p = PATCH_HI16.get(addr)
+    if p is None:
+        return w
+    old, new = p
+    # movz/movk (32 or 64-bit) with hw = 1: imm16 in bits 5..20
+    if (w & 0x7f800000) not in (0x52800000, 0x72800000) or (w >> 21) & 3 != 1 or (w >> 5) & 0xffff != old:
+        raise SystemExit("patch at %#x: unexpected instruction %#010x" % (addr, w))
+    _patched.add(addr)
+    return (w & ~(0xffff << 5)) | (new << 5)
+
+
 class Func:
     def __init__(self, prog, start, end, words=None):
         self.p = prog
         self.start, self.end = start, end
         if words is None:
             words = [prog.word(a) for a in range(start, end, 4)]
+        words = [patch_word(start + 4 * k, w) for k, w in enumerate(words)]
         self.insns = [decode(w, start + 4 * k) for k, w in enumerate(words)]
         self.index = {ins.addr: i for i, ins in enumerate(self.insns)}
         self.jtables = {}       # br addr -> list of targets
@@ -1447,6 +1499,14 @@ def write_tables(prog, out):
         lines.append('    "%s",' % n)
     lines.append("};")
     lines.append("const uint32_t g_import_count = %d;" % len(prog.import_names))
+    lines.append("")
+    # the part of ycAudio::Mixer::s_sources the smaller rings leave untouched
+    src = next(sy.value for sy in m.symbols if sy.name == "__ZN7ycAudio5Mixer9s_sourcesE")
+    if _patched != set(PATCH_HI16):
+        raise SystemExit("patches not applied: %s" % ", ".join("%#x" % a for a in set(PATCH_HI16) - _patched))
+    lines.append("/* untouched part of ycAudio::Mixer::s_sources (rings of %#x bytes, not 0x40000) */" % AUDIO_RING)
+    lines.append("const uint32_t g_spare_lo = 0x%xu, g_spare_hi = 0x%xu;" %
+                 (rel(src + 0xc00 + 256 * _STRIDE), rel(src + 0xc00 + 256 * _OLD_STRIDE)))
     lines.append("")
     lines.append("/* bind: slot (guest address) receives import + addend */")
     lines.append("const GuestBind g_binds[] = {")

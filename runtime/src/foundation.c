@@ -241,9 +241,9 @@ uint64_t ns_number_int(int64_t v)
     n->d = (double)v;
     return objc_autorelease_obj(o);
 }
-static void n_numberWithInt(Ctx *c) { RET(ns_number_int((int64_t)(int32_t)MARG(0))); }
-static void n_numberWithLong(Ctx *c) { RET(ns_number_int((int64_t)MARG(0))); }
-static void n_numberWithBool(Ctx *c) { RET(ns_number_int(MARG(0) & 1)); }
+static void n_numberWithInt(Ctx *c) { RET(objc_autorelease_obj(ns_number_int((int64_t)(int32_t)MARG(0)))); }
+static void n_numberWithLong(Ctx *c) { RET(objc_autorelease_obj(ns_number_int((int64_t)MARG(0)))); }
+static void n_numberWithBool(Ctx *c) { RET(objc_autorelease_obj(ns_number_int(MARG(0) & 1))); }
 static void n_numberWithDouble(Ctx *c)
 {
     uint32_t o = objc_new_object(&cls_NSNumber);

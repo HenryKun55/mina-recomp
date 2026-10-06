@@ -23,6 +23,7 @@ uint8_t *g_mem;
 #include <malloc.h>
 /* with the extended memory mode (ATTRIBUTE2=12 in param.sfo) */
 int _newlib_heap_size_user = 330 * 1024 * 1024;
+static uint32_t image_size;
 
 #include <pthread.h>
 #include <unistd.h>
@@ -67,6 +68,7 @@ void mem_init(void)
         pthread_create(&t, NULL, lowguard_thread, NULL);
         return;
     }
+    image_size = end - GUEST_IMAGE_BASE;
     uint8_t *block = memalign(16384, end - GUEST_IMAGE_BASE);
     if (!block)
         rt_fatal("cannot allocate the image (%u bytes)", end - GUEST_IMAGE_BASE);
@@ -164,7 +166,9 @@ uint32_t gstrdup(const char *s)
 void mem_report(void)
 {
     struct mallinfo mi = mallinfo();
-    rt_log("[mem] guest heap %.1f MiB, newlib arena %.1f MiB\n", heap_in_use / 1048576.0, mi.arena / 1048576.0);
+    rt_log("[mem] guest heap %.1f MiB, newlib arena %.1f MiB (in use %.1f, free %.1f, largest free %.1f), image %.1f MiB\n",
+           heap_in_use / 1048576.0, mi.arena / 1048576.0, mi.uordblks / 1048576.0, mi.fordblks / 1048576.0,
+           mi.keepcost / 1048576.0, image_size / 1048576.0);
 }
 
 #else
@@ -240,6 +244,7 @@ typedef struct BlockHdr {
 /* MINA_HEAPMAP: live bytes per allocating site (host return addresses of the
  * generated functions above malloc), reported by mem_report. */
 #include <dlfcn.h>
+#include <malloc/malloc.h>
 #include <unistd.h>
 #define SITES 4096
 static struct { void *pc; int64_t bytes; int64_t count; } sites[SITES];
@@ -607,8 +612,11 @@ void mem_report(void)
     static uint64_t peak;
     if (heap_in_use > peak)
         peak = heap_in_use;
-    rt_log("[mem] heap in use %.1f MiB (peak %.1f), heap span %.1f MiB\n", heap_in_use / 1048576.0,
-           peak / 1048576.0, (heap_top - HEAP_BASE) / 1048576.0);
+    malloc_statistics_t hs;
+    malloc_zone_statistics(NULL, &hs);
+    rt_log("[mem] heap in use %.1f MiB (peak %.1f), heap span %.1f MiB, host malloc %.1f MiB\n",
+           heap_in_use / 1048576.0, peak / 1048576.0, (heap_top - HEAP_BASE) / 1048576.0,
+           hs.size_in_use / 1048576.0);
     void metal_buffers_report(void);
     metal_buffers_report();
     if (heapmap > 0) {

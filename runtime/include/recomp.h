@@ -79,6 +79,7 @@ extern const GuestStub g_stubs[];
 extern const uint32_t g_stub_count;
 extern const GuestSegment g_segments[];
 extern const uint32_t g_segment_count;
+extern const uint32_t g_spare_lo, g_spare_hi;   /* image memory the game never touches */
 extern const uint32_t g_tls_template, g_tls_size, g_tls_vars, g_tls_vars_size;
 extern const uint32_t g_entry, g_mod_init, g_mod_init_count;
 extern const uint32_t g_objc_classlist, g_objc_classlist_count, g_objc_methname, g_objc_methname_size;
