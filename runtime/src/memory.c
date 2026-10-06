@@ -308,6 +308,17 @@ uint32_t gcalloc(uint64_t n, uint64_t size)
 }
 int gmalloc_was_fresh(void) { return last_fresh; }
 
+/* Debug: a block of never-used (zero, untouched) memory, for measuring what the
+ * game writes; it is never reused once freed. */
+uint32_t gmalloc_fresh(uint64_t size)
+{
+    pthread_mutex_lock(&heap_lock);
+    uint32_t a = (heap_top + 16383u) & ~16383u;
+    heap_top = a + (uint32_t)((size + 16383u) & ~16383ull);
+    pthread_mutex_unlock(&heap_lock);
+    return a;
+}
+
 uint32_t grealloc(uint32_t a, uint64_t size)
 {
     if (!a)

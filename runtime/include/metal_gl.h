@@ -46,6 +46,7 @@ typedef struct MBuffer {
     uint32_t options;
     GLuint gl;
     int gpu_dirty;           /* private buffer written by a blit: re-upload */
+    int fresh;               /* debug (MINA_FRESH_BUFFERS): untouched memory, never freed */
 } MBuffer;
 
 typedef struct MTexture {

@@ -383,16 +383,24 @@ void metal_buffers_report(void)
         uint64_t hi = ((uint64_t)(uintptr_t)G(b->contents) + b->length + 16383) & ~16383ull;
         unsigned char vec[4096];
         uint64_t res = 0;
+        int first = -1, last = -1, holes = 0;
         if (hi - lo <= 4096ull * 16384 && mincore((void *)(uintptr_t)lo, (size_t)(hi - lo), (char *)vec) == 0)
-            for (uint64_t k = 0; k < (hi - lo) / 16384; k++)
-                res += (vec[k] & 1) ? 16384 : 0;
+            for (uint64_t k = 0; k < (hi - lo) / 16384; k++) {
+                if (vec[k] & 1) {
+                    res += 16384;
+                    if (first < 0) first = (int)k;
+                    if (last >= 0 && (int)k > last + 1) holes++;
+                    last = (int)k;
+                }
+            }
         if (res > b->length) res = b->length;
         total += b->length;
         touched += res;
         if (b->length >= (512u << 10)) {
             big += b->length;
             big_touched += res;
-            rt_log("[mtl]   buffer %7.1f KiB touched %7.1f KiB\n", b->length / 1024.0, res / 1024.0);
+            rt_log("[mtl]   buffer %7.1f KiB touched %7.1f KiB pages %d..%d holes %d\n", b->length / 1024.0,
+                   res / 1024.0, first, last, holes);
         }
     }
     rt_log("[mtl] %d buffers %.1f MiB (touched %.1f), >=512K: %.1f MiB (touched %.1f)\n", nlive_bufs,
@@ -405,8 +413,8 @@ static void buf_dealloc(void *h)
 {
     MBuffer *b = h;
     buf_track(b, 0);
-
-    gfree(b->contents);
+    if (!b->fresh)
+        gfree(b->contents);
 }
 static void d_newBufferWithLength(Ctx *c)
 {
@@ -414,6 +422,13 @@ static void d_newBufferWithLength(Ctx *c)
     MBuffer *b = objc_host(o);
     b->length = (uint32_t)MARG(0);
     b->options = (uint32_t)MARG(1);
+#if !defined(__vita__)
+    uint32_t gmalloc_fresh(uint64_t size);
+    if (getenv("MINA_FRESH_BUFFERS")) {
+        b->contents = gmalloc_fresh(b->length ? b->length : 16);
+        b->fresh = 1;
+    } else
+#endif
     b->contents = gcalloc(1, b->length ? b->length : 16);
     buf_track(b, 1);
     RET(o);
