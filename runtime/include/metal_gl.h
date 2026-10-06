@@ -20,7 +20,7 @@
 #define GL_SILENCE_DEPRECATION
 #include <OpenGL/gl3.h>
 #else
-#include <vitaGL.h>
+#include "gl_compat_vita.h"
 #endif
 
 /* ---- property bags ------------------------------------------------------------ */

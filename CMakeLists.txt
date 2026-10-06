@@ -59,6 +59,9 @@ list(TRANSFORM GEN_FILES PREPEND "${GEN_DIR}/")
 if(VITA)
   # Cortex-A9: no FMA (fused multiply-add rounds once more), NEON for the vector helpers
   set(MINA_ARCH_FLAGS -march=armv7-a -mtune=cortex-a9 -mfpu=neon -mfloat-abi=hard -mthumb -O2)
+  # no debug info for the generated code: GCC's var-tracking is superlinear on
+  # the biggest recompiled functions (it took half the build time)
+  set(MINA_GEN_FLAGS -g0 -fno-var-tracking -fno-var-tracking-assignments)
   set(MINA_DEFS MINA_FAST_FMA)
   option(MINA_VITA_NULL_GL "Vita build without a renderer (game logic only)" ON)
   if(MINA_VITA_NULL_GL)
@@ -66,13 +69,14 @@ if(VITA)
   endif()
 else()
   set(MINA_ARCH_FLAGS)
+  set(MINA_GEN_FLAGS)
   set(MINA_DEFS)
 endif()
 
 add_library(mina_gen OBJECT ${GEN_FILES} ${GEN_DIR}/tables.c)
 target_include_directories(mina_gen PRIVATE runtime/include ${GEN_DIR})
 target_compile_definitions(mina_gen PRIVATE ${MINA_DEFS})
-target_compile_options(mina_gen PRIVATE ${MINA_ARCH_FLAGS} -ffp-contract=off -fno-strict-aliasing
+target_compile_options(mina_gen PRIVATE ${MINA_ARCH_FLAGS} ${MINA_GEN_FLAGS} -ffp-contract=off -fno-strict-aliasing
   -Wno-unused-label -Wno-unused-variable -Wno-unused-but-set-variable)
 
 # ---- runtime ----------------------------------------------------------------

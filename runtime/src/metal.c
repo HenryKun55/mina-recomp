@@ -340,9 +340,60 @@ static void d_supportsSampleCount(Ctx *c) { RET(MARG(0) == 1 || MARG(0) == 2 || 
 static void d_true(Ctx *c) { RET(1); }
 static void d_maxBufferLength(Ctx *c) { RET(256u << 20); }
 
+/* live buffers, for the memory report */
+static MBuffer *live_bufs[8192];
+static int nlive_bufs;
+static pthread_mutex_t bufs_lock = PTHREAD_MUTEX_INITIALIZER;
+static void buf_track(MBuffer *b, int add)
+{
+    pthread_mutex_lock(&bufs_lock);
+    if (add) {
+        if (nlive_bufs < 8192)
+            live_bufs[nlive_bufs++] = b;
+    } else {
+        for (int i = 0; i < nlive_bufs; i++)
+            if (live_bufs[i] == b) {
+                live_bufs[i] = live_bufs[--nlive_bufs];
+                break;
+            }
+    }
+    pthread_mutex_unlock(&bufs_lock);
+}
+
+#if !defined(__vita__)
+#include <sys/mman.h>
+void metal_buffers_report(void)
+{
+    pthread_mutex_lock(&bufs_lock);
+    uint64_t total = 0, touched = 0, big = 0, big_touched = 0;
+    for (int i = 0; i < nlive_bufs; i++) {
+        MBuffer *b = live_bufs[i];
+        uint64_t lo = (uint64_t)(uintptr_t)G(b->contents) & ~16383ull;
+        uint64_t hi = ((uint64_t)(uintptr_t)G(b->contents) + b->length + 16383) & ~16383ull;
+        unsigned char vec[4096];
+        uint64_t res = 0;
+        if (hi - lo <= 4096ull * 16384 && mincore((void *)(uintptr_t)lo, (size_t)(hi - lo), (char *)vec) == 0)
+            for (uint64_t k = 0; k < (hi - lo) / 16384; k++)
+                res += (vec[k] & 1) ? 16384 : 0;
+        if (res > b->length) res = b->length;
+        total += b->length;
+        touched += res;
+        if (b->length >= (512u << 10)) {
+            big += b->length;
+            big_touched += res;
+            rt_log("[mtl]   buffer %7.1f KiB touched %7.1f KiB\n", b->length / 1024.0, res / 1024.0);
+        }
+    }
+    rt_log("[mtl] %d buffers %.1f MiB (touched %.1f), >=512K: %.1f MiB (touched %.1f)\n", nlive_bufs,
+           total / 1048576.0, touched / 1048576.0, big / 1048576.0, big_touched / 1048576.0);
+    pthread_mutex_unlock(&bufs_lock);
+}
+#endif
+
 static void buf_dealloc(void *h)
 {
     MBuffer *b = h;
+    buf_track(b, 0);
 
     gfree(b->contents);
 }
@@ -353,7 +404,7 @@ static void d_newBufferWithLength(Ctx *c)
     b->length = (uint32_t)MARG(0);
     b->options = (uint32_t)MARG(1);
     b->contents = gcalloc(1, b->length ? b->length : 16);
-
+    buf_track(b, 1);
     RET(o);
 }
 static void d_newBufferWithBytes(Ctx *c)
@@ -364,6 +415,7 @@ static void d_newBufferWithBytes(Ctx *c)
     b->options = (uint32_t)MARG(2);
     b->contents = gcalloc(1, b->length ? b->length : 16);
     memcpy(G(b->contents), G(MARG(0)), b->length);
+    buf_track(b, 1);
     RET(o);
 }
 
@@ -649,16 +701,29 @@ static char *patch_vertex_outputs(const char *vs, const char *fs)
 
 static void link_program(MPipeline *p)
 {
+#if defined(__vita__)
+    const char *fsrc = p->fs >= 0 ? g_shaders[p->fs].glsl : "void main(out float4 o0 : COLOR) { o0 = float4(0, 0, 0, 0); }\n";
+    char *vsrc = strdup(g_shaders[p->vs].glsl);
+#else
     const char *fsrc = p->fs >= 0 ? g_shaders[p->fs].glsl : "#version 330 core\nvoid main() {}\n";
     if (getenv("MINA_DEBUG_FS"))
         fsrc = "#version 330 core\nlayout(location = 0) out vec4 o0;\nvoid main() { o0 = vec4(1.0, 0.0, 1.0, 1.0); }\n";
     char *vsrc = patch_vertex_outputs(g_shaders[p->vs].glsl, fsrc);
+#endif
     GLuint vs = compile(GL_VERTEX_SHADER, vsrc, p->vs);
     GLuint fs = compile(GL_FRAGMENT_SHADER, fsrc, p->fs);
     free(vsrc);
     p->prog = glCreateProgram();
     glAttachShader(p->prog, vs);
     glAttachShader(p->prog, fs);
+#if defined(__vita__)
+    /* CG attributes are bound by name (a<N> is attribute N) */
+    for (int i = 0; i < MAX_ATTRS; i++) {
+        char an[8];
+        snprintf(an, sizeof an, "a%d", i);
+        glBindAttribLocation(p->prog, (GLuint)i, an);
+    }
+#endif
     glLinkProgram(p->prog);
     GLint ok;
     glGetProgramiv(p->prog, GL_LINK_STATUS, &ok);
@@ -672,32 +737,36 @@ static void link_program(MPipeline *p)
     for (int i = 0; i < MAX_VBUF; i++)
         p->vcb[i] = p->fcb[i] = -1;
     p->ntex = 0;
-    /* uniforms: vcb<N>[K], fcb<N>[K], vtex<T>_s<S>, ftex<T>_s<S>, _r, _ms */
-    GLint count;
-    glGetProgramiv(p->prog, GL_ACTIVE_UNIFORMS, &count);
+    /* uniforms, read from the sources (GLSL or CG): "uniform <type> vcb<N>[K];",
+     * "uniform <sampler> ftex<T>_s<S>;" (_r: texelFetch only, _ms: multisampled) */
     glUseProgram(p->prog);
-    for (GLint u = 0; u < count; u++) {
-        char name[128];
-        GLint size;
-        GLenum type;
-        glGetActiveUniform(p->prog, (GLuint)u, sizeof name, NULL, &size, &type, name);
-        GLint loc = glGetUniformLocation(p->prog, name);
-        int n;
-        if (sscanf(name, "vcb%d", &n) == 1 && n < MAX_VBUF) {
-            p->vcb[n] = loc;
-            p->vcb_size[n] = size;
-        } else if (sscanf(name, "fcb%d", &n) == 1 && n < MAX_VBUF) {
-            p->fcb[n] = loc;
-            p->fcb_size[n] = size;
-        } else if ((name[0] == 'v' || name[0] == 'f') && sscanf(name + 1, "tex%d", &n) == 1 && p->ntex < 16) {
-            const char *us = strchr(name, '_');
-            int s = (us && us[1] == 's') ? atoi(us + 2) : -1;
-            int k = p->ntex++;
-            p->texb[k].stage = name[0] == 'f';
-            p->texb[k].tex = n;
-            p->texb[k].samp = s;
-            p->texb[k].unit = k;
-            glUniform1i(loc, k);
+    const char *srcs[2] = { g_shaders[p->vs].glsl, p->fs >= 0 ? g_shaders[p->fs].glsl : "" };
+    for (int st = 0; st < 2; st++) {
+        for (const char *q = srcs[st]; (q = strstr(q, "uniform ")) != NULL; q += 8) {
+            char type[32], name[64];
+            int count = 1;
+            if (sscanf(q, "uniform %31s %63[A-Za-z0-9_][%d]", type, name, &count) < 2)
+                continue;
+            GLint loc = glGetUniformLocation(p->prog, name);
+            if (loc < 0)
+                continue;          /* optimized away */
+            int n;
+            if (sscanf(name, "vcb%d", &n) == 1 && n < MAX_VBUF) {
+                p->vcb[n] = loc;
+                p->vcb_size[n] = count;
+            } else if (sscanf(name, "fcb%d", &n) == 1 && n < MAX_VBUF) {
+                p->fcb[n] = loc;
+                p->fcb_size[n] = count;
+            } else if ((name[0] == 'v' || name[0] == 'f') && sscanf(name + 1, "tex%d", &n) == 1 && p->ntex < 16) {
+                const char *us = strchr(name, '_');
+                int sm = (us && us[1] == 's') ? atoi(us + 2) : -1;
+                int k = p->ntex++;
+                p->texb[k].stage = name[0] == 'f';
+                p->texb[k].tex = n;
+                p->texb[k].samp = sm;
+                p->texb[k].unit = k;
+                glUniform1i(loc, k);
+            }
         }
     }
     glGenVertexArrays(1, &p->vao);

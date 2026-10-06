@@ -369,6 +369,8 @@ void mem_report(void)
         peak = heap_in_use;
     rt_log("[mem] heap in use %.1f MiB (peak %.1f), heap span %.1f MiB\n", heap_in_use / 1048576.0,
            peak / 1048576.0, (heap_top - HEAP_BASE) / 1048576.0);
+    void metal_buffers_report(void);
+    metal_buffers_report();
     if (heapmap > 0) {
         /* the 12 biggest sites */
         int order[12] = { 0 };

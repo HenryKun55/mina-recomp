@@ -958,6 +958,91 @@ class Shader:
 
 
 # ---------------------------------------------------------------------------
+# CG for the Vita (vitaGL compiles CG at run time). The GLSL this translator
+# writes has a fixed shape, so it is rewritten line by line.
+
+_CG_TYPES = [(r"\bbvec([234])\b", r"bool\1"), (r"\bivec([234])\b", r"int\1"), (r"\bvec([234])\b", r"float\1")]
+_CG_FUNCS = {"mix": "lerp", "fract": "frac", "dFdx": "ddx", "dFdy": "ddy", "inversesqrt": "rsqrt",
+             "texelFetch": "tex2Dfetch", "textureSize": "tex2Dsize"}
+
+
+def _cg_types(text):
+    for a, b in _CG_TYPES:
+        text = re.sub(a, b, text)
+    return text
+
+
+def _cg_ctor_casts(text):
+    # single-argument constructors (splats, conversions) become casts
+    out, i = "", 0
+    pat = re.compile(r"\b(float|int|bool)([234])?\(")
+    while True:
+        m = pat.search(text, i)
+        if not m:
+            return out + text[i:]
+        j, depth = m.end(), 1
+        while depth:
+            depth += {"(": 1, ")": -1}.get(text[j], 0)
+            j += 1
+        inner = text[m.end():j - 1]
+        tyname = m.group(1) + (m.group(2) or "")
+        if len(split_top(inner)) == 1:
+            out += text[i:m.start()] + "((%s)(%s))" % (tyname, _cg_ctor_casts(inner))
+        else:
+            out += text[i:m.end()] + _cg_ctor_casts(inner) + ")"
+        i = j
+
+
+def glsl_to_cg(glsl, stage):
+    head, body = glsl.split("void main() {\n", 1)
+    params, decls, samplers = [], [], {}
+    for line in head.split("\n"):
+        line = line.strip()
+        if not line or line.startswith("#version"):
+            continue
+        m = re.match(r"layout\(location = (\d+)\) in (\w+) (a\d+);", line)
+        if m:
+            params.append("%s %s" % (_cg_types(m.group(2)), m.group(3)))
+            continue
+        m = re.match(r"(?:flat |noperspective )?(in|out) (\w+) (v_(\w+));", line)
+        if m:
+            sem = m.group(4) if m.group(4).startswith("TEXCOORD") else "TEXCOORD7"
+            params.append("%s%s %s : %s" % ("out " if m.group(1) == "out" else "", _cg_types(m.group(2)),
+                                             m.group(3), sem))
+            continue
+        m = re.match(r"layout\(location = (\d+)\) out vec4 (o\d+);", line)
+        if m:
+            params.append("out float4 %s : COLOR%s" % (m.group(2), "" if m.group(1) == "0" else m.group(1)))
+            continue
+        m = re.match(r"uniform (sampler\w+) (\w+);", line)
+        if m:
+            samplers[m.group(2)] = m.group(1)
+            if m.group(1) == "sampler2DMS":
+                raise ValueError("multisampled textures have no CG form")
+        decls.append(_cg_types(line))
+    body = _cg_types(body)
+    if stage == 0:
+        params.append("out float4 vpos : POSITION")
+        body = body.replace("gl_Position", "vpos")
+        if "gl_VertexID" in body:
+            params.append("int vid : INDEX")
+            body = body.replace("gl_VertexID", "vid")
+    else:
+        if "gl_FragCoord" in body:
+            params.append("float4 fragcoord : WPOS")
+            body = body.replace("gl_FragCoord", "fragcoord")
+        if "gl_FrontFacing" in body:
+            params.append("float face : FACE")
+            body = body.replace("gl_FrontFacing", "(face > 0.0)")
+    for g, c in _CG_FUNCS.items():
+        body = re.sub(r"\b%s\(" % g, c + "(", body)
+    # texture(s, uv): tex2D / texCUBE by the sampler's type
+    body = re.sub(r"\btexture\((\w+),", lambda m: "%s(%s," % (
+        "texCUBE" if samplers.get(m.group(1)) == "samplerCube" else "tex2D", m.group(1)), body)
+    body = body.replace("for (;;)", "while (true)")
+    body = _cg_ctor_casts(body)
+    decls = [_cg_ctor_casts(d) for d in decls]
+    return "\n".join(decls) + "\nvoid main(\n    " + ",\n    ".join(params) + ")\n{\n" + body
 
 
 def find_llvm_dis():
@@ -995,6 +1080,7 @@ def main():
     ap.add_argument("pak")
     ap.add_argument("out")
     ap.add_argument("--dump")
+    ap.add_argument("--cg", action="store_true", help="emit CG (vitaGL) instead of GLSL")
     args = ap.parse_args()
     dis = find_llvm_dis()
     libs = metallibs(args.pak)
@@ -1012,6 +1098,8 @@ def main():
             try:
                 sh = Shader(ll)
                 glsl = sh.translate()
+                if args.cg:
+                    glsl = glsl_to_cg(glsl, sh.stage)
             except Exception as ex:      # keep going: report every failure
                 errors += 1
                 print("shader %d: %s" % (i, ex), file=sys.stderr)
@@ -1019,7 +1107,8 @@ def main():
             entries.append((fnv64(lib), sh.stage, glsl, i))
             if args.dump:
                 os.makedirs(args.dump, exist_ok=True)
-                with open(os.path.join(args.dump, "s%03d.%s" % (i, "vert" if sh.stage == 0 else "frag")), "w") as f:
+                ext = ("vcg" if sh.stage == 0 else "fcg") if args.cg else ("vert" if sh.stage == 0 else "frag")
+                with open(os.path.join(args.dump, "s%03d.%s" % (i, ext)), "w") as f:
                     f.write(glsl)
     lines = ["/* generated by tools/shaders/air2glsl.py */", '#include "metal_gl.h"', "",
              "const ShaderSrc g_shaders[] = {"]
