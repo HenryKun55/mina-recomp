@@ -379,6 +379,8 @@ void metal_buffers_report(void)
     uint64_t total = 0, touched = 0, big = 0, big_touched = 0;
     for (int i = 0; i < nlive_bufs; i++) {
         MBuffer *b = live_bufs[i];
+        if (b->gpu_only)
+            continue;
         uint64_t lo = (uint64_t)(uintptr_t)G(b->contents) & ~16383ull;
         uint64_t hi = ((uint64_t)(uintptr_t)G(b->contents) + b->length + 16383) & ~16383ull;
         unsigned char vec[4096];
@@ -399,8 +401,8 @@ void metal_buffers_report(void)
         if (b->length >= (512u << 10)) {
             big += b->length;
             big_touched += res;
-            rt_log("[mtl]   buffer %7.1f KiB touched %7.1f KiB pages %d..%d holes %d\n", b->length / 1024.0,
-                   res / 1024.0, first, last, holes);
+            rt_log("[mtl]   buffer %7.1f KiB touched %7.1f KiB pages %d..%d holes %d contents asked %d opt %#x\n",
+                   b->length / 1024.0, res / 1024.0, first, last, holes, b->contents_asked, b->options);
         }
     }
     rt_log("[mtl] %d buffers %.1f MiB (touched %.1f), >=512K: %.1f MiB (touched %.1f)\n", nlive_bufs,
@@ -413,7 +415,13 @@ static void buf_dealloc(void *h)
 {
     MBuffer *b = h;
     buf_track(b, 0);
-    if (!b->fresh)
+    if (b->gl) {
+        gpu_lock();
+        glDeleteBuffers(1, &b->gl);
+        gpu_unlock();
+    }
+    free(b->shadow);
+    if (!b->fresh && !b->gpu_only)
         gfree(b->contents);
 }
 static void d_newBufferWithLength(Ctx *c)
@@ -422,6 +430,15 @@ static void d_newBufferWithLength(Ctx *c)
     MBuffer *b = objc_host(o);
     b->length = (uint32_t)MARG(0);
     b->options = (uint32_t)MARG(1);
+    /* MTLStorageModePrivate: GPU memory only (filled by blits), no guest copy */
+    if ((b->options & 0xF0) == 0x20 && !getenv("MINA_NO_PRIVATE")) {
+        b->gpu_only = 1;
+        if (b->length <= (256u << 10))
+            b->shadow = calloc(1, b->length ? b->length : 16);
+        buf_track(b, 1);
+        RET(o);
+        return;
+    }
 #if !defined(__vita__)
     uint32_t gmalloc_fresh(uint64_t size);
     if (getenv("MINA_FRESH_BUFFERS")) {
@@ -928,7 +945,12 @@ static void d_newRenderPipelineState(Ctx *c)
 
 /* ---- buffers, textures, others: properties ------------------------------------------------- */
 
-static void b_contents(Ctx *c) { RET(((MBuffer *)objc_host(SELF))->contents); }
+static void b_contents(Ctx *c)
+{
+    MBuffer *b = objc_host(SELF);
+    b->contents_asked++;
+    RET(b->contents);
+}
 static void b_length(Ctx *c) { RET(((MBuffer *)objc_host(SELF))->length); }
 static void b_didModifyRange(Ctx *c) { (void)c; }
 

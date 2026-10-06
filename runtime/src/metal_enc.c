@@ -201,7 +201,7 @@ static const uint8_t *binding_data(const Binding *b, uint32_t *avail)
         *avail = b->nbytes;
         return b->bytes;
     }
-    if (!b->buf) {
+    if (!b->buf || b->buf->gpu_only) {
         *avail = 0;
         return NULL;
     }
@@ -436,6 +436,7 @@ static void apply_vertices(REnc *e, MPipeline *p, uint32_t max_vertex, uint32_t 
 {
     glBindVertexArray(p->vao);
     uint32_t base[MAX_VBUF];
+    GLuint vbo[MAX_VBUF];
     uint32_t done = 0;
     for (int a = 0; a < MAX_ATTRS; a++) {
         if (!(p->attr_mask & (1u << a)))
@@ -444,13 +445,22 @@ static void apply_vertices(REnc *e, MPipeline *p, uint32_t max_vertex, uint32_t 
         uint32_t bi = at->buffer % MAX_VBUF;
         const MVertexLayout *lay = &p->layouts[bi];
         if (!(done & (1u << bi))) {
-            uint32_t avail;
-            const uint8_t *d = binding_data(&e->vb[bi], &avail);
-            uint32_t count = lay->step_fn == 2 ? (instances + lay->step_rate - 1) / (lay->step_rate ? lay->step_rate : 1)
-                           : lay->step_fn == 0 ? 1 : max_vertex + 1;
-            uint32_t need = lay->stride * count;
-            if (need > avail) need = avail;
-            base[bi] = d && need ? ring_upload(d, need) : 0;
+            const Binding *bd = &e->vb[bi];
+            if (bd->buf && bd->buf->gpu_only) {
+                /* private buffer: read in place */
+                vbo[bi] = bd->buf->gl;
+                base[bi] = bd->offset;
+            } else {
+                uint32_t avail;
+                const uint8_t *d = binding_data(bd, &avail);
+                uint32_t count = lay->step_fn == 2 ? (instances + lay->step_rate - 1) / (lay->step_rate ? lay->step_rate : 1)
+                               : lay->step_fn == 0 ? 1 : max_vertex + 1;
+                uint32_t need = lay->stride * count;
+                if (max_vertex == UINT32_MAX || need > avail)
+                    need = avail;
+                base[bi] = d && need ? ring_upload(d, need) : 0;
+                vbo[bi] = ring;
+            }
             done |= 1u << bi;
         }
         VFmt vf;
@@ -458,6 +468,7 @@ static void apply_vertices(REnc *e, MPipeline *p, uint32_t max_vertex, uint32_t 
             rt_log("metal: vertex format %u not supported\n", at->format);
             continue;
         }
+        glBindBuffer(GL_ARRAY_BUFFER, vbo[bi]);
         glEnableVertexAttribArray((GLuint)a);
         const void *off = (const void *)(uintptr_t)(base[bi] + at->offset);
         if (vf.integer)
@@ -530,15 +541,24 @@ static void draw_indexed(Ctx *c, uint32_t instances)
     if (!count || !instances || !ib)
         return;
     uint32_t isz = type ? 4 : 2;
-    const uint8_t *idx = G(ib->contents + off);
-    uint32_t maxv = 0;
-    for (uint32_t i = 0; i < count; i++) {
-        uint32_t v = type ? rt_ld32(idx + 4 * i) : rt_ld16(idx + 2 * i);
-        if (v > maxv) maxv = v;
+    const uint8_t *idx = ib->gpu_only ? (ib->shadow ? ib->shadow + off : NULL) : G(ib->contents + off);
+    uint32_t maxv = UINT32_MAX;          /* unknown: shared vertex buffers go up whole */
+    if (idx) {
+        maxv = 0;
+        for (uint32_t i = 0; i < count; i++) {
+            uint32_t v = type ? rt_ld32(idx + 4 * i) : rt_ld16(idx + 2 * i);
+            if (v > maxv) maxv = v;
+        }
     }
     apply_vertices(e, p, maxv, instances);
-    uint32_t ipos = ring_upload(idx, count * isz);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ring);
+    uint32_t ipos;
+    if (ib->gpu_only) {
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ib->gl);
+        ipos = off;
+    } else {
+        ipos = ring_upload(idx, count * isz);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ring);
+    }
     glDrawElementsInstanced(gl_prim((uint32_t)MARG(0)), (GLsizei)count, type ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT,
                             (const void *)(uintptr_t)ipos, (GLsizei)instances);
     gl_check("drawElements");
@@ -647,15 +667,45 @@ static void be_copyTexture(Ctx *c)
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 /* copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size: */
+static void gpu_buffer_write(MBuffer *d, uint32_t off, const void *src, uint32_t n)
+{
+    if (!d->gl) {
+        glGenBuffers(1, &d->gl);
+        glBindBuffer(GL_ARRAY_BUFFER, d->gl);
+        glBufferData(GL_ARRAY_BUFFER, d->length, NULL, GL_STATIC_DRAW);
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, d->gl);
+    glBufferSubData(GL_ARRAY_BUFFER, off, n, src);
+    if (d->shadow)
+        memcpy(d->shadow + off, src, n);
+}
+
 static void be_copyBuffer(Ctx *c)
 {
     MBuffer *s = objc_host(MARG(0)), *d = objc_host(MARG(2));
-    memmove(G(d->contents + (uint32_t)MARG(3)), G(s->contents + (uint32_t)MARG(1)), (size_t)MARG(4));
+    uint32_t so = (uint32_t)MARG(1), dof = (uint32_t)MARG(3), n = (uint32_t)MARG(4);
+    if (s->gpu_only) {
+        static int told;
+        if (!told++)
+            rt_log("metal: copy from a private buffer is not supported\n");
+        return;
+    }
+    if (d->gpu_only)
+        gpu_buffer_write(d, dof, G(s->contents + so), n);
+    else
+        memmove(G(d->contents + dof), G(s->contents + so), n);
 }
 /* fillBuffer:range:value: (NSRange in x3/x4) */
 static void be_fillBuffer(Ctx *c)
 {
     MBuffer *b = objc_host(MARG(0));
+    if (b->gpu_only) {
+        uint8_t *tmp = malloc((size_t)MARG(2));
+        memset(tmp, (int)MARG(3), (size_t)MARG(2));
+        gpu_buffer_write(b, (uint32_t)MARG(1), tmp, (uint32_t)MARG(2));
+        free(tmp);
+        return;
+    }
     memset(G(b->contents + (uint32_t)MARG(1)), (int)MARG(3), (size_t)MARG(2));
 }
 static void be_generateMipmaps(Ctx *c)

@@ -47,6 +47,9 @@ typedef struct MBuffer {
     GLuint gl;
     int gpu_dirty;           /* private buffer written by a blit: re-upload */
     int fresh;               /* debug (MINA_FRESH_BUFFERS): untouched memory, never freed */
+    int contents_asked;      /* times the game asked for the CPU pointer */
+    int gpu_only;            /* MTLStorageModePrivate: only the GL buffer exists */
+    uint8_t *shadow;         /* CPU copy of a small private buffer (index data) */
 } MBuffer;
 
 typedef struct MTexture {
