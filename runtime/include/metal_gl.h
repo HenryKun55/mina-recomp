@@ -54,6 +54,7 @@ typedef struct MTexture {
     GLuint fbo_cache;
     uint32_t staging;        /* guest copy for CPU-visible textures (getBytes / replaceRegion) */
     int is_drawable;
+    int is_rb;               /* a renderbuffer (Vita depth/stencil), not a texture */
 } MTexture;
 
 typedef struct MSampler {

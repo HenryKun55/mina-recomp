@@ -1101,6 +1101,9 @@ def main():
                 if args.cg:
                     glsl = glsl_to_cg(glsl, sh.stage)
             except Exception as ex:      # keep going: report every failure
+                if args.cg and "multisampled" in str(ex):
+                    print("shader %d: skipped (multisample resolve: no MSAA on the Vita)" % i, file=sys.stderr)
+                    continue
                 errors += 1
                 print("shader %d: %s" % (i, ex), file=sys.stderr)
                 continue

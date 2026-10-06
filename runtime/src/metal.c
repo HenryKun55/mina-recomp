@@ -29,6 +29,13 @@ void gpu_lock(void)
 {
     pthread_mutex_lock(&gpu_mutex);
 #if defined(__vita__)
+#if !defined(MINA_NULL_GL)
+    static int vgl_ready;
+    if (!vgl_ready) {
+        vglInitExtended(0x800000, 960, 544, 0x1000000, SCE_GXM_MULTISAMPLE_NONE);
+        vgl_ready = 1;
+    }
+#endif
     return;
 #endif
     SDL_Window *w = sdl_main_window();
@@ -336,7 +343,11 @@ static void imp_MTLCreateSystemDefaultDevice(Ctx *c)
 
 static void d_name(Ctx *c) { RET(ns_string_auto("OpenGL (mina-recomp)")); }
 static void d_newCommandQueue(Ctx *c) { RET(objc_new_object(&cls_Queue)); }
+#if defined(__vita__)
+static void d_supportsSampleCount(Ctx *c) { RET(MARG(0) == 1); }
+#else
 static void d_supportsSampleCount(Ctx *c) { RET(MARG(0) == 1 || MARG(0) == 2 || MARG(0) == 4); }
+#endif
 static void d_true(Ctx *c) { RET(1); }
 static void d_maxBufferLength(Ctx *c) { RET(256u << 20); }
 
@@ -423,7 +434,8 @@ static void tex_dealloc(void *h)
 {
     MTexture *t = h;
     gpu_lock();
-    if (t->gl) glDeleteTextures(1, &t->gl);
+    if (t->gl && t->is_rb) glDeleteRenderbuffers(1, &t->gl);
+    else if (t->gl) glDeleteTextures(1, &t->gl);
     if (t->fbo_cache) glDeleteFramebuffers(1, &t->fbo_cache);
     gpu_unlock();
     gfree(t->staging);
@@ -443,6 +455,16 @@ static void tex_create_gl(MTexture *t)
     if (!gl_format(t->format, &f))
         rt_fatal("metal: unsupported pixel format %u", t->format);
     GLenum target = tex_target(t);
+#if defined(__vita__)
+    if (f.depth) {
+        /* depth/stencil attachments are renderbuffers (they are never sampled) */
+        glGenRenderbuffers(1, &t->gl);
+        glBindRenderbuffer(GL_RENDERBUFFER, t->gl);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, (GLsizei)t->width, (GLsizei)t->height);
+        t->is_rb = 1;
+        return;
+    }
+#endif
     glGenTextures(1, &t->gl);
     glBindTexture(target, t->gl);
     if (target == GL_TEXTURE_2D_MULTISAMPLE) {
@@ -920,10 +942,23 @@ static void tex_upload(MTexture *t, uint32_t x, uint32_t y, uint32_t w, uint32_t
         glCompressedTexSubImage2D(tt, (GLint)level, (GLint)x, (GLint)y, (GLsizei)w, (GLsizei)h, f.internal, size, src);
         return;
     }
+#if defined(__vita__)
+    /* no GL_UNPACK_ROW_LENGTH: rows with padding are packed first */
+    uint8_t *packed = NULL;
+    if (f.bpp && bpr != w * (uint32_t)f.bpp) {
+        packed = malloc((size_t)w * h * (uint32_t)f.bpp);
+        for (uint32_t row = 0; row < h; row++)
+            memcpy(packed + (size_t)row * w * (uint32_t)f.bpp, src + (size_t)row * bpr, (size_t)w * (uint32_t)f.bpp);
+        src = packed;
+    }
+    glTexSubImage2D(tt, (GLint)level, (GLint)x, (GLint)y, (GLsizei)w, (GLsizei)h, f.format, f.type, src);
+    free(packed);
+#else
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glPixelStorei(GL_UNPACK_ROW_LENGTH, f.bpp ? (GLint)(bpr / (uint32_t)f.bpp) : 0);
     glTexSubImage2D(tt, (GLint)level, (GLint)x, (GLint)y, (GLsizei)w, (GLsizei)h, f.format, f.type, src);
     glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+#endif
 }
 static void t_replaceRegion(Ctx *c)
 {
@@ -1017,8 +1052,11 @@ static GLuint pass_fbo(MTexture **color, const int *levels, MTexture *depth, MTe
     if (ds) {
         GLFmt f;
         gl_format(ds->format, &f);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, f.stencil ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT,
-                               tex_target(ds), ds->gl, 0);
+        if (ds->is_rb)
+            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, ds->gl);
+        else
+            glFramebufferTexture2D(GL_FRAMEBUFFER, f.stencil ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT,
+                                   tex_target(ds), ds->gl, 0);
     }
     GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
     if (st != GL_FRAMEBUFFER_COMPLETE)
@@ -1167,6 +1205,14 @@ void metal_present(uint64_t drawable)
     MTexture *t = objc_host(((MDrawable *)objc_host(drawable))->texture);
     gpu_lock();
 #if defined(__vita__)
+#if !defined(MINA_NULL_GL)
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, tex_fbo(t, 0));
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glDisable(GL_SCISSOR_TEST);
+    glBlitFramebuffer(0, 0, (GLint)t->width, (GLint)t->height, 0, 544, 960, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    vglSwapBuffers(GL_FALSE);
+#endif
     gpu_unlock();
     return;
 #endif

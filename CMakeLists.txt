@@ -47,9 +47,12 @@ file(STRINGS "${GEN_DIR}/files.txt" GEN_FILES)
 get_filename_component(MINA_DATA "${MINA_EXE}/../../Resources/data" ABSOLUTE)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
   ${CMAKE_SOURCE_DIR}/tools/shaders/air2glsl.py ${MINA_DATA}/shaders.pak.yc)
+if(VITA)
+  set(MINA_SHADER_DIALECT --cg)      # vitaGL compiles CG
+endif()
 execute_process(
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/shaders/air2glsl.py
-          ${MINA_DATA}/shaders.pak.yc ${GEN_DIR}/shaders.c
+          ${MINA_DATA}/shaders.pak.yc ${GEN_DIR}/shaders.c ${MINA_SHADER_DIALECT}
   RESULT_VARIABLE SHADER_RESULT)
 if(NOT SHADER_RESULT EQUAL 0)
   message(FATAL_ERROR "shader translation failed")
@@ -64,13 +67,15 @@ if(VITA)
   set(MINA_GEN_FLAGS -g0 -fno-var-tracking -fno-var-tracking-assignments)
   set(MINA_DEFS MINA_FAST_FMA)
   option(MINA_VITA_NULL_GL "Vita build without a renderer (game logic only)" ON)
+  set(MINA_RUNTIME_DEFS)
   if(MINA_VITA_NULL_GL)
-    list(APPEND MINA_DEFS MINA_NULL_GL)
+    list(APPEND MINA_RUNTIME_DEFS MINA_NULL_GL)
   endif()
 else()
   set(MINA_ARCH_FLAGS)
   set(MINA_GEN_FLAGS)
   set(MINA_DEFS)
+  set(MINA_RUNTIME_DEFS)
 endif()
 
 add_library(mina_gen OBJECT ${GEN_FILES} ${GEN_DIR}/tables.c)
@@ -83,7 +88,7 @@ target_compile_options(mina_gen PRIVATE ${MINA_ARCH_FLAGS} ${MINA_GEN_FLAGS} -ff
 file(GLOB RUNTIME_SOURCES runtime/src/*.c)
 add_executable(mina ${RUNTIME_SOURCES} ${GEN_DIR}/shaders.c $<TARGET_OBJECTS:mina_gen>)
 target_include_directories(mina PRIVATE runtime/include ${GEN_DIR})
-target_compile_definitions(mina PRIVATE ${MINA_DEFS})
+target_compile_definitions(mina PRIVATE ${MINA_DEFS} ${MINA_RUNTIME_DEFS})
 target_compile_options(mina PRIVATE ${MINA_ARCH_FLAGS} -ffp-contract=off -fno-strict-aliasing -Wall -Wno-unused-function)
 
 if(VITA)
