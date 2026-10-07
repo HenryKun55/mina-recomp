@@ -1526,6 +1526,12 @@ def write_tables(prog, out):
     lines.append("const uint32_t g_spare_lo = 0x%xu, g_spare_hi = 0x%xu;" %
                  (rel(src + 0xc00 + 256 * _STRIDE), rel(src + 0xc00 + 256 * _OLD_STRIDE)))
     lines.append("")
+    # the game's own machine code: never read (the recompiled C runs instead), so
+    # the Vita needs no memory for it (whole 16 KiB pages inside __text)
+    lines.append("/* __text, whole 16 KiB pages: the arm64 code, never read at run time */")
+    lines.append("const uint32_t g_text_lo = 0x%xu, g_text_hi = 0x%xu;" %
+                 ((rel(prog.text.addr) + 0x3fff) & ~0x3fff, rel(prog.text.end) & ~0x3fff))
+    lines.append("")
     lines.append("/* bind: slot (guest address) receives import + addend */")
     lines.append("const GuestBind g_binds[] = {")
     for b in m.binds:

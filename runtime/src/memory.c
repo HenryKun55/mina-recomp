@@ -28,6 +28,7 @@ static uint32_t image_size;
 #include <pthread.h>
 #include <unistd.h>
 static uint32_t image_end;
+static uint32_t skip_hi = GUEST_IMAGE_BASE;      /* image memory starts here (see mem_init) */
 static void *lowguard_thread(void *arg)
 {
     (void)arg;
@@ -49,8 +50,10 @@ static void *lowguard_thread(void *arg)
     return NULL;
 }
 
+char *sbrk_start;
 void mem_init(void)
 {
+    sbrk_start = sbrk(0);
     uint32_t end = GUEST_IMAGE_BASE;
     for (uint32_t k = 0; k < g_segment_count; k++)
         if (g_segments[k].addr + g_segments[k].size > end)
@@ -68,12 +71,17 @@ void mem_init(void)
         pthread_create(&t, NULL, lowguard_thread, NULL);
         return;
     }
-    image_size = end - GUEST_IMAGE_BASE;
-    uint8_t *block = memalign(16384, end - GUEST_IMAGE_BASE);
+    /* the Mach-O header and the arm64 code (never read: the recompiled C runs
+     * instead) get no memory: the block starts after them (MINA_KEEPTEXT: whole) */
+    skip_hi = getenv("MINA_KEEPTEXT") ? GUEST_IMAGE_BASE : g_text_hi;
+    image_size = end - skip_hi;
+    uint8_t *block = memalign(16384, end - skip_hi);
     if (!block)
-        rt_fatal("cannot allocate the image (%u bytes)", end - GUEST_IMAGE_BASE);
-    g_mem = (uint8_t *)((uintptr_t)block - GUEST_IMAGE_BASE);
+        rt_fatal("cannot allocate the image (%u bytes)", end - skip_hi);
+    g_mem = (uint8_t *)((uintptr_t)block - skip_hi);
 }
+uint32_t image_skip_lo(void) { return GUEST_IMAGE_BASE; }
+uint32_t image_skip_hi(void) { return skip_hi; }
 
 uint32_t rt_alloc(uint32_t size, uint32_t align)
 {
@@ -93,6 +101,16 @@ uint32_t gmalloc(uint64_t size)
     void *p = memalign(16, size ? (size_t)size : 1);
     if (!p) {
         rt_log("guest heap: %llu bytes not available\n", (unsigned long long)size);
+        static int told;
+        if (!told++) {
+            extern char *sbrk_start;
+            char *now = sbrk(0);
+            void *more = sbrk(1 << 20);
+            struct mallinfo mi = mallinfo();
+            rt_log("guest heap: break moved %.1f MiB since boot, sbrk(1 MiB) %s; arena %.1f MiB, free %.1f in %d chunks\n",
+                   (now - sbrk_start) / 1048576.0, more == (void *)-1 ? "fails" : "works", mi.arena / 1048576.0,
+                   mi.fordblks / 1048576.0, mi.ordblks);
+        }
         return 0;
     }
     heap_in_use += malloc_usable_size(p);
@@ -188,6 +206,9 @@ void mem_report(void)
 #else
 
 static int strict_mem;
+static uint32_t skip_hi = GUEST_IMAGE_BASE;
+uint32_t image_skip_lo(void) { return GUEST_IMAGE_BASE; }
+uint32_t image_skip_hi(void) { return skip_hi; }
 
 void mem_init(void)
 {
@@ -201,6 +222,12 @@ void mem_init(void)
         rt_fatal("cannot map the guest address space");
     /* the lazy-bank window is never memory: a stray access faults */
     mprotect(g_mem + 0x40000000u, 0x60000000u, PROT_NONE);
+    /* MINA_NOTEXT: the Mach-O header and the arm64 code are no memory either,
+     * as on the Vita (a read of them faults) */
+    if (getenv("MINA_NOTEXT")) {
+        skip_hi = g_text_hi;
+        mprotect(g_mem + GUEST_IMAGE_BASE, skip_hi - GUEST_IMAGE_BASE, PROT_NONE);
+    }
     /* MINA_STRICTMEM: only what is allocated is memory, as on the Vita, where
      * any other guest address is some host memory */
     if (getenv("MINA_STRICTMEM")) {

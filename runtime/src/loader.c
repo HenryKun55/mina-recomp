@@ -3,6 +3,10 @@
 
 #include <string.h>
 
+/* the guest range the loader leaves out (memory.c: the Vita has no memory there) */
+uint32_t image_skip_lo(void);
+uint32_t image_skip_hi(void);
+
 static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
 
 void loader_load(const char *path)
@@ -27,14 +31,30 @@ void loader_load(const char *path)
             rt_fatal("%s: no arm64 slice", path);
     }
 
+    /* each segment in pieces around [skip_lo, skip_hi): the arm64 code and
+     * what precedes it (the Mach-O header), which have no memory on the Vita */
+    uint32_t skip_lo = image_skip_lo(), skip_hi = image_skip_hi();
     for (uint32_t k = 0; k < g_segment_count; k++) {
         const GuestSegment *s = &g_segments[k];
-        memset(G(s->addr), 0, s->size);
-        if (!s->filesize)
-            continue;
-        if (fseek(f, slice + (long)s->fileoff, SEEK_SET) != 0 ||
-            fread(G(s->addr), 1, s->filesize, f) != s->filesize)
-            rt_fatal("%s: cannot read segment %u", path, k);
+        uint32_t lo = s->addr, hi = s->addr + s->size;
+        for (int part = 0; part < 2; part++) {
+            uint32_t a = part ? (skip_hi > lo ? skip_hi : lo) : lo;
+            uint32_t b = part ? hi : (skip_lo < hi ? skip_lo : hi);
+            if (skip_lo == skip_hi && part)
+                break;
+            if (skip_lo == skip_hi)
+                b = hi;
+            if (a >= b)
+                continue;
+            memset(G(a), 0, b - a);
+            uint32_t fend = s->addr + s->filesize;           /* file bytes cover [addr, fend) */
+            uint32_t ra = a, rb = b < fend ? b : fend;
+            if (ra >= rb)
+                continue;
+            if (fseek(f, slice + (long)(s->fileoff + (ra - s->addr)), SEEK_SET) != 0 ||
+                fread(G(ra), 1, rb - ra, f) != rb - ra)
+                rt_fatal("%s: cannot read segment %u", path, k);
+        }
     }
     fclose(f);
 

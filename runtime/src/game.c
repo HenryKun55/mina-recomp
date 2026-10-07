@@ -28,21 +28,21 @@ uint32_t g_composites, g_bounds;        /* calls (MINA_FPS) */
  * thousands of transforms for a second; MINA_INPUT_UNTIL_PLAY stops the
  * scripted keys there */
 int g_in_play;
-static uint32_t composites_total;
+static uint32_t composites_total, recalcs_total;
 
 void f_99f430_orig(Ctx *c);
 void nat__ZN4Game11FixedUpdateEv(Ctx *c)
 {
     uint64_t t0 = now_us();
-    uint32_t before = composites_total;
+    uint32_t before = recalcs_total;
     g_fixed_updates++;
     f_99f430_orig(c);
     g_fixed_us += now_us() - t0;
     static int heavy;          /* consecutive fixed updates moving thousands of transforms */
-    heavy = composites_total - before > 4000 ? heavy + 1 : 0;
-    if (heavy == 60 && !g_in_play) {
+    heavy = recalcs_total - before > 1500 ? heavy + 1 : 0;
+    if (heavy == 20 && !g_in_play) {
         g_in_play = 1;
-        rt_log("[play] gameplay (%u transforms in a fixed update)\n", composites_total - before);
+        rt_log("[play] gameplay (%u world transforms in a fixed update)\n", recalcs_total - before);
     }
 }
 
@@ -115,12 +115,16 @@ void nat__ZNK11ycTransform9CompositeERKS_y(Ctx *c)
     composite(c);
 }
 
+static void compose(XForm *o, const XForm *a, const XForm *bp, uint64_t f);
 static void composite(Ctx *c)
 {
-    XForm *o = G(c->x[0]);
-    const XForm *a = G(c->x[1]);
-    const uint64_t f = c->x[3];
-    const XForm b = *(const XForm *)G(c->x[2]);     /* a struct copy: no library call */
+    compose(G(c->x[0]), G(c->x[1]), G(c->x[2]), c->x[3]);
+}
+
+/* o may be a: b is copied into o first, a is read after (as the game does) */
+static void compose(XForm *o, const XForm *a, const XForm *bp, uint64_t f)
+{
+    const XForm b = *bp;     /* a struct copy: no library call */
     *o = b;
     int scale_t = 0;
     if (!(f & 0x10)) {
@@ -279,4 +283,264 @@ void nat__ZN21ycCutterAnimComponent12UpdateBoundsEv(Ctx *c)
         return;
     }
     update_bounds(c);
+}
+
+/* ---- IsoAnim::CalcTransform ----------------------------------------------------------------
+ * x0 out, x1 the iso parameters P, x2 transform A, x3 transform B, x4 flags,
+ * w5/w6 bools. With w5 and P's mode (P+0xc) set, B's z comes from
+ * IsoAnim::GetIsoDepth (the game's code) and A's z is dropped before the
+ * composite. */
+void f_873480(Ctx *c);           /* IsoAnim::GetIsoDepth */
+void f_87363c_orig(Ctx *c);
+static void calc_transform_p(Ctx *c, XForm *o, uint64_t pa, const XForm *ap, const XForm *bp, uint64_t flags,
+                             uint32_t w5, uint32_t w6)
+{
+    const uint32_t mode = w5 ? rt_ld32(G(pa + 0xc)) : 0;
+    if (!mode) {
+        compose(o, ap, bp, flags);
+        return;
+    }
+    const float *p = G(pa);
+    XForm b = *bp;
+    const float bz = b.t[2];
+    const float ty = w6 ? b.t[1] : -0.0f;
+    /* GetIsoDepth(x0 = P+0x18, x1 = mode, s0 = A.t[1] + P[0] + (B.t[1] or -0), s1 = P[4], s2 = P[2]) */
+    c->x[0] = ld_ptr(pa + 0x18);
+    c->x[1] = mode;
+    c->v[0] = vset_f32((ap->t[1] + p[0]) + ty);
+    c->v[1] = vset_f32(p[4]);
+    c->v[2] = vset_f32(p[2]);
+    f_873480(c);
+    b.t[2] = c->v[0].f[0] - p[1];
+    XForm a = *ap;
+    const uint32_t pflags = rt_ld32(G(pa + 0x14));
+    const float az = (a.t[2] < 0.0f && (pflags >> 8 & 1)) ? 0.0f : a.t[2];
+    a.t[2] = az;
+    if (mode == 1) {
+        b.t[2] = bz;
+        compose(o, &a, &b, flags);
+        return;
+    }
+    a.t[2] = 0.0f;
+    compose(o, &a, &b, flags);
+    if (mode != 8 && !(pflags >> 10 & 1))
+        o->t[1] = bz + (az + o->t[1]);
+}
+static void calc_transform(Ctx *c)
+{
+    calc_transform_p(c, G(c->x[0]), c->x[1], G(c->x[2]), G(c->x[3]), c->x[4], (uint32_t)c->x[5], (uint32_t)c->x[6]);
+}
+void nat__ZN7IsoAnim13CalcTransformERK11ycTransformS2_ybb(Ctx *c)
+{
+    if (verify_xform()) {
+        verify_against(c, calc_transform, f_87363c_orig, "IsoAnim::CalcTransform", sizeof(XForm));
+        return;
+    }
+    calc_transform(c);
+}
+
+/* ---- GameAnim::RecalcWorldTransform -------------------------------------------------------
+ * x0 the GameAnim O, x1 the world transform W. The parent's transform (O+0x200)
+ * composed with the local one (O+0x180), the iso transform (IsoAnim::CalcTransform),
+ * a virtual hook (O+0x2b8, slot 0x60) that may move it, then the 4x4 matrix
+ * (rotation x scale, translation) into up to 4 places and the bounds. Fields
+ * O+0x1d0/0x1d8/0x1e0 are only changed for the duration. The locals the hook
+ * sees are in a guest stack frame, as in the game. */
+static inline float ldf(uint64_t a) { float f; memcpy(&f, G(a), 4); return f; }
+static inline void stf(uint64_t a, float f) { memcpy(G(a), &f, 4); }
+void f_9a65c4_orig(Ctx *c);
+static void recalc_world_transform(Ctx *c)
+{
+    const uint64_t O = c->x[0];
+    const XForm *W = G(c->x[1]);
+    const uint64_t saved_sp = c->sp;
+    const uint64_t sp = saved_sp - 0xf0;
+    c->sp = sp;
+    XForm *L = G(sp + 0x8), *Wc = G(sp + 0x30), *R = G(sp + 0x60);
+
+    const uint64_t par = ld_ptr(O + 0x200);
+    if (par && !(*(uint8_t *)G(O + 0x1f8) & 2)) {
+        rt_st32(G(O + 0x1dc), rt_ld32(G(par + 0xbc)));
+        rt_st32(G(O + 0x1e4), rt_ld32(G(O + 0x1e4)) | 0x20);
+    }
+    const float s8 = ldf(O + 0x1d8);
+    uint32_t w22 = rt_ld32(G(O + 0x1e4));
+    float s11 = s8;
+    if ((w22 & (1u << 20)) && rt_ld32(G(O + 0x1dc)) != 4) {
+        s11 = -s8;
+        stf(O + 0x1d8, s11);
+    }
+    const float s9 = ldf(O + 0x1d0), s10 = ldf(O + 0x1e0);
+
+    /* the layer: O+0x1e0 (when 0) from the depth of the parent's or own sprite */
+    int layer = 0;            /* 0: keep, 1: from x8 below, 2: 1.0 */
+    uint64_t x8 = 0;
+    if (par) {
+        compose(R, G(par + 0x78), G(O + 0x180), ld_ptr(O + 0x18));
+        const uint32_t f = rt_ld32(G(O + 0x1f8));
+        if (!(f & 1))
+            stf(O + 0x1d0, ldf(par + 0xc0) + s9);
+        if (!(f & 2)) {
+            rt_st32(G(O + 0x1dc), rt_ld32(G(par + 0xbc)));
+            w22 |= 0x20;
+            rt_st32(G(O + 0x1e4), w22);
+            stf(O + 0x1d8, ldf(par + 0xc4) + s11);
+        }
+        if (f & 0x20) {
+            if (s10 == 0.0f) {
+                x8 = ld_ptr(O + 0x248);
+                layer = x8 && !(*(uint8_t *)G(O + 0x1f8) & 0x40) ? 1 : 2;
+                if (!x8)
+                    layer = 3;               /* 1.0 stored as is */
+                else if (layer == 2)
+                    layer = 3;
+            }
+        } else {
+            x8 = ld_ptr(par + 0x50);
+            layer = x8 ? 1 : 2;
+        }
+    } else {
+        *R = *(const XForm *)G(O + 0x180);
+        if (s10 == 0.0f) {
+            x8 = ld_ptr(O + 0x248);
+            layer = x8 && !(*(uint8_t *)G(O + 0x1f8) & 0x40) ? 1 : 3;
+        }
+    }
+    if (layer) {
+        float v = 1.0f;
+        if (layer == 1) {
+            int32_t d = (int32_t)rt_ld32(G(x8 + 0x15c));
+            if (d > 10)
+                d -= 10;
+            d += 2;
+            v = (float)(int32_t)((float)d * 0.5f);
+        }
+        stf(O + 0x1e0, layer == 3 ? v : s10 + v);
+    }
+
+    *Wc = *W;
+    if (*(uint8_t *)G(O + 0x1cb)) {
+        /* whole pixels: floor(t * k0 + 0.5) * k1 */
+        const float k0 = ldf(0x6039f5c), k1 = ldf(0x6039f58);
+        for (int i = 0; i < 2; i++) {
+            Wc->t[i] = floorf(Wc->t[i] * k0 + 0.5f) * k1;
+            R->t[i] = floorf(R->t[i] * k0 + 0.5f) * k1;
+        }
+    }
+    memcpy(G(O + 0x274), R->t, 12);
+    calc_transform_p(c, L, O + 0x1d0, Wc, R, ld_ptr(O + 0x18), w22 >> 4 & 1, w22 >> 2 & 1);
+    memcpy(G(O + 0x25c), L->t, 12);
+    stf(sp + 4, 0.0f);
+    float hook = 0.0f;
+    const uint64_t h = ld_ptr(O + 0x2b8);
+    if (h) {
+        *(uint8_t *)G(sp + 3) = 0;
+        c->v[0] = vset_f32((rt_ld32(G(O + 0x1e4)) & 0x1000000) ? -0.8f : 0.0f);
+        c->x[0] = h;
+        c->x[1] = O;
+        c->x[2] = sp + 0x8 + 0x1c;
+        c->x[3] = sp + 0x8 + 0x10;
+        c->x[4] = sp + 4;
+        c->x[5] = sp + 3;
+        rt_call(c, ld_ptr(ld_ptr(h) + 0x60));
+        if (!(*(uint8_t *)G(O + 0x1e6) & 0x20)) {
+            const float step = *(uint8_t *)G(sp + 3) ? 10.0f : -10.0f;
+            if (ldf(O + 0x1e0) == 1.0f)
+                L->t[2] = L->t[2] + step;
+        }
+        hook = ldf(sp + 4);
+    }
+    memcpy(G(O + 0x268), L->t, 12);
+
+    /* rotation (L.q) x scale (L.s), translation (L.t) */
+    const float x = L->q[0], y = L->q[1], z = L->q[2], w = L->q[3];
+    const float xx = x * x, yy = y * y, zz = z * z, xz = x * z, xy = x * y, yz = y * z, xw = x * w, yw = y * w,
+                zw = z * w;
+    float m00 = yy + zz; m00 = m00 + m00; m00 = 1.0f - m00;
+    float m01 = xy + zw; m01 = m01 + m01;
+    float m02 = xz - yw; m02 = m02 + m02;
+    float m10 = xy - zw; m10 = m10 + m10;
+    float m11 = xx + zz; m11 = m11 + m11; m11 = 1.0f - m11;
+    float m12 = yz + xw; m12 = m12 + m12;
+    float m20 = xz + yw; m20 = m20 + m20;
+    float m21 = yz - xw; m21 = m21 + m21;
+    float m22 = xx + yy; m22 = m22 + m22; m22 = 1.0f - m22;
+    const float sx = L->s[0], sy = L->s[1], sz = L->s[2];
+    const float m[16] = { m00 * sx, m01 * sx, m02 * sx, 0.0f * sx, m10 * sy, m11 * sy, m12 * sy, 0.0f * sy,
+                          m20 * sz, m21 * sz, m22 * sz, 0.0f * sz, L->t[0], L->t[1], L->t[2], 1.0f };
+    stf(ld_ptr(O + 0xa0) + 4, hook);
+    for (int k = 1; k < 4; k++) {
+        uint64_t p = ld_ptr(O + 0xa0 + 8 * k);
+        if (!p)
+            break;
+        stf(p + 4, hook);
+    }
+    memcpy(G(ld_ptr(O + 0x60)), m, sizeof m);
+    for (int k = 1; k < 4; k++) {
+        uint64_t p = ld_ptr(O + 0x60 + 8 * k);
+        if (!p)
+            break;
+        memcpy(G(p), m, sizeof m);
+    }
+    c->x[0] = O;
+    update_bounds(c);
+    stf(O + 0x1e0, s10);
+    stf(O + 0x1d0, s9);
+    stf(O + 0x1d8, s8);
+    c->sp = saved_sp;
+}
+/* what it writes: the object, its 4 matrices, the 4 hook floats, the 4 boxes */
+typedef struct RwtSnap {
+    uint8_t obj[0x300];
+    uint64_t mat[4], hk[4], box[4];
+    float m[4][16], h[4], b[4][6];
+} RwtSnap;
+static void rwt_take(uint64_t O, RwtSnap *s)
+{
+    memcpy(s->obj, G(O), sizeof s->obj);
+    for (int k = 0; k < 4; k++) {
+        s->mat[k] = ld_ptr(O + 0x60 + 8 * k);
+        s->hk[k] = ld_ptr(O + 0xa0 + 8 * k);
+        s->box[k] = ld_ptr(O + 0x80 + 8 * k);
+        if (s->mat[k]) memcpy(s->m[k], G(s->mat[k]), 64);
+        if (s->hk[k]) memcpy(&s->h[k], G(s->hk[k] + 4), 4);
+        if (s->box[k]) memcpy(s->b[k], G(s->box[k]), 24);
+    }
+}
+static void rwt_put(uint64_t O, const RwtSnap *s)
+{
+    memcpy(G(O), s->obj, sizeof s->obj);
+    for (int k = 0; k < 4; k++) {
+        if (s->mat[k]) memcpy(G(s->mat[k]), s->m[k], 64);
+        if (s->hk[k]) memcpy(G(s->hk[k] + 4), &s->h[k], 4);
+        if (s->box[k]) memcpy(G(s->box[k]), s->b[k], 24);
+    }
+}
+void nat__ZN8GameAnim20RecalcWorldTransformERK11ycTransformS2_(Ctx *c)
+{
+    recalcs_total++;
+    if (verify_xform()) {
+        static RwtSnap before, mine, theirs;
+        static uint32_t checked, bad;
+        const uint64_t O = c->x[0];
+        rwt_take(O, &before);
+        Ctx save = *c;
+        recalc_world_transform(c);
+        rwt_take(O, &mine);
+        rwt_put(O, &before);
+        *c = save;
+        f_9a65c4_orig(c);
+        rwt_take(O, &theirs);
+        checked++;
+        if (memcmp(&mine, &theirs, sizeof mine) != 0 && bad++ < 10) {
+            const uint8_t *a = (const uint8_t *)&mine, *b = (const uint8_t *)&theirs;
+            size_t i = 0;
+            while (a[i] == b[i]) i++;
+            rt_log("[verify] RecalcWorldTransform differs at snapshot byte %#zx (object %#zx)\n", i, i < 0x300 ? i : 0);
+        }
+        if ((checked & 0x3ffff) == 0)
+            rt_log("[verify] RecalcWorldTransform: %u calls checked, %u differ\n", checked, bad);
+        return;
+    }
+    recalc_world_transform(c);
 }
