@@ -682,9 +682,10 @@ class Lower:
         return "@STORE#%d@" % k
 
     def call_seq(self, call):
-        self.emit(self.store_marker("call"))
+        m = self.store_marker("call")
+        self.emit(m)
         self.emit(call)
-        self.emit("@RELOAD@")
+        self.emit("@RELOAD#%s@" % m[7:-1])
 
     def tail_seq(self, call):
         self.emit(self.store_marker("tail"))
@@ -821,6 +822,7 @@ class Lower:
             ret.append("c->nzcv = nzcv;")
         s_store, s_reload, s_ret = " ".join(store), " ".join(reload), " ".join(ret)
         site_stores = self.site_stores()
+        entry_live, site_reloads = self.liveness()
 
         name = self.p.names.get(fn.start, "")
         lines = ["/* %s */" % name.replace("*/", "* /") if name else "/* sub_%x */" % fn.start,
@@ -829,10 +831,18 @@ class Lower:
         # under the ABI nothing comes in x9-x18 or v16-v31 (scratch): they start
         # at 0 instead of a load (dead when written first, which the compiler sees)
         def x_init(r):
-            return "x%d = 0" % r if 9 <= r <= 18 and not self.test_mode else "x%d = c->x[%d]" % (r, r)
+            if self.test_mode:
+                return "x%d = c->x[%d]" % (r, r)
+            if (9 <= r <= 18) or (entry_live is not None and "x%d" % r not in entry_live):
+                return "x%d = 0" % r
+            return "x%d = c->x[%d]" % (r, r)
 
         def v_init(r):
-            return "v%d = vzero()" % r if r >= 16 and not self.test_mode else "v%d = c->v[%d]" % (r, r)
+            if self.test_mode:
+                return "v%d = c->v[%d]" % (r, r)
+            if r >= 16 or (entry_live is not None and "v%d" % r not in entry_live):
+                return "v%d = vzero()" % r
+            return "v%d = c->v[%d]" % (r, r)
         if self.xs:
             lines.append("    uint64_t " + ", ".join(x_init(r) for r in sorted(self.xs)) + ";")
         if self.uses_sp or self.wrote_sp:
@@ -846,6 +856,8 @@ class Lower:
         for l in self.out:
             if "@STORE#" in l:
                 l = re.sub(r"@STORE#(\d+)@", lambda m: site_stores.get(int(m.group(1)), s_store), l)
+            if "@RELOAD#" in l:
+                l = re.sub(r"@RELOAD#(\d+)@", lambda m: site_reloads.get(int(m.group(1)), s_reload), l)
             l = l.replace("@STORE@", s_store).replace("@RELOAD@", s_reload).replace("@RET@", s_ret)
             if l.strip():
                 lines.append(l)
@@ -930,6 +942,106 @@ class Lower:
                 st.append("c->sp = sp;")
             res[k] = " ".join(st)
         return res
+
+    TOKEN = re.compile(r"(?<![\w.>])(x\d+|v\d+)(?!\w)")
+    LANE_ASSIGN = re.compile(r"(?<![\w.>])(x\d+|v\d+)\.\w+\[\d+\]\s*=(?!=)")
+
+    def liveness(self):
+        """Backward liveness over the blocks: the registers read before being
+        written from the entry (only those are loaded from the context) and
+        after each call (only those of the results are reloaded). Uses and
+        definitions are read off the emitted C; a lane write is a use too; a
+        store marker uses what it stores, a return uses the result registers."""
+        fn = self.fn
+        if self.test_mode or not getattr(fn, "blocks", None):
+            return None, {}
+        stores = self.site_stores()
+        ret_regs = {"x%d" % r for r in RET_X} | {"v%d" % r for r in RET_V}
+
+        def stored(k):
+            return set(re.findall(r"= (x\d+|v\d+);", stores.get(k, "")))
+
+        # per instruction, the backward transfer as a list of steps (in program order)
+        steps = {}
+        for addr, (a, e) in self.ins_lines.items():
+            st = []
+            for l in self.out[a:e]:
+                t = l.strip()
+                if t == "return;":
+                    st.append(("kill_all",))
+                    continue
+                if t == "@RET@":
+                    st.append(("use", ret_regs))
+                    continue
+                m = re.fullmatch(r"@STORE#(\d+)@", t)
+                if m:
+                    st.append(("use", stored(int(m.group(1)))))
+                    continue
+                m = re.fullmatch(r"@RELOAD#(\d+)@", t)
+                if m:
+                    st.append(("reload", int(m.group(1))))
+                    continue
+                uses, defs = set(), set()
+                for mm in self.MARK.finditer(l):          # a conditional tail call inside the line
+                    uses |= stored(int(mm.group(1)))
+                lane = {mm.group(1) for mm in self.LANE_ASSIGN.finditer(l)}
+                full = {mm.group(1) for mm in self.ASSIGN.finditer(l)} - lane
+                for mm in self.TOKEN.finditer(l):
+                    uses.add(mm.group(1))
+                # a register only assigned on this line is not a use of it,
+                # unless it also appears elsewhere on the line (conservative)
+                for r in full:
+                    if len(re.findall(r"(?<![\w.>])%s(?!\w)" % r, l)) == 1:
+                        uses.discard(r)
+                defs = full
+                st.append(("line", uses, defs))
+            steps[addr] = st
+        reload_live = {}
+
+        def transfer(b, live, record):
+            a, e = fn.blocks[b]
+            live = set(live)
+            for x in range(e - 4, a - 4, -4):
+                for step in reversed(steps.get(x, ())):
+                    if step[0] == "kill_all":
+                        live = set()
+                    elif step[0] == "use":
+                        live |= step[1]
+                    elif step[0] == "reload":
+                        if record:
+                            reload_live[step[1]] = set(live)
+                        live -= ret_regs
+                    else:
+                        live -= step[2]
+                        live |= step[1]
+            return live
+
+        nb = len(fn.blocks)
+        live_in = [set() for _ in range(nb)]
+        changed = True
+        while changed:
+            changed = False
+            for b in reversed(range(nb)):
+                out = set()
+                for t in fn.succs(b):
+                    out |= live_in[t]
+                new = transfer(b, out, False)
+                if new != live_in[b]:
+                    live_in[b] = new
+                    changed = True
+        for b in range(nb):
+            out = set()
+            for t in fn.succs(b):
+                out |= live_in[t]
+            transfer(b, out, True)
+        entry = fn.block_of.get(fn.start)
+        entry_live = live_in[entry] if entry is not None else None
+        reloads = {}
+        for k, live in reload_live.items():
+            rl = ["x%d = c->x[%d];" % (r, r) for r in RET_X if "x%d" % r in live and r in self.xs]
+            rl += ["v%d = c->v[%d];" % (r, r) for r in RET_V if "v%d" % r in live and r in self.vs]
+            reloads[k] = " ".join(rl)
+        return entry_live, reloads
 
     def i_unknown(self, ins):
         self.emit('rt_unimpl(c, 0x%xu, "%s");' % (rel(ins.addr), ins.op))
