@@ -1219,3 +1219,23 @@ void nat__ZN21ycCutterAnimComponent11UpdateFrameEfb(Ctx *c)
     }
     update_frame(c);
 }
+
+/* ---- GameAnim::UpdateFacing: its early out natively ------------------------------------------
+ * Nothing to do unless the facing flag (bit 3 of +0x1e4) is set and the facing
+ * (from the owner at +0x248 +0x144, or +0x280) differs from the one used
+ * (+0x250): then the game's code runs. */
+void f_9a7c54_orig(Ctx *c);
+void nat__ZN8GameAnim12UpdateFacingEv(Ctx *c)
+{
+    GM_BEGIN;
+    const uint64_t O = c->x[0];
+    const uint32_t f = rt_ld32(GP(O + 0x1e4));
+    if (!(f & 8) || (int32_t)rt_ld32(GP(O + 0x2d0)) < 0)
+        return;
+    const uint64_t own = lp(O + 0x248);
+    const int from_owner = own && !(f & 0x10000000);
+    const uint64_t xy = from_owner ? own + 0x144 : O + 0x280, z = from_owner ? own + 0x14c : O + 0x288;
+    if (ldfp(xy) == ldfp(O + 0x250) && ldfp(xy + 4) == ldfp(O + 0x254) && ldfp(z) == ldfp(O + 0x258))
+        return;
+    f_9a7c54_orig(c);
+}
