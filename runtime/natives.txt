@@ -70,3 +70,5 @@ __ZN7ycAudio11FileManager11CacheEventsEPKNS_10BankHandleEP15ycAudioItemBaseb
 # Game code (runtime/src/game.c)
 __ZN4Game11FixedUpdateEv
 __ZN4Game6UpdateEf
+__ZNK11ycTransform9CompositeERKS_y
+__ZN21ycCutterAnimComponent12UpdateBoundsEv
