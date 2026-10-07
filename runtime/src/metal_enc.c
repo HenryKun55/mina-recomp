@@ -1406,9 +1406,31 @@ static void be_copyBuffer(Ctx *c)
     MBuffer *s = objc_host(MARG(0)), *d = objc_host(MARG(2));
     uint32_t so = (uint32_t)MARG(1), dof = (uint32_t)MARG(3), n = (uint32_t)MARG(4);
     if (s->gpu_only) {
-        static int told;
-        if (!told++)
-            rt_log("metal: copy from a private buffer is not supported\n");
+        /* from GPU memory: its CPU shadow, or the GL buffer read back */
+        uint8_t *tmp = malloc(n ? n : 1);
+        if (s->shadow) {
+            memcpy(tmp, s->shadow + so, n);
+        } else if (s->gl) {
+            glBindBuffer(GL_ARRAY_BUFFER, s->gl);
+#if defined(__vita__)
+            const uint8_t *p = glMapBuffer(GL_ARRAY_BUFFER, GL_READ_ONLY);
+            if (p) {
+                memcpy(tmp, p + so, n);
+                glUnmapBuffer(GL_ARRAY_BUFFER);
+            } else {
+                memset(tmp, 0, n);
+            }
+#else
+            glGetBufferSubData(GL_ARRAY_BUFFER, so, n, tmp);
+#endif
+        } else {
+            memset(tmp, 0, n);              /* never written */
+        }
+        if (d->gpu_only)
+            gpu_buffer_write(d, dof, tmp, n);
+        else
+            memcpy(G(metal_buf_mem(d) + dof), tmp, n);
+        free(tmp);
         return;
     }
     if (d->gpu_only) {
