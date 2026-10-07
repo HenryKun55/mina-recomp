@@ -1,6 +1,7 @@
 /* Entry point: loads the game's executable and runs its main(). */
 #include "objc_rt.h"
 
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -46,6 +47,18 @@ int main(int argc, char **argv)
 {
 #if defined(__vita__)
     load_env_file();
+    {   /* the fastest clocks an application may ask for (the defaults are lower:
+         * CPU 333 MHz); MINA_CLOCKS=0 keeps them */
+        int scePowerSetArmClockFrequency(int), scePowerSetBusClockFrequency(int);
+        int scePowerSetGpuClockFrequency(int), scePowerSetGpuXbarClockFrequency(int);
+        const char *v = getenv("MINA_CLOCKS");
+        if (!v || atoi(v)) {
+            scePowerSetArmClockFrequency(444);
+            scePowerSetBusClockFrequency(222);
+            scePowerSetGpuClockFrequency(222);
+            scePowerSetGpuXbarClockFrequency(166);
+        }
+    }
 #if !defined(MINA_NULL_GL)
     void metal_vita_init(void);
     metal_vita_init();
