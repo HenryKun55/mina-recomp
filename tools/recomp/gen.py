@@ -381,7 +381,7 @@ class Func:
         if op in ("logic_imm", "logic_reg") and ins.opc in ("ands", "bics"):
             return ("logic", 64 if ins.sf else 32)
         if op == "fcmp":
-            return ("fcmp", 0)
+            return ("fcmp", 32 if ins.ft == 32 else 0)     # single: compared as float
         if op in ("ccmp", "fccmp"):
             return ("nzcv", 0)
         if op == "adc" and ins.s:
@@ -492,6 +492,7 @@ class Lower:
         self.fn = fn
         self.p = fn.p
         self.test_mode = test_mode
+        self.elide = set()
         self.out = []
         self.xs = set()       # general registers referenced
         self.vs = set()       # vector registers referenced
@@ -633,7 +634,7 @@ class Lower:
                 return "cond_holds(flags_add32((uint32_t)fa, (uint32_t)fb), %d)" % c
             return "cond_holds(flags_add64(fa, fb), %d)" % c
         if kind == "fcmp":
-            a, b = "fda", "fdb"
+            a, b = ("ffa", "ffb") if w == 32 else ("fda", "fdb")
             return {
                 "eq": "%s == %s" % (a, b), "ne": "!(%s == %s)" % (a, b),
                 "hs": "!(%s < %s)" % (a, b), "lo": "%s < %s" % (a, b),
@@ -651,9 +652,10 @@ class Lower:
         self.uses_flags = True
         k, w = kind
         if k == "fcmp":
-            self.emit("fda = %s; fdb = %s;" % (a, b))
+            fa_, fb_ = ("ffa", "ffb") if w == 32 else ("fda", "fdb")
+            self.emit("%s = %s; %s = %s;" % (fa_, a, fb_, b))
             if ins.addr in self.fn.materialize:
-                self.emit("nzcv = flags_fcmp(fda, fdb);")
+                self.emit("nzcv = flags_fcmp(%s, %s);" % (fa_, fb_))
             return
         self.emit("fa = %s; fb = %s;" % (a, b) if b is not None else "fa = %s;" % a)
         if ins.addr in self.fn.materialize:
@@ -709,9 +711,56 @@ class Lower:
 
     # -- main ---------------------------------------------------------------------------
 
+    def callee_saved_elision(self):
+        """Saves of x19-x28/d8-d15 in the opening run of stack stores, and their
+        reloads in an epilogue (only reloads and sp adjustments up to the exit):
+        the recompiled code keeps those registers in C locals and never writes
+        them back to the context, so the caller's values are intact without
+        them. x29/x30 stay (frame chain). The sp writeback still happens."""
+        if self.test_mode:
+            return set()
+        SP_REG = 32                             # a64.py's number for sp
+
+        def callee(ins, r):
+            return (19 <= r <= 28) if not ins.fp else (ins.size == 8 and 8 <= r <= 15)
+
+        def regs(ins):
+            return [ins.rt, ins.rt2] if ins.op == "ldstp" else [ins.rt]
+
+        def sp_adjust(ins):
+            return ins.op == "addsub_imm" and not ins.s and ins.rn == SP_REG and ins.rd in (29, SP_REG)
+
+        elide = set()
+        insns = self.fn.insns
+        for ins in insns:                       # the prologue
+            if ins.op in ("ldst", "ldstp") and not ins.load and ins.rn == SP_REG:
+                if all(callee(ins, r) for r in regs(ins)):
+                    elide.add(ins.addr)
+                continue
+            if sp_adjust(ins) or ins.op == "hint":
+                continue
+            break
+        for i, ins in enumerate(insns):         # epilogues
+            if not (ins.op in ("ldst", "ldstp") and ins.load and ins.rn == SP_REG and
+                    all(callee(ins, r) for r in regs(ins))):
+                continue
+            ok = False
+            for nxt in insns[i + 1:]:
+                if nxt.op in ("ldst", "ldstp") and nxt.load and nxt.rn == SP_REG and \
+                        all(callee(nxt, r) or (not nxt.fp and r in (29, 30)) for r in regs(nxt)):
+                    continue
+                if sp_adjust(nxt) or nxt.op == "hint":
+                    continue
+                ok = nxt.op in ("ret", "br") or (nxt.op == "b" and not self.fn.inside(nxt.target))
+                break
+            if ok:
+                elide.add(ins.addr)
+        return elide
+
     def run(self):
         fn = self.fn
         last = None
+        self.elide = self.callee_saved_elision()
         for ins in fn.insns:
             if ins.addr in fn.labels:
                 self.out.append("%s:" % label(ins.addr))
@@ -760,16 +809,23 @@ class Lower:
         lines = ["/* %s */" % name.replace("*/", "* /") if name else "/* sub_%x */" % fn.start,
                  "void %s(Ctx *c)" % cname(fn.start), "{",
                  "    uint8_t *const gm = g_mem; (void)gm;"]
+        # under the ABI nothing comes in x9-x18 or v16-v31 (scratch): they start
+        # at 0 instead of a load (dead when written first, which the compiler sees)
+        def x_init(r):
+            return "x%d = 0" % r if 9 <= r <= 18 and not self.test_mode else "x%d = c->x[%d]" % (r, r)
+
+        def v_init(r):
+            return "v%d = vzero()" % r if r >= 16 and not self.test_mode else "v%d = c->v[%d]" % (r, r)
         if self.xs:
-            lines.append("    uint64_t " + ", ".join("x%d = c->x[%d]" % (r, r) for r in sorted(self.xs)) + ";")
+            lines.append("    uint64_t " + ", ".join(x_init(r) for r in sorted(self.xs)) + ";")
         if self.uses_sp or self.wrote_sp:
             lines.append("    uint64_t sp = c->sp;")
         if self.vs:
-            lines.append("    V128 " + ", ".join("v%d = c->v[%d]" % (r, r) for r in sorted(self.vs)) + ";")
+            lines.append("    V128 " + ", ".join(v_init(r) for r in sorted(self.vs)) + ";")
         if self.uses_flags:
-            lines.append("    uint64_t fa = 0, fb = 0; double fda = 0, fdb = 0; uint32_t nzcv = %s;"
+            lines.append("    uint64_t fa = 0, fb = 0; double fda = 0, fdb = 0; float ffa = 0, ffb = 0; uint32_t nzcv = %s;"
                          % ("c->nzcv" if self.test_mode else "0"))
-            lines.append("    (void)fa; (void)fb; (void)fda; (void)fdb; (void)nzcv;")
+            lines.append("    (void)fa; (void)fb; (void)fda; (void)fdb; (void)ffa; (void)ffb; (void)nzcv;")
         for l in self.out:
             l = l.replace("@STORE@", s_store).replace("@RELOAD@", s_reload).replace("@RET@", s_ret)
             if l.strip():
@@ -1080,6 +1136,10 @@ class Lower:
 
     def i_ldst(self, ins):
         addr, wb = self.ea(ins)
+        if ins.addr in self.elide:
+            if wb:
+                self.setX(wb[0], 1, wb[1])
+            return
         if wb:
             self.emit("{ uint64_t ea_ = %s;" % addr)
             addr = "ea_"
@@ -1093,6 +1153,10 @@ class Lower:
 
     def i_ldstp(self, ins):
         addr, wb = self.ea(ins)
+        if ins.addr in self.elide:
+            if wb:
+                self.setX(wb[0], 1, wb[1])
+            return
         self.emit("{ uint64_t ea_ = %s;" % addr)
         a2 = "ea_ + %d" % ins.size
         if ins.load:
@@ -1242,7 +1306,11 @@ class Lower:
     def i_fcmp(self, ins):
         a = self.F(ins.rn, ins.ft)
         b = "0.0" if ins.zero else self.F(ins.rm, ins.ft)
-        self.set_flags(ins, ("fcmp", 0), "(double)%s" % a, "(double)%s" % b)
+        if ins.ft == 32:     # exact as float: no conversions to double
+            b = "0.0f" if ins.zero else b
+            self.set_flags(ins, ("fcmp", 32), a, b)
+        else:
+            self.set_flags(ins, ("fcmp", 0), "(double)%s" % a, "(double)%s" % b)
 
     def i_fccmp(self, ins):
         a, b = self.F(ins.rn, ins.ft), self.F(ins.rm, ins.ft)

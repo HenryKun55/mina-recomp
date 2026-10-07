@@ -544,3 +544,63 @@ void nat__ZN8GameAnim20RecalcWorldTransformERK11ycTransformS2_(Ctx *c)
     }
     recalc_world_transform(c);
 }
+
+/* ---- ycEntity::RefreshWorldTransform ---------------------------------------------------------
+ * The entity's world transform (E+0xc0): its local one (E+0x80) as is, or (flag
+ * bit 0 of E+0x18) composed under its frame: a provider object (E+0x60, virtual
+ * slot 0, returns a transform), else the parent's world (E+0x10), else identity.
+ * Then each active component of the pages at E+0x38 gets RecalcWorldTransform
+ * (virtual slot 0x48) with the new and the previous world. */
+void f_1cb43c_orig(Ctx *c);
+static void refresh_world_transform(Ctx *c)
+{
+    const uint64_t E = c->x[0];
+    const uint64_t saved_sp = c->sp, sp = saved_sp - 0xb0;
+    c->sp = sp;
+    XForm *world = G(E + 0xc0);
+    XForm *P = G(sp), *prev = G(sp + 0x50);
+    *prev = *world;
+    uint64_t flags = ld_ptr(E + 0x18);
+    if (!(flags & 1)) {
+        *world = *(const XForm *)G(E + 0x80);
+    } else {
+        const uint64_t prov = ld_ptr(E + 0x60);
+        if (prov) {
+            static const GuestFunc *ic;
+            c->x[0] = prov;
+            c->x[8] = sp;                        /* the transform comes back at sp */
+            RT_CALL_IC(c, ld_ptr(ld_ptr(prov)), ic);
+            flags = ld_ptr(E + 0x18);
+        } else {
+            const uint64_t parent = ld_ptr(E + 0x10);
+            if (parent) {
+                *P = *(const XForm *)G(parent + 0xc0);
+            } else {
+                memcpy(P, G(0x1d48610), 16);       /* identity: the game's constants */
+                memcpy((uint8_t *)P + 16, G(0x1d486d0), 16);
+                memset((uint8_t *)P + 32, 0, 8);
+            }
+        }
+        XForm r;
+        compose(&r, P, G(E + 0x80), flags);
+        *world = r;
+    }
+    for (uint64_t page = ld_ptr(E + 0x38); page; page = ld_ptr(page + 0x8)) {
+        for (uint32_t i = 0; i < ld_ptr(page + 0x10); i++) {
+            const uint64_t comp = ld_ptr(page + 0x18 + 8 * (uint64_t)i);
+            const uint64_t f = ld_ptr(comp + 0x18);
+            if (!(f & 1) || (f & 0x3000) == 0x1000)
+                continue;
+            static const GuestFunc *ic;
+            c->x[0] = comp;
+            c->x[1] = E + 0xc0;
+            c->x[2] = sp + 0x50;
+            RT_CALL_IC(c, ld_ptr(ld_ptr(comp) + 0x48), ic);
+        }
+    }
+    c->sp = saved_sp;
+}
+void nat__ZN8ycEntity21RefreshWorldTransformEb(Ctx *c)
+{
+    refresh_world_transform(c);
+}

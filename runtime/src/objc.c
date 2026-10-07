@@ -444,8 +444,32 @@ static void dispatch(Ctx *c, Class *k, int meta, uint32_t sel)
         rt_call(c, imp.guest);
 }
 
+/* An object of a host class keeps its Obj in guest bytes the game never reads
+ * (they hold only the isa for it): the pointer at +8 and a tag at +16 that
+ * matches only that address and pointer; objc_obj takes it without the lock. */
+#define OBJ_TAG_KEY 0xA5C3E1F7u
+static uint32_t obj_tag(uint32_t a, const Obj *o) { return a ^ OBJ_TAG_KEY ^ (uint32_t)(uintptr_t)o ^ 0x00010001u; }
+/* the heap span objects were made in: only there is reading a+8..a+20 safe */
+static uint32_t obj_lo = 0xFFFFFFFFu, obj_hi;
+/* the Obj of a host-class instance, from its tag (NULL: not one) */
+static inline Obj *obj_tagged(uint64_t a)
+{
+    if (a < obj_lo || a > obj_hi)
+        return NULL;
+    uint64_t p;
+    memcpy(&p, G(a + 8), 8);
+    Obj *t = (Obj *)(uintptr_t)p;
+    return t && rt_ld32(G(a + 16)) == obj_tag((uint32_t)a, t) ? t : NULL;
+}
+
 static void resolve_receiver(uint64_t recv, Class **k, int *meta)
 {
+    Obj *o = obj_tagged(recv);       /* a host object (no class object is tagged) */
+    if (o) {
+        *k = o->cls;
+        *meta = 0;
+        return;
+    }
     Class *cl = map_get(&class_by_obj, (uint32_t)recv);
     if (cl) {
         *k = cl;
@@ -593,14 +617,6 @@ static Class *host_ancestor(Class *k)
     return k;
 }
 
-/* An object of a host class keeps its Obj in guest bytes the game never reads
- * (they hold only the isa for it): the pointer at +8 and a tag at +16 that
- * matches only that address and pointer; objc_obj takes it without the lock. */
-#define OBJ_TAG_KEY 0xA5C3E1F7u
-static uint32_t obj_tag(uint32_t a, const Obj *o) { return a ^ OBJ_TAG_KEY ^ (uint32_t)(uintptr_t)o ^ 0x00010001u; }
-/* the heap span objects were made in: only there is reading a+8..a+20 safe */
-static uint32_t obj_lo = 0xFFFFFFFFu, obj_hi;
-
 uint32_t objc_new_object(Class *k)
 {
     uint32_t size = k->instance_size < 16 ? 16 : k->instance_size;
@@ -641,13 +657,9 @@ Obj *objc_obj(uint64_t a)
 {
     if (!a)
         return NULL;
-    if (a >= obj_lo && a <= obj_hi) {
-        uint64_t p;
-        memcpy(&p, G(a + 8), 8);
-        Obj *t = (Obj *)(uintptr_t)p;
-        if (rt_ld32(G(a + 16)) == obj_tag((uint32_t)a, t) && t)
-            return t;
-    }
+    Obj *t = obj_tagged(a);
+    if (t)
+        return t;
     pthread_mutex_lock(&objc_lock);
     Obj *o = map_get(&objects, (uint32_t)a);
     pthread_mutex_unlock(&objc_lock);

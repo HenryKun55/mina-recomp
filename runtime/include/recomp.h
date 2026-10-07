@@ -10,8 +10,71 @@
 #define MINA_RECOMP_H
 
 #include <math.h>
+
 #include <stdint.h>
 #include <string.h>
+
+#if defined(__vita__)
+/* floor/ceil/trunc without newlib's bit-twiddling C (the Cortex-A9 has no
+ * rounding instruction): through an integer, exact (the sign of a zero result
+ * kept; huge values, infinities and NaN as they are) */
+static inline float rt_truncf(float x)
+{
+    if (!(__builtin_fabsf(x) < 8388608.0f))
+        return x;
+    float t = (float)(int32_t)x;
+    return t == 0.0f ? __builtin_copysignf(0.0f, x) : t;
+}
+static inline float rt_floorf(float x)
+{
+    if (!(__builtin_fabsf(x) < 8388608.0f))
+        return x;
+    float t = (float)(int32_t)x;
+    if (t > x)
+        t -= 1.0f;
+    return t == 0.0f ? __builtin_copysignf(0.0f, x) : t;
+}
+static inline float rt_ceilf(float x)
+{
+    if (!(__builtin_fabsf(x) < 8388608.0f))
+        return x;
+    float t = (float)(int32_t)x;
+    if (t < x)
+        t += 1.0f;
+    return t == 0.0f ? __builtin_copysignf(0.0f, x) : t;
+}
+static inline double rt_trunc(double x)
+{
+    if (!(__builtin_fabs(x) < 2147483648.0))
+        return __builtin_trunc(x);
+    double t = (double)(int32_t)x;
+    return t == 0.0 ? __builtin_copysign(0.0, x) : t;
+}
+static inline double rt_floor(double x)
+{
+    if (!(__builtin_fabs(x) < 2147483648.0))
+        return __builtin_floor(x);
+    double t = (double)(int32_t)x;
+    if (t > x)
+        t -= 1.0;
+    return t == 0.0 ? __builtin_copysign(0.0, x) : t;
+}
+static inline double rt_ceil(double x)
+{
+    if (!(__builtin_fabs(x) < 2147483648.0))
+        return __builtin_ceil(x);
+    double t = (double)(int32_t)x;
+    if (t < x)
+        t += 1.0;
+    return t == 0.0 ? __builtin_copysign(0.0, x) : t;
+}
+#define truncf rt_truncf
+#define floorf rt_floorf
+#define ceilf rt_ceilf
+#define trunc rt_trunc
+#define floor rt_floor
+#define ceil rt_ceil
+#endif
 
 /* ---- layout of the guest space ---------------------------------------- */
 
