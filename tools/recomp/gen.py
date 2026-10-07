@@ -17,6 +17,7 @@ Conventions of the generated code (see docs/PLAN.md and runtime/include/recomp.h
 
 import argparse
 import os
+import re
 import struct
 import sys
 
@@ -496,6 +497,8 @@ class Lower:
         self.p = fn.p
         self.test_mode = test_mode
         self.elide = set()
+        self.sites = []             # store markers, by number: 'call' or 'tail'
+        self.ins_lines = {}         # instruction -> (first, end) lines of self.out
         self.out = []
         self.xs = set()       # general registers referenced
         self.vs = set()       # vector registers referenced
@@ -670,13 +673,21 @@ class Lower:
 
     # -- calls and control flow -------------------------------------------------
 
+    def store_marker(self, kind):
+        """@STORE#k@: the stores before a call (finish() puts there the argument
+        registers that may have changed since the last call; kind 'call': the
+        path goes on after it, 'tail': it returns)."""
+        k = len(self.sites)
+        self.sites.append(kind)
+        return "@STORE#%d@" % k
+
     def call_seq(self, call):
-        self.emit("@STORE@")
+        self.emit(self.store_marker("call"))
         self.emit(call)
         self.emit("@RELOAD@")
 
     def tail_seq(self, call):
-        self.emit("@STORE@")
+        self.emit(self.store_marker("tail"))
         self.emit(call)
         self.emit("return;")
 
@@ -697,7 +708,7 @@ class Lower:
                     return "{ RT_SPIN(c); goto %s; }" % label(t)
                 return "goto %s;" % label(t)
             raise GenError("branch to %#x without label" % t)
-        return "{ @STORE@ %s return; }" % self.call_target(t)
+        return "{ %s %s return; }" % (self.store_marker("tail"), self.call_target(t))
 
     def spin_loop(self, t):
         """A back edge to t closing a small loop with atomics: a spin-wait."""
@@ -768,7 +779,9 @@ class Lower:
             if ins.addr in fn.labels:
                 self.out.append("%s:" % label(ins.addr))
             self.cur = ins
+            first = len(self.out)
             getattr(self, "i_" + ins.op, self.i_unknown)(ins)
+            self.ins_lines[ins.addr] = (first, len(self.out))
             last = ins
         if last is not None and last.op not in ("b", "br", "ret", "brk"):
             nxt = fn.end
@@ -807,6 +820,7 @@ class Lower:
         if self.test_mode and self.uses_flags:
             ret.append("c->nzcv = nzcv;")
         s_store, s_reload, s_ret = " ".join(store), " ".join(reload), " ".join(ret)
+        site_stores = self.site_stores()
 
         name = self.p.names.get(fn.start, "")
         lines = ["/* %s */" % name.replace("*/", "* /") if name else "/* sub_%x */" % fn.start,
@@ -830,11 +844,92 @@ class Lower:
                          % ("c->nzcv" if self.test_mode else "0"))
             lines.append("    (void)fa; (void)fb; (void)fda; (void)fdb; (void)ffa; (void)ffb; (void)nzcv;")
         for l in self.out:
+            if "@STORE#" in l:
+                l = re.sub(r"@STORE#(\d+)@", lambda m: site_stores.get(int(m.group(1)), s_store), l)
             l = l.replace("@STORE@", s_store).replace("@RELOAD@", s_reload).replace("@RET@", s_ret)
             if l.strip():
                 lines.append(l)
         lines.append("}")
         return "\n".join(lines) + "\n"
+
+    ASSIGN = re.compile(r"(?<![\w.>])(x\d+|v\d+)(?:\.\w+\[\d+\])?\s*=(?!=)")
+    MARK = re.compile(r"@STORE#(\d+)@")
+
+    def site_stores(self):
+        """Per store marker: the argument registers that may have been written
+        since the function's entry or its last call, on any path (a forward
+        dataflow over the blocks; what is written is read off the emitted
+        assignments). After a call the callee may have changed any of them, but
+        under the ABI the code does not read them again without writing them.
+        sp is stored at every call when the function writes it (callees leave
+        c->sp lowered)."""
+        fn = self.fn
+        if self.test_mode or not self.sites or not getattr(fn, "blocks", None):
+            return {}
+        args = {"x%d" % r for r in ARG_X} | {"v%d" % r for r in ARG_V}
+        # events per instruction, in order: ('def', reg) / ('site', k)
+        events = {}
+        for addr, (a, e) in self.ins_lines.items():
+            ev = []
+            for l in self.out[a:e]:
+                pos = []
+                for m in self.MARK.finditer(l):
+                    pos.append((m.start(), ("site", int(m.group(1)))))
+                for m in self.ASSIGN.finditer(l):
+                    if m.group(1) in args:
+                        pos.append((m.start(), ("def", m.group(1))))
+                ev.extend(x for _, x in sorted(pos))
+            events[addr] = ev
+        nb = len(fn.blocks)
+        preds = [[] for _ in range(nb)]
+        for b in range(nb):
+            for t in fn.succs(b):
+                preds[t].append(b)
+        dirty_at = {}
+
+        def run_block(b, cur, record):
+            a, e = fn.blocks[b]
+            cur = set(cur)
+            for x in range(a, e, 4):
+                for kind, v in events.get(x, ()):
+                    if kind == "def":
+                        cur.add(v)
+                    else:
+                        if record:
+                            dirty_at.setdefault(v, set()).update(cur)
+                        if self.sites[v] == "call":
+                            cur = set()
+            return cur
+
+        inn = [set() for _ in range(nb)]
+        out = [None] * nb
+        work = list(range(nb))
+        while work:
+            b = work.pop()
+            new_in = set()
+            for p in preds[b]:
+                if out[p] is not None:
+                    new_in |= out[p]
+            if out[b] is not None and new_in == inn[b]:
+                continue
+            inn[b] = new_in
+            o = run_block(b, new_in, False)
+            if o != out[b]:
+                out[b] = o
+                work.extend(t for t in fn.succs(b))
+            elif out[b] is None:
+                out[b] = o
+        for b in range(nb):
+            run_block(b, inn[b], True)
+        res = {}
+        for k in range(len(self.sites)):
+            d = dirty_at.get(k, set())
+            st = ["c->x[%d] = x%d;" % (r, r) for r in ARG_X if "x%d" % r in d and r in self.wx]
+            st += ["c->v[%d] = v%d;" % (r, r) for r in ARG_V if "v%d" % r in d and r in self.wv]
+            if self.wrote_sp:
+                st.append("c->sp = sp;")
+            res[k] = " ".join(st)
+        return res
 
     def i_unknown(self, ins):
         self.emit('rt_unimpl(c, 0x%xu, "%s");' % (rel(ins.addr), ins.op))
