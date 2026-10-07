@@ -677,3 +677,301 @@ void nat__ZN7IsoAnim11GetIsoDepthEP11ycComponentRK6ycVec3fif(Ctx *c)
     }
     get_iso_depth(c);
 }
+
+/* ---- ycRenderPass::Update ---------------------------------------------------------------------
+ * For each of the 5 views (camera at RP+0x10+8v): the frustum planes of the
+ * camera's two matrices, then every render object of the pages at RP+0x130:
+ * the bounds of all of them (RP+0xb0+0x18v), a layer/flag filter, the planes,
+ * and the visible ones into the view's lists (objects RP+0x218+8v, sort keys
+ * RP+0x1f0+8v), their bounds (RP+0x150+0x18v) and count (RP+0x1c8+8v), sorted
+ * by key unless the key function (RP+0x128) is the default one. */
+void f_a33c0(Ctx *c);            /* ycMtx4::Inverted */
+void f_1e0ca0(Ctx *c);           /* ycRenderPass::SetMaxVisibleObjects */
+void f_1e13ac_orig(Ctx *c);
+
+typedef struct { float x, y, z, w; } Plane;
+static inline float fabs_sel(float v) { return v > 0.0f ? v : -v; }
+static void make_plane(Plane *p, float x, float y, float z, float w)
+{
+    float n = x * x;
+    n = n + y * y;
+    n = n + z * z;
+    const float inv = 1.0f / sqrtf(n);
+    p->x = x * inv;
+    p->y = y * inv;
+    p->z = z * inv;
+    p->w = w * -inv;
+}
+/* bounds (center, extent) grown by a box: as the game does it */
+static void grow_bounds(float *bc, float *be, const float *box)
+{
+    float lo_z = bc[2] - be[2];
+    const float blo_z = box[2] - box[5];
+    lo_z = lo_z < blo_z ? lo_z : blo_z;
+    float hi_z = bc[2] + be[2];
+    const float bhi_z = box[2] + box[5];
+    hi_z = hi_z < bhi_z ? bhi_z : hi_z;
+    const float ez = (hi_z - lo_z) * 0.5f;
+    const float cz = lo_z + ez;
+    float lo[2], hi[2];
+    for (int i = 0; i < 2; i++) {
+        lo[i] = bc[i] - be[i];
+        const float blo = box[i] - box[3 + i];
+        lo[i] = blo > lo[i] ? lo[i] : blo;
+        hi[i] = bc[i] + be[i];
+        const float bhi = box[i] + box[3 + i];
+        hi[i] = bhi > hi[i] ? bhi : hi[i];
+    }
+    for (int i = 0; i < 2; i++) {
+        be[i] = (hi[i] - lo[i]) * 0.5f;
+        bc[i] = lo[i] + be[i];
+    }
+    be[2] = ez;
+    bc[2] = cz;
+}
+/* the visible bounds grow the same way, with the additions in another order */
+static void grow_bounds_vis(float *bc, float *be, const float *box)
+{
+    float lo_z = bc[2] - be[2];
+    const float blo_z = box[2] - box[5];
+    lo_z = lo_z < blo_z ? lo_z : blo_z;
+    const float hi_z0 = be[2] + bc[2];
+    float hi_z = box[2] + box[5];
+    hi_z = hi_z0 < hi_z ? hi_z : hi_z0;
+    const float dz = hi_z - lo_z;
+    float lo[2], hi[2];
+    for (int i = 0; i < 2; i++) {
+        lo[i] = bc[i] - be[i];
+        const float blo = box[i] - box[3 + i];
+        lo[i] = blo > lo[i] ? lo[i] : blo;
+        const float h0 = be[i] + bc[i];
+        hi[i] = box[i] + box[3 + i];
+        hi[i] = hi[i] > h0 ? hi[i] : h0;
+    }
+    for (int i = 0; i < 2; i++) {
+        be[i] = (hi[i] - lo[i]) * 0.5f;
+        bc[i] = lo[i] + be[i];
+    }
+    be[2] = dz * 0.5f;
+    bc[2] = lo_z + be[2];
+}
+static int plane_culls(const Plane *p, const float *box)
+{
+    if (__builtin_fabsf(p->w) == __builtin_inff())
+        return 0;
+    const float ax = fabs_sel(p->x), ay = fabs_sel(p->y), az = fabs_sel(p->z);
+    float d = p->x * box[0];
+    d = d + box[1] * p->y;
+    d = d + box[2] * p->z;
+    float r = ax * box[3];
+    r = r + ay * box[4];
+    r = r + az * box[5];
+    return d + r < p->w;
+}
+
+static void render_pass_update(Ctx *c)
+{
+    const uint64_t RP = c->x[0];
+    if (!*(uint8_t *)G(RP + 0x258))
+        return;
+    const uint64_t saved_sp = c->sp, fr = saved_sp - 0x80;    /* campos +0, camdir +0x10, inverse +0x20 */
+    c->sp = fr;
+    for (uint32_t v = 0; v < 5; v++) {
+        const uint64_t cam = ld_ptr(RP + 0x10 + 8 * v);
+        if (!cam)
+            continue;
+        const uint32_t mask = *(uint8_t *)G(RP + 0x9);
+        const float *A = G(cam), *B = G(cam + 0x40);
+        /* camera position: the translation of B's inverse (the game's code) */
+        c->x[0] = cam + 0x40;
+        c->x[8] = fr + 0x20;
+        f_a33c0(c);
+        const float *Binv = G(fr + 0x20);
+        float *campos = G(fr), *camdir = G(fr + 0x10);
+        campos[0] = Binv[12]; campos[1] = Binv[13]; campos[2] = Binv[14];
+        memcpy(camdir, G(cam + 0x10c), 12);
+        /* M = B x A, by rows */
+        float M[4][4];
+        for (int r = 0; r < 4; r++)
+            for (int k = 0; k < 4; k++) {
+                float s = A[0 * 4 + k] * B[r * 4 + 0];
+                s = s + A[1 * 4 + k] * B[r * 4 + 1];
+                s = s + A[2 * 4 + k] * B[r * 4 + 2];
+                s = s + A[3 * 4 + k] * B[r * 4 + 3];
+                M[r][k] = s;
+            }
+        /* planes in the order they are tested */
+        Plane P[6];
+        make_plane(&P[0], M[0][3] - M[0][2], M[1][3] - M[1][2], M[2][3] - M[2][2], M[3][3] - M[3][2]);
+        make_plane(&P[1], M[0][2], M[1][2], M[2][2], M[3][2]);
+        make_plane(&P[2], M[0][3] + M[0][0], M[1][3] + M[1][0], M[2][3] + M[2][0], M[3][3] + M[3][0]);
+        make_plane(&P[3], M[0][3] - M[0][0], M[1][3] - M[1][0], M[2][3] - M[2][0], M[3][3] - M[3][0]);
+        make_plane(&P[4], M[0][3] - M[0][1], M[1][3] - M[1][1], M[2][3] - M[2][1], M[3][3] - M[3][1]);
+        make_plane(&P[5], M[0][3] + M[0][1], M[1][3] + M[1][1], M[2][3] + M[2][1], M[3][3] + M[3][1]);
+        /* bounds of all objects: empty */
+        float *ab = G(RP + 0xb0 + 0x18 * v);         /* center 3, extent 3 */
+        const float neg_max = hexf(0xfe7fffff);
+        ab[0] = ab[1] = ab[2] = 0.0f;
+        ab[3] = ab[4] = ab[5] = neg_max;
+        float vc[3] = { 0, 0, 0 }, ve[3] = { neg_max, neg_max, neg_max };
+        const uint32_t skip_flag = ((1u << v) & mask) ? 8 : 0;
+        uint32_t n = 0;
+        const uint64_t npages = ld_ptr(RP + 0x138);
+        for (uint64_t pg = 0; pg < npages; pg++) {
+            const uint64_t pages = ld_ptr(RP + 0x130);
+            uint32_t left = *(uint16_t *)G(pages + 0x6660 + 2 * pg);
+            if (!left)
+                continue;
+            const uint64_t page = ld_ptr(pages + 8 * pg);
+            for (uint64_t j = 0; left; j++) {
+                const uint64_t obj = ld_ptr(page + 8 * j);
+                if (!obj)
+                    continue;
+                left--;
+                const uint64_t boxa = page + 0x4800 + 0x18 * j;
+                const float *box = G(boxa);
+                grow_bounds(ab, ab + 3, box);
+                const uint8_t layer = *(uint8_t *)G(page + 8 * j + 0x6001);
+                if (!(*(uint8_t *)G(RP + 0x8) & layer))
+                    continue;
+                const uint64_t fa = page + 8 * j + 0x6000;
+                uint8_t f = *(uint8_t *)G(fa);
+                if (f & skip_flag)
+                    continue;
+                if (f & 1) {
+                    int culled = 0;
+                    for (int k = 0; k < 6 && !culled; k++)
+                        culled = plane_culls(&P[k], box);
+                    if (culled)
+                        continue;
+                }
+                if (n == ld_ptr(RP + 0x148)) {
+                    c->x[0] = RP;
+                    c->x[1] = (uint64_t)n * 2;
+                    f_1e0ca0(c);
+                    f = *(uint8_t *)G(fa);
+                }
+                uint32_t key;
+                if (f & 6) {
+                    key = (f >> 1 & 1) - 1u;
+                } else {
+                    c->x[0] = boxa;
+                    c->x[1] = fr;
+                    c->x[2] = fr + 0x10;
+                    c->x[3] = fa;                    /* the object's flags (ycRenderObjectFlags) */
+                    static const GuestFunc *ic;
+                    RT_CALL_IC(c, ld_ptr(RP + 0x128), ic);
+                    key = (uint32_t)c->x[0];
+                }
+                rt_st32(G(ld_ptr(RP + 0x1f0 + 8 * v) + 4 * (uint64_t)n), key);
+                const uint64_t o64 = obj;
+                memcpy(G(ld_ptr(RP + 0x218 + 8 * v) + 8 * (uint64_t)n), &o64, 8);
+                n++;
+                grow_bounds_vis(vc, ve, box);
+            }
+        }
+        float *vb = G(RP + 0x150 + 0x18 * v);
+        vb[0] = vc[0]; vb[1] = vc[1]; vb[2] = vc[2];
+        vb[3] = ve[0]; vb[4] = ve[1]; vb[5] = ve[2];
+        if (ld_ptr(RP + 0x128) != 0x11e0ae4 && n >= 2) {
+            /* bottom-up merge sort by key (ties: the right run first), two buffers */
+            const uint64_t o0 = ld_ptr(RP + 0x218 + 8 * v), k0 = ld_ptr(RP + 0x1f0 + 8 * v);
+            const uint64_t o1 = ld_ptr(RP + 0x248), k1 = ld_ptr(RP + 0x240);
+            uint64_t so = o0, sk = k0, dob = o1, dk = k1;
+            for (uint32_t w = 1;; w *= 2) {
+                for (uint32_t i = 0; i < n;) {
+                    const uint32_t mid = i + w < n ? i + w : n, end = i + 2 * w < n ? i + 2 * w : n;
+                    uint32_t a = i, b = mid, d = i;
+                    while (d < end) {
+                        int take_left;
+                        uint32_t ka = 0, kb = 0;
+                        if (a < mid) {
+                            ka = rt_ld32(G(sk + 4 * (uint64_t)a));
+                            take_left = b < end ? (kb = rt_ld32(G(sk + 4 * (uint64_t)b)), ka < kb) : 1;
+                        } else {
+                            take_left = 0;
+                        }
+                        if (take_left) {
+                            memcpy(G(dob + 8 * (uint64_t)d), G(so + 8 * (uint64_t)a), 8);
+                            rt_st32(G(dk + 4 * (uint64_t)d), ka);
+                            a++;
+                        } else {
+                            kb = rt_ld32(G(sk + 4 * (uint64_t)b));
+                            memcpy(G(dob + 8 * (uint64_t)d), G(so + 8 * (uint64_t)b), 8);
+                            rt_st32(G(dk + 4 * (uint64_t)d), kb);
+                            b++;
+                        }
+                        d++;
+                    }
+                    i = i + 2 * w;
+                }
+                uint64_t t;
+                t = so; so = dob; dob = t;
+                t = sk; sk = dk; dk = t;
+                if (2 * w >= n)
+                    break;
+            }
+            if (so != o0) {
+                memcpy(G(o0), G(o1), 8 * (size_t)n);
+                memcpy(G(k0), G(k1), 4 * (size_t)n);
+            }
+        }
+        memcpy(G(RP + 0x1c8 + 8 * v), &(uint64_t){ n }, 8);
+    }
+    c->sp = saved_sp;
+}
+void nat__ZN12ycRenderPass6UpdateEv(Ctx *c)
+{
+    static int off = -1;
+    if (off < 0)
+        off = getenv("MINA_NO_NATIVE_RPU") != NULL;
+    if (off) {
+        f_1e13ac_orig(c);
+        return;
+    }
+    if (verify_xform()) {
+        /* the pass and the view lists it writes */
+        static uint8_t before[0x260], mine[0x260];
+        static uint32_t checked, bad;
+        const uint64_t RP = c->x[0];
+        memcpy(before, G(RP), sizeof before);
+        Ctx save = *c;
+        render_pass_update(c);
+        memcpy(mine, G(RP), sizeof mine);
+        uint64_t lists[5][2];
+        static uint8_t mo[5][4096 * 8], mk[5][4096 * 4];
+        uint32_t cnt[5];
+        for (int v = 0; v < 5; v++) {
+            cnt[v] = ld_ptr(RP + 0x10 + 8 * v) ? (uint32_t)ld_ptr(RP + 0x1c8 + 8 * v) : 0;
+            if (cnt[v] > 4096) cnt[v] = 4096;
+            lists[v][0] = ld_ptr(RP + 0x218 + 8 * v);
+            lists[v][1] = ld_ptr(RP + 0x1f0 + 8 * v);
+            if (cnt[v]) {
+                memcpy(mo[v], G(lists[v][0]), 8 * cnt[v]);
+                memcpy(mk[v], G(lists[v][1]), 4 * cnt[v]);
+            }
+        }
+        /* the lists grew (reallocated): the game's code would free them again */
+        if (memcmp(before + 0x1f0, mine + 0x1f0, 0x60) != 0)
+            return;
+        memcpy(G(RP), before, sizeof before);
+        *c = save;
+        f_1e13ac_orig(c);
+        checked++;
+        int diff = memcmp(mine, G(RP), sizeof mine) != 0;
+        for (int v = 0; v < 5 && !diff; v++)
+            if (cnt[v] && (memcmp(mo[v], G(ld_ptr(RP + 0x218 + 8 * v)), 8 * cnt[v]) ||
+                           memcmp(mk[v], G(ld_ptr(RP + 0x1f0 + 8 * v)), 4 * cnt[v])))
+                diff = 2;
+        if (diff && bad++ < 10) {
+            size_t i = 0;
+            while (i < sizeof mine && mine[i] == ((uint8_t *)G(RP))[i])
+                i++;
+            rt_log("[verify] RenderPass::Update differs (%s, first byte %#zx)\n", diff == 2 ? "lists" : "pass", i);
+        }
+        if ((checked & 0x3ff) == 0)
+            rt_log("[verify] RenderPass::Update: %u calls checked, %u differ\n", checked, bad);
+        return;
+    }
+    render_pass_update(c);
+}
