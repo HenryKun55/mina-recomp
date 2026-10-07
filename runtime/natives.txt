@@ -66,3 +66,7 @@ __ZN7ycAudio7Decoder9ycOggReadEPvmmS1_
 _ov_open_callbacks
 __ZN7ycAudio11FileManager10LoadEventsEPNS_10BankHandleEP15ycAudioItemBaseb
 __ZN7ycAudio11FileManager11CacheEventsEPKNS_10BankHandleEP15ycAudioItemBaseb
+
+# Game code (runtime/src/game.c)
+__ZN4Game11FixedUpdateEv
+__ZN4Game6UpdateEf

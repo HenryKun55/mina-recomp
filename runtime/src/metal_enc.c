@@ -77,6 +77,7 @@ typedef struct REnc {
     int vp_set, sc_set;
     int to_display;                      /* Vita: the drawable's pass draws to the screen */
     int folded;                          /* Vita: its copy was folded (fold_pass), nothing drawn yet */
+    struct MTexture *ftex_folded;        /* the copy's source */
     double vp[6];
     int sc[4];
 } REnc;
@@ -202,13 +203,22 @@ static void fold_drop(MTexture *x)
 static void fold_draw(MTexture *x)
 {
     MTexture *src = x->read_alias;
+    if (g_framelog)
+        rt_log("[frame %d]   (fold drawn: #%04x from #%04x)\n", g_framelog, (unsigned)(((uintptr_t)x >> 4) & 0xffff),
+               (unsigned)(((uintptr_t)src >> 4) & 0xffff));
     fold_drop(x);
+    /* folding it only to draw it later saves nothing: not again */
+    if (!x->no_fold) {
+        x->no_fold = 1;
+        rt_log("metal: a folded %ux%u copy is needed whole: that texture is not folded again\n", x->width, x->height);
+    }
     GLuint fbo = metal_tex_fbo(x, 0);
     glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glViewport(0, 0, (GLsizei)x->width, (GLsizei)x->height);
     glDisable(GL_SCISSOR_TEST);
-    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
+    static const GLfloat black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glClearBufferfv(GL_COLOR, 0, black);
     g_copy_rgb = 1;
     vita_copy_quad(src, 0, 0, (float)src->width, (float)src->height, fbo, 0, 0, (GLsizei)x->width,
                    (GLsizei)x->height, 0);
@@ -340,6 +350,7 @@ static int fold_pass(REnc *e, MPipeline *p, uint32_t count, uint32_t instances)
     x->read_alias = t;
     folds[nfolds++] = x;
     e->folded = 1;
+    e->ftex_folded = t;
     if (g_framelog)
         rt_log("[frame %d]   (folded: #%04x reads as #%04x)\n", g_framelog, (unsigned)(((uintptr_t)x >> 4) & 0xffff),
                (unsigned)(((uintptr_t)t >> 4) & 0xffff));
@@ -356,8 +367,7 @@ static void fold_pass_targets(REnc *e)
         fold_source_changes(x);
         if (x->read_alias) {
             if (e->folded && i == 0) {
-                fold_draw(x);           /* more draws after the folded copy: it is needed */
-                e->clear_mask &= ~1u;
+                fold_drop(x);           /* more draws after the folded copy: drawn in the pass (pass_begin) */
             } else if (e->clear_mask & (1u << i)) {
                 fold_drop(x);
             } else {
@@ -372,7 +382,6 @@ static void fold_pass_targets(REnc *e)
         if (e->resolve[i])
             metal_fold_write(e->resolve[i]);
     }
-    e->folded = 0;
 }
 
 /* before a draw: textures read whole are drawn now (colour-only reads take the
@@ -487,6 +496,22 @@ static void pass_begin(REnc *e)
     glDepthRange(-1.0, 1.0);      /* the default Metal viewport (see apply_viewport) */
     glEnable(GL_SCISSOR_TEST);
     glScissor(0, 0, (GLsizei)e->tw, (GLsizei)e->th);
+#endif
+#if defined(__vita__)
+    if (e->folded) {
+        /* the copy folded at the pass's first draw, then more draws: it is drawn
+         * first after all (over the clear: colour from the source, alpha 1) */
+        MTexture *src = e->ftex_folded;
+        e->folded = 0;
+        g_copy_rgb = 1;
+        vita_copy_quad(src, 0, 0, (float)src->width, (float)src->height, e->fbo, 0, 0, (GLsizei)e->tw,
+                       (GLsizei)e->th, 0);
+        g_copy_rgb = 0;
+        glViewport(0, 0, (GLsizei)e->tw, (GLsizei)e->th);
+        glDepthRange(-1.0, 1.0);
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(0, 0, (GLsizei)e->tw, (GLsizei)e->th);
+    }
 #endif
     if (e->vp_set)
         apply_viewport(e);

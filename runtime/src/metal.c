@@ -1631,9 +1631,15 @@ void metal_present(uint64_t drawable)
                 window = t1;
             frames++;
             if (t1 - window >= 2000000) {
-                rt_log("[fps] %.1f fps, %.1f ms/frame (worst %.1f), %.1f ms of it waiting in swap\n",
+                extern uint32_t g_fixed_updates, g_updates;
+                extern uint64_t g_fixed_us, g_update_us;
+                rt_log("[fps] %.1f fps, %.1f ms/frame (worst %.1f), %.1f ms of it waiting in swap; "
+                       "%.2f updates (%.1f ms), %.2f fixed updates (%.1f ms) per frame\n",
                        frames * 1e6 / (double)(t1 - window), (t1 - window) / 1000.0 / frames, frame_max / 1000.0,
-                       swap_us / 1000.0 / frames);
+                       swap_us / 1000.0 / frames, g_updates / (double)frames, g_update_us / 1000.0 / frames,
+                       g_fixed_updates / (double)frames, g_fixed_us / 1000.0 / frames);
+                g_updates = g_fixed_updates = 0;
+                g_fixed_us = g_update_us = 0;
                 if (getenv("MINA_OBJSTATS")) {
                     void objc_stats(void);
                     objc_stats();
