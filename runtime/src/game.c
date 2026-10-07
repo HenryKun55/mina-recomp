@@ -19,6 +19,15 @@ static uint64_t now_us(void)
 }
 #endif
 
+/* Hot natives read the guest memory base once (GM_BEGIN): through the global
+ * the compiler reloads it after every store to guest memory. A guest pointer's
+ * low 32 bits are the address. */
+#define GM_BEGIN uint8_t *const gm_ = g_mem
+#define GP(a) ((void *)(gm_ + (uint32_t)(a)))
+#define lp(a) ((uint64_t)rt_ld32(GP(a)))
+#define ldfp(a) ({ float f_; memcpy(&f_, GP(a), 4); f_; })
+#define stfp(a, v) do { float f_ = (v); memcpy(GP(a), &f_, 4); } while (0)
+
 /* MINA_FPS: fixed updates (Game::FixedUpdate) and updates per presented frame,
  * and the time spent in them */
 uint32_t g_fixed_updates, g_updates;
@@ -204,11 +213,12 @@ static inline void minmax(float lo, float hi, float *mn, float *mx)
 }
 static void update_bounds(Ctx *c)
 {
+    GM_BEGIN;
     const uint64_t self = c->x[0];
-    const float *m = G(ld_ptr(self + 0x60));
+    const float *m = GP(lp(self + 0x60));
     float box[6];
-    uint64_t src = ld_ptr(self + 0x40) ? ld_ptr(self + 0x48) : 0;
-    const float *b = src ? G(src + 0x30) : NULL;
+    uint64_t src = lp(self + 0x40) ? lp(self + 0x48) : 0;
+    const float *b = src ? GP(src + 0x30) : NULL;
     float hw = 0, hh = 0;
     if (b) {
         hw = b[2] * 0.5f;
@@ -238,12 +248,12 @@ static void update_bounds(Ctx *c)
             box[3 + a] = e;
         }
     }
-    memcpy(G(ld_ptr(self + 0x80)), box, sizeof box);
+    memcpy(GP(lp(self + 0x80)), box, sizeof box);
     for (int k = 1; k < 4; k++) {
-        uint64_t p = ld_ptr(self + 0x80 + 8 * k);
+        uint64_t p = lp(self + 0x80 + 8 * k);
         if (!p)
             break;
-        memcpy(G(p), box, sizeof box);
+        memcpy(GP(p), box, sizeof box);
     }
 }
 void f_d3e24_orig(Ctx *c);
@@ -295,20 +305,21 @@ void f_87363c_orig(Ctx *c);
 static void calc_transform_p(Ctx *c, XForm *o, uint64_t pa, const XForm *ap, const XForm *bp, uint64_t flags,
                              uint32_t w5, uint32_t w6)
 {
-    const uint32_t mode = w5 ? rt_ld32(G(pa + 0xc)) : 0;
+    GM_BEGIN;
+    const uint32_t mode = w5 ? rt_ld32(GP(pa + 0xc)) : 0;
     if (!mode) {
         compose(o, ap, bp, flags);
         return;
     }
-    const float *p = G(pa);
+    const float *p = GP(pa);
     XForm b = *bp;
     const float bz = b.t[2];
     const float ty = w6 ? b.t[1] : -0.0f;
     /* GetIsoDepth(x0 = P+0x18, x1 = mode, s0 = A.t[1] + P[0] + (B.t[1] or -0), s1 = P[4], s2 = P[2]) */
-    const float depth = iso_depth(ld_ptr(pa + 0x18), mode, (ap->t[1] + p[0]) + ty, p[4], p[2]);
+    const float depth = iso_depth(lp(pa + 0x18), mode, (ap->t[1] + p[0]) + ty, p[4], p[2]);
     b.t[2] = depth - p[1];
     XForm a = *ap;
-    const uint32_t pflags = rt_ld32(G(pa + 0x14));
+    const uint32_t pflags = rt_ld32(GP(pa + 0x14));
     const float az = (a.t[2] < 0.0f && (pflags >> 8 & 1)) ? 0.0f : a.t[2];
     a.t[2] = az;
     if (mode == 1) {
@@ -346,106 +357,107 @@ static inline void stf(uint64_t a, float f) { memcpy(G(a), &f, 4); }
 void f_9a65c4_orig(Ctx *c);
 static void recalc_world_transform(Ctx *c)
 {
+    GM_BEGIN;
     const uint64_t O = c->x[0];
-    const XForm *W = G(c->x[1]);
+    const XForm *W = GP(c->x[1]);
     const uint64_t saved_sp = c->sp;
     const uint64_t sp = saved_sp - 0xf0;
     c->sp = sp;
-    XForm *L = G(sp + 0x8), *Wc = G(sp + 0x30), *R = G(sp + 0x60);
+    XForm *L = GP(sp + 0x8), *Wc = GP(sp + 0x30), *R = GP(sp + 0x60);
 
-    const uint64_t par = ld_ptr(O + 0x200);
-    if (par && !(*(uint8_t *)G(O + 0x1f8) & 2)) {
-        rt_st32(G(O + 0x1dc), rt_ld32(G(par + 0xbc)));
-        rt_st32(G(O + 0x1e4), rt_ld32(G(O + 0x1e4)) | 0x20);
+    const uint64_t par = lp(O + 0x200);
+    if (par && !(*(uint8_t *)GP(O + 0x1f8) & 2)) {
+        rt_st32(GP(O + 0x1dc), rt_ld32(GP(par + 0xbc)));
+        rt_st32(GP(O + 0x1e4), rt_ld32(GP(O + 0x1e4)) | 0x20);
     }
-    const float s8 = ldf(O + 0x1d8);
-    uint32_t w22 = rt_ld32(G(O + 0x1e4));
+    const float s8 = ldfp(O + 0x1d8);
+    uint32_t w22 = rt_ld32(GP(O + 0x1e4));
     float s11 = s8;
-    if ((w22 & (1u << 20)) && rt_ld32(G(O + 0x1dc)) != 4) {
+    if ((w22 & (1u << 20)) && rt_ld32(GP(O + 0x1dc)) != 4) {
         s11 = -s8;
-        stf(O + 0x1d8, s11);
+        stfp(O + 0x1d8, s11);
     }
-    const float s9 = ldf(O + 0x1d0), s10 = ldf(O + 0x1e0);
+    const float s9 = ldfp(O + 0x1d0), s10 = ldfp(O + 0x1e0);
 
     /* the layer: O+0x1e0 (when 0) from the depth of the parent's or own sprite */
     int layer = 0;            /* 0: keep, 1: from x8 below, 2: 1.0 */
     uint64_t x8 = 0;
     if (par) {
-        compose(R, G(par + 0x78), G(O + 0x180), ld_ptr(O + 0x18));
-        const uint32_t f = rt_ld32(G(O + 0x1f8));
+        compose(R, GP(par + 0x78), GP(O + 0x180), lp(O + 0x18));
+        const uint32_t f = rt_ld32(GP(O + 0x1f8));
         if (!(f & 1))
-            stf(O + 0x1d0, ldf(par + 0xc0) + s9);
+            stfp(O + 0x1d0, ldfp(par + 0xc0) + s9);
         if (!(f & 2)) {
-            rt_st32(G(O + 0x1dc), rt_ld32(G(par + 0xbc)));
+            rt_st32(GP(O + 0x1dc), rt_ld32(GP(par + 0xbc)));
             w22 |= 0x20;
-            rt_st32(G(O + 0x1e4), w22);
-            stf(O + 0x1d8, ldf(par + 0xc4) + s11);
+            rt_st32(GP(O + 0x1e4), w22);
+            stfp(O + 0x1d8, ldfp(par + 0xc4) + s11);
         }
         if (f & 0x20) {
             if (s10 == 0.0f) {
-                x8 = ld_ptr(O + 0x248);
-                layer = x8 && !(*(uint8_t *)G(O + 0x1f8) & 0x40) ? 1 : 2;
+                x8 = lp(O + 0x248);
+                layer = x8 && !(*(uint8_t *)GP(O + 0x1f8) & 0x40) ? 1 : 2;
                 if (!x8)
                     layer = 3;               /* 1.0 stored as is */
                 else if (layer == 2)
                     layer = 3;
             }
         } else {
-            x8 = ld_ptr(par + 0x50);
+            x8 = lp(par + 0x50);
             layer = x8 ? 1 : 2;
         }
     } else {
-        *R = *(const XForm *)G(O + 0x180);
+        *R = *(const XForm *)GP(O + 0x180);
         if (s10 == 0.0f) {
-            x8 = ld_ptr(O + 0x248);
-            layer = x8 && !(*(uint8_t *)G(O + 0x1f8) & 0x40) ? 1 : 3;
+            x8 = lp(O + 0x248);
+            layer = x8 && !(*(uint8_t *)GP(O + 0x1f8) & 0x40) ? 1 : 3;
         }
     }
     if (layer) {
         float v = 1.0f;
         if (layer == 1) {
-            int32_t d = (int32_t)rt_ld32(G(x8 + 0x15c));
+            int32_t d = (int32_t)rt_ld32(GP(x8 + 0x15c));
             if (d > 10)
                 d -= 10;
             d += 2;
             v = (float)(int32_t)((float)d * 0.5f);
         }
-        stf(O + 0x1e0, layer == 3 ? v : s10 + v);
+        stfp(O + 0x1e0, layer == 3 ? v : s10 + v);
     }
 
     *Wc = *W;
-    if (*(uint8_t *)G(O + 0x1cb)) {
+    if (*(uint8_t *)GP(O + 0x1cb)) {
         /* whole pixels: floor(t * k0 + 0.5) * k1 */
-        const float k0 = ldf(0x6039f5c), k1 = ldf(0x6039f58);
+        const float k0 = ldfp(0x6039f5c), k1 = ldfp(0x6039f58);
         for (int i = 0; i < 2; i++) {
             Wc->t[i] = floorf(Wc->t[i] * k0 + 0.5f) * k1;
             R->t[i] = floorf(R->t[i] * k0 + 0.5f) * k1;
         }
     }
-    memcpy(G(O + 0x274), R->t, 12);
-    calc_transform_p(c, L, O + 0x1d0, Wc, R, ld_ptr(O + 0x18), w22 >> 4 & 1, w22 >> 2 & 1);
-    memcpy(G(O + 0x25c), L->t, 12);
-    stf(sp + 4, 0.0f);
+    memcpy(GP(O + 0x274), R->t, 12);
+    calc_transform_p(c, L, O + 0x1d0, Wc, R, lp(O + 0x18), w22 >> 4 & 1, w22 >> 2 & 1);
+    memcpy(GP(O + 0x25c), L->t, 12);
+    stfp(sp + 4, 0.0f);
     float hook = 0.0f;
-    const uint64_t h = ld_ptr(O + 0x2b8);
+    const uint64_t h = lp(O + 0x2b8);
     if (h) {
-        *(uint8_t *)G(sp + 3) = 0;
-        c->v[0] = vset_f32((rt_ld32(G(O + 0x1e4)) & 0x1000000) ? -0.8f : 0.0f);
+        *(uint8_t *)GP(sp + 3) = 0;
+        c->v[0] = vset_f32((rt_ld32(GP(O + 0x1e4)) & 0x1000000) ? -0.8f : 0.0f);
         c->x[0] = h;
         c->x[1] = O;
         c->x[2] = sp + 0x8 + 0x1c;
         c->x[3] = sp + 0x8 + 0x10;
         c->x[4] = sp + 4;
         c->x[5] = sp + 3;
-        rt_call(c, ld_ptr(ld_ptr(h) + 0x60));
-        if (!(*(uint8_t *)G(O + 0x1e6) & 0x20)) {
-            const float step = *(uint8_t *)G(sp + 3) ? 10.0f : -10.0f;
-            if (ldf(O + 0x1e0) == 1.0f)
+        rt_call(c, lp(lp(h) + 0x60));
+        if (!(*(uint8_t *)GP(O + 0x1e6) & 0x20)) {
+            const float step = *(uint8_t *)GP(sp + 3) ? 10.0f : -10.0f;
+            if (ldfp(O + 0x1e0) == 1.0f)
                 L->t[2] = L->t[2] + step;
         }
-        hook = ldf(sp + 4);
+        hook = ldfp(sp + 4);
     }
-    memcpy(G(O + 0x268), L->t, 12);
+    memcpy(GP(O + 0x268), L->t, 12);
 
     /* rotation (L.q) x scale (L.s), translation (L.t) */
     const float x = L->q[0], y = L->q[1], z = L->q[2], w = L->q[3];
@@ -463,25 +475,25 @@ static void recalc_world_transform(Ctx *c)
     const float sx = L->s[0], sy = L->s[1], sz = L->s[2];
     const float m[16] = { m00 * sx, m01 * sx, m02 * sx, 0.0f * sx, m10 * sy, m11 * sy, m12 * sy, 0.0f * sy,
                           m20 * sz, m21 * sz, m22 * sz, 0.0f * sz, L->t[0], L->t[1], L->t[2], 1.0f };
-    stf(ld_ptr(O + 0xa0) + 4, hook);
+    stfp(lp(O + 0xa0) + 4, hook);
     for (int k = 1; k < 4; k++) {
-        uint64_t p = ld_ptr(O + 0xa0 + 8 * k);
+        uint64_t p = lp(O + 0xa0 + 8 * k);
         if (!p)
             break;
-        stf(p + 4, hook);
+        stfp(p + 4, hook);
     }
-    memcpy(G(ld_ptr(O + 0x60)), m, sizeof m);
+    memcpy(GP(lp(O + 0x60)), m, sizeof m);
     for (int k = 1; k < 4; k++) {
-        uint64_t p = ld_ptr(O + 0x60 + 8 * k);
+        uint64_t p = lp(O + 0x60 + 8 * k);
         if (!p)
             break;
-        memcpy(G(p), m, sizeof m);
+        memcpy(GP(p), m, sizeof m);
     }
     c->x[0] = O;
     update_bounds(c);
-    stf(O + 0x1e0, s10);
-    stf(O + 0x1d0, s9);
-    stf(O + 0x1d8, s8);
+    stfp(O + 0x1e0, s10);
+    stfp(O + 0x1d0, s9);
+    stfp(O + 0x1d8, s8);
     c->sp = saved_sp;
 }
 /* what it writes: the object, its 4 matrices, the 4 hook floats, the 4 boxes */
@@ -549,48 +561,49 @@ void nat__ZN8GameAnim20RecalcWorldTransformERK11ycTransformS2_(Ctx *c)
 void f_1cb43c_orig(Ctx *c);
 static void refresh_world_transform(Ctx *c)
 {
+    GM_BEGIN;
     const uint64_t E = c->x[0];
     const uint64_t saved_sp = c->sp, sp = saved_sp - 0xb0;
     c->sp = sp;
-    XForm *world = G(E + 0xc0);
-    XForm *P = G(sp), *prev = G(sp + 0x50);
+    XForm *world = GP(E + 0xc0);
+    XForm *P = GP(sp), *prev = GP(sp + 0x50);
     *prev = *world;
-    uint64_t flags = ld_ptr(E + 0x18);
+    uint64_t flags = lp(E + 0x18);
     if (!(flags & 1)) {
-        *world = *(const XForm *)G(E + 0x80);
+        *world = *(const XForm *)GP(E + 0x80);
     } else {
-        const uint64_t prov = ld_ptr(E + 0x60);
+        const uint64_t prov = lp(E + 0x60);
         if (prov) {
             static const GuestFunc *ic;
             c->x[0] = prov;
             c->x[8] = sp;                        /* the transform comes back at sp */
-            RT_CALL_IC(c, ld_ptr(ld_ptr(prov)), ic);
-            flags = ld_ptr(E + 0x18);
+            RT_CALL_IC(c, lp(lp(prov)), ic);
+            flags = lp(E + 0x18);
         } else {
-            const uint64_t parent = ld_ptr(E + 0x10);
+            const uint64_t parent = lp(E + 0x10);
             if (parent) {
-                *P = *(const XForm *)G(parent + 0xc0);
+                *P = *(const XForm *)GP(parent + 0xc0);
             } else {
-                memcpy(P, G(0x1d48610), 16);       /* identity: the game's constants */
-                memcpy((uint8_t *)P + 16, G(0x1d486d0), 16);
+                memcpy(P, GP(0x1d48610), 16);       /* identity: the game's constants */
+                memcpy((uint8_t *)P + 16, GP(0x1d486d0), 16);
                 memset((uint8_t *)P + 32, 0, 8);
             }
         }
         XForm r;
-        compose(&r, P, G(E + 0x80), flags);
+        compose(&r, P, GP(E + 0x80), flags);
         *world = r;
     }
-    for (uint64_t page = ld_ptr(E + 0x38); page; page = ld_ptr(page + 0x8)) {
-        for (uint32_t i = 0; i < ld_ptr(page + 0x10); i++) {
-            const uint64_t comp = ld_ptr(page + 0x18 + 8 * (uint64_t)i);
-            const uint64_t f = ld_ptr(comp + 0x18);
+    for (uint64_t page = lp(E + 0x38); page; page = lp(page + 0x8)) {
+        for (uint32_t i = 0; i < lp(page + 0x10); i++) {
+            const uint64_t comp = lp(page + 0x18 + 8 * (uint64_t)i);
+            const uint64_t f = lp(comp + 0x18);
             if (!(f & 1) || (f & 0x3000) == 0x1000)
                 continue;
             static const GuestFunc *ic;
             c->x[0] = comp;
             c->x[1] = E + 0xc0;
             c->x[2] = sp + 0x50;
-            RT_CALL_IC(c, ld_ptr(ld_ptr(comp) + 0x48), ic);
+            RT_CALL_IC(c, lp(lp(comp) + 0x48), ic);
         }
     }
     c->sp = saved_sp;
@@ -607,6 +620,7 @@ static inline float hexf(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
 void f_873480_orig(Ctx *c);
 static float iso_depth(uint64_t comp, uint32_t mode, float a, float b, float cc)
 {
+    GM_BEGIN;
     float s3 = (cc + 10.0f) / 20.0f;
     s3 = fmin_f32(s3, 1.0f);
     s3 = fmax_f32(s3, 0.0f);
@@ -627,13 +641,13 @@ static float iso_depth(uint64_t comp, uint32_t mode, float a, float b, float cc)
     case 11:
         s0 = s3 * hexf(0x3db851e8); s2 = hexf(0x3f4ccccd); break;
     default: {
-        const uint64_t lv = ld_ptr(ld_ptr(ld_ptr(comp + 0x10) + 0x50) + 0x16c0);
+        const uint64_t lv = lp(lp(lp(comp + 0x10) + 0x50) + 0x16c0);
         const uint64_t q = lv + 0x6a88;
-        const uint32_t k = rt_ld32(G(q + 0x58));
+        const uint32_t k = rt_ld32(GP(q + 0x58));
         const uint64_t p = (k != 3 && k != 0) ? q + 0x60 : q;
-        const float cam = ldf(lv + 0x138);
-        const float lo = cam + ldf(p);
-        float span = (ldf(p) - cam) - lo;
+        const float cam = ldfp(lv + 0x138);
+        const float lo = cam + ldfp(p);
+        float span = (ldfp(p) - cam) - lo;
         float d = a - lo;
         float m = span > 0.0f ? span : -span;
         m = fmaxnm_f32(m, hexf(0x322bcc77));
@@ -771,25 +785,26 @@ static int plane_culls(const Plane *p, const float *box)
 
 static void render_pass_update(Ctx *c)
 {
+    GM_BEGIN;
     const uint64_t RP = c->x[0];
-    if (!*(uint8_t *)G(RP + 0x258))
+    if (!*(uint8_t *)GP(RP + 0x258))
         return;
     const uint64_t saved_sp = c->sp, fr = saved_sp - 0x80;    /* campos +0, camdir +0x10, inverse +0x20 */
     c->sp = fr;
     for (uint32_t v = 0; v < 5; v++) {
-        const uint64_t cam = ld_ptr(RP + 0x10 + 8 * v);
+        const uint64_t cam = lp(RP + 0x10 + 8 * v);
         if (!cam)
             continue;
-        const uint32_t mask = *(uint8_t *)G(RP + 0x9);
-        const float *A = G(cam), *B = G(cam + 0x40);
+        const uint32_t mask = *(uint8_t *)GP(RP + 0x9);
+        const float *A = GP(cam), *B = GP(cam + 0x40);
         /* camera position: the translation of B's inverse (the game's code) */
         c->x[0] = cam + 0x40;
         c->x[8] = fr + 0x20;
         f_a33c0(c);
-        const float *Binv = G(fr + 0x20);
-        float *campos = G(fr), *camdir = G(fr + 0x10);
+        const float *Binv = GP(fr + 0x20);
+        float *campos = GP(fr), *camdir = GP(fr + 0x10);
         campos[0] = Binv[12]; campos[1] = Binv[13]; campos[2] = Binv[14];
-        memcpy(camdir, G(cam + 0x10c), 12);
+        memcpy(camdir, GP(cam + 0x10c), 12);
         /* M = B x A, by rows */
         float M[4][4];
         for (int r = 0; r < 4; r++)
@@ -809,33 +824,33 @@ static void render_pass_update(Ctx *c)
         make_plane(&P[4], M[0][3] - M[0][1], M[1][3] - M[1][1], M[2][3] - M[2][1], M[3][3] - M[3][1]);
         make_plane(&P[5], M[0][3] + M[0][1], M[1][3] + M[1][1], M[2][3] + M[2][1], M[3][3] + M[3][1]);
         /* bounds of all objects: empty */
-        float *ab = G(RP + 0xb0 + 0x18 * v);         /* center 3, extent 3 */
+        float *ab = GP(RP + 0xb0 + 0x18 * v);         /* center 3, extent 3 */
         const float neg_max = hexf(0xfe7fffff);
         ab[0] = ab[1] = ab[2] = 0.0f;
         ab[3] = ab[4] = ab[5] = neg_max;
         float vc[3] = { 0, 0, 0 }, ve[3] = { neg_max, neg_max, neg_max };
         const uint32_t skip_flag = ((1u << v) & mask) ? 8 : 0;
         uint32_t n = 0;
-        const uint64_t npages = ld_ptr(RP + 0x138);
+        const uint64_t npages = lp(RP + 0x138);
         for (uint64_t pg = 0; pg < npages; pg++) {
-            const uint64_t pages = ld_ptr(RP + 0x130);
-            uint32_t left = *(uint16_t *)G(pages + 0x6660 + 2 * pg);
+            const uint64_t pages = lp(RP + 0x130);
+            uint32_t left = *(uint16_t *)GP(pages + 0x6660 + 2 * pg);
             if (!left)
                 continue;
-            const uint64_t page = ld_ptr(pages + 8 * pg);
+            const uint64_t page = lp(pages + 8 * pg);
             for (uint64_t j = 0; left; j++) {
-                const uint64_t obj = ld_ptr(page + 8 * j);
+                const uint64_t obj = lp(page + 8 * j);
                 if (!obj)
                     continue;
                 left--;
                 const uint64_t boxa = page + 0x4800 + 0x18 * j;
-                const float *box = G(boxa);
+                const float *box = GP(boxa);
                 grow_bounds(ab, ab + 3, box);
-                const uint8_t layer = *(uint8_t *)G(page + 8 * j + 0x6001);
-                if (!(*(uint8_t *)G(RP + 0x8) & layer))
+                const uint8_t layer = *(uint8_t *)GP(page + 8 * j + 0x6001);
+                if (!(*(uint8_t *)GP(RP + 0x8) & layer))
                     continue;
                 const uint64_t fa = page + 8 * j + 0x6000;
-                uint8_t f = *(uint8_t *)G(fa);
+                uint8_t f = *(uint8_t *)GP(fa);
                 if (f & skip_flag)
                     continue;
                 if (f & 1) {
@@ -845,11 +860,11 @@ static void render_pass_update(Ctx *c)
                     if (culled)
                         continue;
                 }
-                if (n == ld_ptr(RP + 0x148)) {
+                if (n == lp(RP + 0x148)) {
                     c->x[0] = RP;
                     c->x[1] = (uint64_t)n * 2;
                     f_1e0ca0(c);
-                    f = *(uint8_t *)G(fa);
+                    f = *(uint8_t *)GP(fa);
                 }
                 uint32_t key;
                 if (f & 6) {
@@ -860,23 +875,23 @@ static void render_pass_update(Ctx *c)
                     c->x[2] = fr + 0x10;
                     c->x[3] = fa;                    /* the object's flags (ycRenderObjectFlags) */
                     static const GuestFunc *ic;
-                    RT_CALL_IC(c, ld_ptr(RP + 0x128), ic);
+                    RT_CALL_IC(c, lp(RP + 0x128), ic);
                     key = (uint32_t)c->x[0];
                 }
-                rt_st32(G(ld_ptr(RP + 0x1f0 + 8 * v) + 4 * (uint64_t)n), key);
+                rt_st32(GP(lp(RP + 0x1f0 + 8 * v) + 4 * (uint64_t)n), key);
                 const uint64_t o64 = obj;
-                memcpy(G(ld_ptr(RP + 0x218 + 8 * v) + 8 * (uint64_t)n), &o64, 8);
+                memcpy(GP(lp(RP + 0x218 + 8 * v) + 8 * (uint64_t)n), &o64, 8);
                 n++;
                 grow_bounds_vis(vc, ve, box);
             }
         }
-        float *vb = G(RP + 0x150 + 0x18 * v);
+        float *vb = GP(RP + 0x150 + 0x18 * v);
         vb[0] = vc[0]; vb[1] = vc[1]; vb[2] = vc[2];
         vb[3] = ve[0]; vb[4] = ve[1]; vb[5] = ve[2];
-        if (ld_ptr(RP + 0x128) != 0x11e0ae4 && n >= 2) {
+        if (lp(RP + 0x128) != 0x11e0ae4 && n >= 2) {
             /* bottom-up merge sort by key (ties: the right run first), two buffers */
-            const uint64_t o0 = ld_ptr(RP + 0x218 + 8 * v), k0 = ld_ptr(RP + 0x1f0 + 8 * v);
-            const uint64_t o1 = ld_ptr(RP + 0x248), k1 = ld_ptr(RP + 0x240);
+            const uint64_t o0 = lp(RP + 0x218 + 8 * v), k0 = lp(RP + 0x1f0 + 8 * v);
+            const uint64_t o1 = lp(RP + 0x248), k1 = lp(RP + 0x240);
             uint64_t so = o0, sk = k0, dob = o1, dk = k1;
             for (uint32_t w = 1;; w *= 2) {
                 for (uint32_t i = 0; i < n;) {
@@ -886,19 +901,19 @@ static void render_pass_update(Ctx *c)
                         int take_left;
                         uint32_t ka = 0, kb = 0;
                         if (a < mid) {
-                            ka = rt_ld32(G(sk + 4 * (uint64_t)a));
-                            take_left = b < end ? (kb = rt_ld32(G(sk + 4 * (uint64_t)b)), ka < kb) : 1;
+                            ka = rt_ld32(GP(sk + 4 * (uint64_t)a));
+                            take_left = b < end ? (kb = rt_ld32(GP(sk + 4 * (uint64_t)b)), ka < kb) : 1;
                         } else {
                             take_left = 0;
                         }
                         if (take_left) {
-                            memcpy(G(dob + 8 * (uint64_t)d), G(so + 8 * (uint64_t)a), 8);
-                            rt_st32(G(dk + 4 * (uint64_t)d), ka);
+                            memcpy(GP(dob + 8 * (uint64_t)d), GP(so + 8 * (uint64_t)a), 8);
+                            rt_st32(GP(dk + 4 * (uint64_t)d), ka);
                             a++;
                         } else {
-                            kb = rt_ld32(G(sk + 4 * (uint64_t)b));
-                            memcpy(G(dob + 8 * (uint64_t)d), G(so + 8 * (uint64_t)b), 8);
-                            rt_st32(G(dk + 4 * (uint64_t)d), kb);
+                            kb = rt_ld32(GP(sk + 4 * (uint64_t)b));
+                            memcpy(GP(dob + 8 * (uint64_t)d), GP(so + 8 * (uint64_t)b), 8);
+                            rt_st32(GP(dk + 4 * (uint64_t)d), kb);
                             b++;
                         }
                         d++;
@@ -912,11 +927,11 @@ static void render_pass_update(Ctx *c)
                     break;
             }
             if (so != o0) {
-                memcpy(G(o0), G(o1), 8 * (size_t)n);
-                memcpy(G(k0), G(k1), 4 * (size_t)n);
+                memcpy(GP(o0), GP(o1), 8 * (size_t)n);
+                memcpy(GP(k0), GP(k1), 4 * (size_t)n);
             }
         }
-        memcpy(G(RP + 0x1c8 + 8 * v), &(uint64_t){ n }, 8);
+        memcpy(GP(RP + 0x1c8 + 8 * v), &(uint64_t){ n }, 8);
     }
     c->sp = saved_sp;
 }
