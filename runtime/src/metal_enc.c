@@ -2,6 +2,7 @@
 #include "metal_gl.h"
 
 #include <string.h>
+#include <time.h>
 
 void metal_pass_info(uint64_t pd, uint64_t *color, uint64_t *depth, uint64_t *stencil);
 GLuint metal_pass_fbo(MTexture **color, const int *levels, MTexture *depth, MTexture *stencil);
@@ -78,6 +79,7 @@ typedef struct REnc {
     int to_display;                      /* Vita: the drawable's pass draws to the screen */
     int folded;                          /* Vita: its copy was folded (fold_pass), nothing drawn yet */
     int depth_stale;                     /* Vita: the depth in memory is not the pass's (depth_by_shader) */
+    int depth_lost;                      /* Vita: a depth_by_shader draw would have written depth (fs) */
     struct MTexture *ftex_folded;        /* the copy's source */
     double vp[6];
     int sc[4];
@@ -417,6 +419,7 @@ static void pass_begin(REnc *e)
 {
     e->begun = 1;
     e->depth_stale = 1;
+    e->depth_lost = 0;
 #if defined(__vita__)
     fold_pass_targets(e);
 #endif
@@ -800,6 +803,13 @@ static void apply_state(REnc *e, MPipeline *p)
     if (no_depth && no_stencil)
         ds = NULL;
 #endif
+#if defined(__vita__)
+    if (e->depth_lost && ds && ds->compare != 7 && p->dst_depth_unit < 0) {
+        static int n;
+        if (n++ < 8)
+            rt_log("metal: fs %d tests the depth fs %d wrote (not kept on the Vita)\n", p->fs, e->depth_lost - 1);
+    }
+#endif
     if (ds && (ds->compare != 7 || ds->write)
 #if defined(__vita__)
         && !no_depth
@@ -870,6 +880,21 @@ static void apply_uniforms(REnc *e, MPipeline *p)
     }
 }
 
+/* a sampler state's GL sampler (0, the texture's own state, for none) */
+static GLuint sampler_gl(uint64_t samp)
+{
+    if (!samp)
+        return 0;
+    MSampler *s = objc_host(samp);
+    if (!s) {                /* not a live object (released too early somewhere) */
+        static int n;
+        if (n++ < 8)
+            rt_log("metal: sampler %#llx bound to a draw is not a live object\n", (unsigned long long)samp);
+        return 0;
+    }
+    return s->gl;
+}
+
 static void bind_tex(int unit, uint64_t tex, uint64_t samp)
 {
     glActiveTexture(GL_TEXTURE0 + (GLenum)unit);
@@ -878,6 +903,13 @@ static void bind_tex(int unit, uint64_t tex, uint64_t samp)
         return;
     }
     MTexture *t = objc_host(tex);
+    if (!t) {
+        static int n;
+        if (n++ < 8)
+            rt_log("metal: texture %#llx bound to a draw is not a live object\n", (unsigned long long)tex);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        return;
+    }
 #if defined(__vita__)
     if (t->read_alias)       /* a folded copy read for its colour: the source (fold_draw_reads) */
         t = t->read_alias;
@@ -886,12 +918,12 @@ static void bind_tex(int unit, uint64_t tex, uint64_t samp)
         if (t->owe_clear)
             rt_log("metal: a depth buffer is sampled before the clear a folded pass owed it\n");
         glBindTexture(GL_TEXTURE_2D, t->depth_tex);
-        glBindSampler((GLuint)unit, samp ? ((MSampler *)objc_host(samp))->gl : 0);
+        glBindSampler((GLuint)unit, sampler_gl(samp));
         return;
     }
 #endif
     glBindTexture(metal_tex_target(t), t->gl);
-    glBindSampler((GLuint)unit, samp ? ((MSampler *)objc_host(samp))->gl : 0);
+    glBindSampler((GLuint)unit, sampler_gl(samp));
 }
 
 static void apply_textures(REnc *e, MPipeline *p)
@@ -1092,6 +1124,7 @@ static int draw_is_noop(REnc *e, MPipeline *p)
 }
 
 #if defined(__vita__)
+uint32_t g_depth_fs_draws, g_depth_restarts;     /* MINA_FPS */
 /* A fragment shader that writes its depth (a layer composited with the depth
  * it was drawn with: the logo, the world's layers) tests it itself, against
  * the target's depth sampled as a texture: the scene drawn so far ends (its
@@ -1108,6 +1141,7 @@ static void depth_by_shader(REnc *e, MPipeline *p)
     int cmp = ds && !no_depth && !off && e->dtex->is_rb ? (int)ds->compare : 7;
     if (cmp != 7) {
         MTexture *d = e->dtex;
+        g_depth_fs_draws++;
         if (!d->depth_tex) {         /* a depth buffer never sampled before */
             void vglTexImageRenderbufferDepth(GLuint rb, GLsizei width, GLsizei height);   /* deps/vitaGL patch */
             glActiveTexture(GL_TEXTURE0 + (GLenum)p->dst_depth_unit);
@@ -1123,6 +1157,7 @@ static void depth_by_shader(REnc *e, MPipeline *p)
             vglRenderbufferForceLoad(d->gl, GL_TRUE);
             vglRestartScene();
             e->depth_stale = 0;
+            g_depth_restarts++;
         }
         d->sampled = 1;
         glActiveTexture(GL_TEXTURE0 + (GLenum)p->dst_depth_unit);
@@ -1135,11 +1170,8 @@ static void depth_by_shader(REnc *e, MPipeline *p)
         glUniform4f(p->dst_xform_loc, w, flip ? -h : h, 0.0f, flip ? 1.0f : 0.0f);
         glDisable(GL_DEPTH_TEST);
         glDepthMask(GL_FALSE);
-        if (ds->write) {
-            static int n;
-            if (n++ < 4)
-                rt_log("metal: fs %d writes its depth: not kept on the Vita\n", p->fs);
-        }
+        if (ds->write)
+            e->depth_lost = p->fs + 1;
     }
     glUniform1f(p->depth_cmp_loc, (float)cmp);
 }
@@ -1306,8 +1338,18 @@ static void draw_arrays(Ctx *c, uint32_t instances)
         glDrawArraysInstanced(gl_prim((uint32_t)MARG(0)), (GLint)start, (GLsizei)count, (GLsizei)instances);
     gl_check("drawArrays");
 }
-static void re_drawPrimitives(Ctx *c) { draw_arrays(c, 1); }
-static void re_drawPrimitivesInstanced(Ctx *c) { draw_arrays(c, (uint32_t)MARG(3)); }
+/* MINA_FPS: time in the draws (setup, our state, vitaGL) and in ending passes */
+uint64_t g_draw_ns, g_endenc_ns;
+uint32_t g_draw_calls;
+static uint64_t mono_ns(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+#define TIMED(acc, call) do { uint64_t t0_ = mono_ns(); call; acc += mono_ns() - t0_; g_draw_calls++; } while (0)
+static void re_drawPrimitives(Ctx *c) { TIMED(g_draw_ns, draw_arrays(c, 1)); }
+static void re_drawPrimitivesInstanced(Ctx *c) { TIMED(g_draw_ns, draw_arrays(c, (uint32_t)MARG(3))); }
 
 /* drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:[instanceCount:] */
 static void draw_indexed(Ctx *c, uint32_t instances)
@@ -1350,11 +1392,17 @@ static void draw_indexed(Ctx *c, uint32_t instances)
                                 (const void *)(uintptr_t)ipos, (GLsizei)instances);
     gl_check("drawElements");
 }
-static void re_drawIndexed(Ctx *c) { draw_indexed(c, 1); }
-static void re_drawIndexedInstanced(Ctx *c) { draw_indexed(c, (uint32_t)MARG(5)); }
+static void re_drawIndexed(Ctx *c) { TIMED(g_draw_ns, draw_indexed(c, 1)); }
+static void re_drawIndexedInstanced(Ctx *c) { TIMED(g_draw_ns, draw_indexed(c, (uint32_t)MARG(5))); }
+static void re_endEncoding_timed(Ctx *c)
+{
+    uint64_t t0 = mono_ns();
+    re_endEncoding(c);
+    g_endenc_ns += mono_ns() - t0;
+}
 
 static const Method renc_m[] = {
-    { "endEncoding", re_endEncoding },
+    { "endEncoding", re_endEncoding_timed },
     { "setRenderPipelineState:", re_setPipeline },
     { "setVertexBuffer:offset:atIndex:", re_setVertexBuffer },
     { "setFragmentBuffer:offset:atIndex:", re_setFragmentBuffer },

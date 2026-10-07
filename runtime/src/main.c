@@ -58,6 +58,10 @@ int main(int argc, char **argv)
             scePowerSetGpuClockFrequency(222);
             scePowerSetGpuXbarClockFrequency(166);
         }
+        int scePowerGetArmClockFrequency(void), scePowerGetBusClockFrequency(void);
+        int scePowerGetGpuClockFrequency(void);
+        rt_log("[clock] CPU %d MHz, bus %d MHz, GPU %d MHz\n", scePowerGetArmClockFrequency(),
+               scePowerGetBusClockFrequency(), scePowerGetGpuClockFrequency());
     }
 #if !defined(MINA_NULL_GL)
     void metal_vita_init(void);

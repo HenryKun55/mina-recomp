@@ -725,6 +725,15 @@ uint32_t objc_new_object(Class *k)
     o->addr = a;
     o->cls = k;
     o->refs = 1;
+    {   /* MINA_TRACE_CLASS=name: retains, releases and deallocs of that class's objects */
+        static const char *tc = (const char *)1;
+        if (tc == (const char *)1)
+            tc = getenv("MINA_TRACE_CLASS");
+        if (tc && !strcmp(tc, k->name)) {
+            o->traced = 1;
+            objc_trace_ref(o, "new");
+        }
+    }
     /* host state: the biggest host_size along the chain (subclasses extend it) */
     uint32_t hs = 0, hz = 0;
     for (Class *c = k; c; c = c->super)
@@ -834,6 +843,8 @@ static void m_dealloc(Ctx *c)
     Obj *o = objc_obj(a);
     if (!o)
         return;
+    if (o->traced)
+        objc_trace_ref(o, "dealloc");
     for (Class *k = o->cls; k; k = k->super)
         if (!k->guest && k->dealloc && o->host)
             k->dealloc(o->host);

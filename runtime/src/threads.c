@@ -583,7 +583,23 @@ static void hsem_signal(HSem *s)
 }
 
 /* timeout: DISPATCH_TIME_FOREVER (~0) or a dispatch_time value (ns, mach clock) */
+/* MINA_FPS: time the presenting thread spends blocked in semaphores */
+pthread_t g_present_thread;
+int g_present_thread_set;
+uint64_t g_present_sem_ns;
+static int hsem_wait_(HSem *s, uint64_t timeout);
 static int hsem_wait(HSem *s, uint64_t timeout)
+{
+    if (!g_present_thread_set || !pthread_equal(pthread_self(), g_present_thread))
+        return hsem_wait_(s, timeout);
+    struct timespec a, b;
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    int r = hsem_wait_(s, timeout);
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    g_present_sem_ns += (uint64_t)(b.tv_sec - a.tv_sec) * 1000000000ull + (uint64_t)(b.tv_nsec - a.tv_nsec);
+    return r;
+}
+static int hsem_wait_(HSem *s, uint64_t timeout)
 {
     pthread_mutex_lock(&s->m);
     int r = 0;

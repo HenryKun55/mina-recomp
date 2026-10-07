@@ -1635,6 +1635,12 @@ void metal_present(uint64_t drawable)
         if (on < 0)
             on = getenv("MINA_FPS") != NULL;
         uint64_t t0 = sceKernelGetProcessTimeWide();
+        {
+            extern pthread_t g_present_thread;
+            extern int g_present_thread_set;
+            g_present_thread = pthread_self();
+            g_present_thread_set = 1;
+        }
         vglSwapBuffers(GL_FALSE);
         if (on) {
             uint64_t t1 = sceKernelGetProcessTimeWide();
@@ -1653,9 +1659,19 @@ void metal_present(uint64_t drawable)
                        frames * 1e6 / (double)(t1 - window), (t1 - window) / 1000.0 / frames, frame_max / 1000.0,
                        swap_us / 1000.0 / frames, g_updates / (double)frames, g_update_us / 1000.0 / frames,
                        g_fixed_updates / (double)frames, g_fixed_us / 1000.0 / frames);
-                extern uint32_t g_composites, g_bounds;
-                rt_log("[fps]   per frame: %u Composite, %u UpdateBounds\n", g_composites / frames, g_bounds / frames);
+                extern uint32_t g_composites, g_bounds, g_depth_fs_draws, g_depth_restarts;
+                rt_log("[fps]   per frame: %u Composite, %u UpdateBounds; %.1f depth-testing shader draws, %.1f scene restarts\n",
+                       g_composites / frames, g_bounds / frames, g_depth_fs_draws / (double)frames,
+                       g_depth_restarts / (double)frames);
                 g_composites = g_bounds = 0;
+                g_depth_fs_draws = g_depth_restarts = 0;
+                extern uint64_t g_draw_ns, g_endenc_ns, g_present_sem_ns;
+                extern uint32_t g_draw_calls;
+                rt_log("[fps]   render: %u draws %.1f ms, pass ends %.1f ms; presenting thread blocked %.1f ms\n",
+                       g_draw_calls / frames, g_draw_ns / 1e6 / frames, g_endenc_ns / 1e6 / frames,
+                       g_present_sem_ns / 1e6 / frames);
+                g_draw_ns = g_endenc_ns = g_present_sem_ns = 0;
+                g_draw_calls = 0;
                 g_updates = g_fixed_updates = 0;
                 g_fixed_us = g_update_us = 0;
                 if (getenv("MINA_OBJSTATS")) {
