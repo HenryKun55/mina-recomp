@@ -290,7 +290,7 @@ void nat__ZN21ycCutterAnimComponent12UpdateBoundsEv(Ctx *c)
  * w5/w6 bools. With w5 and P's mode (P+0xc) set, B's z comes from
  * IsoAnim::GetIsoDepth (the game's code) and A's z is dropped before the
  * composite. */
-void f_873480(Ctx *c);           /* IsoAnim::GetIsoDepth */
+static float iso_depth(uint64_t comp, uint32_t mode, float a, float b, float cc);
 void f_87363c_orig(Ctx *c);
 static void calc_transform_p(Ctx *c, XForm *o, uint64_t pa, const XForm *ap, const XForm *bp, uint64_t flags,
                              uint32_t w5, uint32_t w6)
@@ -305,13 +305,8 @@ static void calc_transform_p(Ctx *c, XForm *o, uint64_t pa, const XForm *ap, con
     const float bz = b.t[2];
     const float ty = w6 ? b.t[1] : -0.0f;
     /* GetIsoDepth(x0 = P+0x18, x1 = mode, s0 = A.t[1] + P[0] + (B.t[1] or -0), s1 = P[4], s2 = P[2]) */
-    c->x[0] = ld_ptr(pa + 0x18);
-    c->x[1] = mode;
-    c->v[0] = vset_f32((ap->t[1] + p[0]) + ty);
-    c->v[1] = vset_f32(p[4]);
-    c->v[2] = vset_f32(p[2]);
-    f_873480(c);
-    b.t[2] = c->v[0].f[0] - p[1];
+    const float depth = iso_depth(ld_ptr(pa + 0x18), mode, (ap->t[1] + p[0]) + ty, p[4], p[2]);
+    b.t[2] = depth - p[1];
     XForm a = *ap;
     const uint32_t pflags = rt_ld32(G(pa + 0x14));
     const float az = (a.t[2] < 0.0f && (pflags >> 8 & 1)) ? 0.0f : a.t[2];
@@ -603,4 +598,82 @@ static void refresh_world_transform(Ctx *c)
 void nat__ZN8ycEntity21RefreshWorldTransformEb(Ctx *c)
 {
     refresh_world_transform(c);
+}
+
+/* ---- IsoAnim::GetIsoDepth --------------------------------------------------------------------
+ * x0 component, w1 mode, s0 a, s1 b, s2 c: a depth (s0). Fixed per mode, or
+ * from the camera's position against the level's (mode 4 and above 11). */
+static inline float hexf(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
+void f_873480_orig(Ctx *c);
+static float iso_depth(uint64_t comp, uint32_t mode, float a, float b, float cc)
+{
+    float s3 = (cc + 10.0f) / 20.0f;
+    s3 = fmin_f32(s3, 1.0f);
+    s3 = fmax_f32(s3, 0.0f);
+    float s0, s2;
+    switch (mode) {
+    case 0: case 1:
+        return cc;
+    case 2:
+        return -cc;
+    case 3:
+        s0 = s3 * hexf(0x3eccccc0); s2 = 8.5f; break;
+    case 5: case 8:
+        s0 = s3 * hexf(0x3e4cccd0); s2 = 3.0f; break;
+    case 6: case 9:
+        s0 = s3 * hexf(0x3e0f5c30); s2 = hexf(0x40566666); break;
+    case 7: case 10:
+        s0 = s3 * hexf(0x3db85200); s2 = hexf(0x40333333); break;
+    case 11:
+        s0 = s3 * hexf(0x3db851e8); s2 = hexf(0x3f4ccccd); break;
+    default: {
+        const uint64_t lv = ld_ptr(ld_ptr(ld_ptr(comp + 0x10) + 0x50) + 0x16c0);
+        const uint64_t q = lv + 0x6a88;
+        const uint32_t k = rt_ld32(G(q + 0x58));
+        const uint64_t p = (k != 3 && k != 0) ? q + 0x60 : q;
+        const float cam = ldf(lv + 0x138);
+        const float lo = cam + ldf(p);
+        float span = (ldf(p) - cam) - lo;
+        float d = a - lo;
+        float m = span > 0.0f ? span : -span;
+        m = fmaxnm_f32(m, hexf(0x322bcc77));
+        m = span >= 0.0f ? m : -m;
+        d = d / m;
+        d = fmin_f32(d, 1.0f);
+        d = fmax_f32(d, 0.0f);
+        d = d * hexf(0x467ffc00);
+        d = floorf(d);
+        d = s3 + d;
+        d = d * hexf(0x38800000);
+        s0 = d * hexf(0x40999999);
+        s2 = hexf(0x40666666);
+        break;
+    }
+    }
+    s0 = s0 + s2;
+    const float b1 = b < 0.0f ? b : b + -1.0f;
+    s0 = b1 * 10.0f + s0;
+    return -s0;
+}
+static void get_iso_depth(Ctx *c)
+{
+    c->v[0] = vset_f32(iso_depth(c->x[0], (uint32_t)c->x[1], c->v[0].f[0], c->v[1].f[0], c->v[2].f[0]));
+}
+void nat__ZN7IsoAnim11GetIsoDepthEP11ycComponentRK6ycVec3fif(Ctx *c)
+{
+    if (verify_xform()) {
+        static uint32_t checked, bad;
+        Ctx save = *c;
+        get_iso_depth(c);
+        const float mine = c->v[0].f[0];
+        *c = save;
+        f_873480_orig(c);
+        checked++;
+        if (memcmp(&mine, &c->v[0].f[0], 4) != 0 && bad++ < 10)
+            rt_log("[verify] GetIsoDepth differs: %g / %g (mode %u)\n", mine, c->v[0].f[0], (uint32_t)save.x[1]);
+        if ((checked & 0xfffff) == 0)
+            rt_log("[verify] GetIsoDepth: %u calls checked, %u differ\n", checked, bad);
+        return;
+    }
+    get_iso_depth(c);
 }
