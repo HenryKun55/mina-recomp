@@ -369,11 +369,52 @@ static inline V128 vset_f64(double f) { return vset_u64(d2u(f)); }
 static inline V128 vzero(void) { V128 v; v.d[0] = 0; v.d[1] = 0; return v; }
 static inline V128 vlow(V128 a) { a.d[1] = 0; return a; }
 
-/* Fused multiply-add: exact on the desktop; the Cortex-A9 has no FMA, so the
- * Vita build rounds twice (MINA_FAST_FMA). */
+/* Fused multiply-add (fmadd & co.): one rounding, as on arm64. The Cortex-A9
+ * has no FMA instruction, so the Vita build emulates it exactly
+ * (MINA_FAST_FMA; rounding twice instead could make game math differ). */
 #if defined(MINA_FAST_FMA)
-#define FMA_F32(a, b, c) ((a) * (b) + (c))
-#define FMA_F64(a, b, c) ((a) * (b) + (c))
+/* Exact fused multiply-add without an FMA instruction (Cortex-A9).
+ * float: the product is exact in double; the sum rounded to odd (sticky bit
+ * from TwoSum's error) then to float rounds once overall.
+ * double: Dekker product, TwoSum, round-to-odd of the low parts, one final
+ * rounding (Boldo & Melquiond, "Emulation of FMA and correctly rounded sums:
+ * proved algorithms using rounding to odd"). */
+static inline uint64_t rt_d2u(double d) { uint64_t u; memcpy(&u, &d, 8); return u; }
+static inline double rt_u2d(uint64_t u) { double d; memcpy(&d, &u, 8); return d; }
+/* s = RN(x + y) made round-to-odd: when inexact and s is even, the neighbour on the side of the error */
+static inline double rt_add_odd(double x, double y)
+{
+    const double s = x + y;
+    const double bb = s - x;
+    const double e = (x - (s - bb)) + (y - bb);
+    uint64_t u = rt_d2u(s);
+    if (e != 0.0 && !(u & 1) && s == s && (u & 0x7ff0000000000000ull) != 0x7ff0000000000000ull)
+        u += ((e > 0.0) == (s > 0.0)) ? 1 : (uint64_t)-1;
+    return rt_u2d(u);
+}
+static inline float rt_fmaf(float a, float b, float c)
+{
+    const double p = (double)a * (double)b;      /* exact: 24 + 24 bits */
+    return (float)rt_add_odd(p, (double)c);
+}
+static inline double rt_fma(double a, double b, double c)
+{
+    /* exact product a*b = uh + ul (Veltkamp split, Dekker) */
+    const double C = 134217729.0;                /* 2^27 + 1 */
+    const double ga = C * a, ah = ga - (ga - a), al = a - ah;
+    const double gb = C * b, bh = gb - (gb - b), bl = b - bh;
+    const double uh = a * b;
+    const double ul = (((ah * bh - uh) + ah * bl) + al * bh) + al * bl;
+    if (uh != uh || uh - uh != 0.0 || c - c != 0.0)
+        return uh + c;                           /* infinities, NaN */
+    /* c + uh = th + tl exactly */
+    const double th = c + uh;
+    const double bb = th - c;
+    const double tl = (c - (th - bb)) + (uh - bb);
+    return th + rt_add_odd(tl, ul);
+}
+#define FMA_F32(a, b, c) rt_fmaf((a), (b), (c))
+#define FMA_F64(a, b, c) rt_fma((a), (b), (c))
 #else
 #define FMA_F32(a, b, c) fmaf((a), (b), (c))
 #define FMA_F64(a, b, c) fma((a), (b), (c))
