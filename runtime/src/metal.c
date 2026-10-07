@@ -618,6 +618,7 @@ static void tex_dealloc(void *h)
 {
     MTexture *t = h;
     gpu_lock();
+    metal_fold_forget(t);
     if (t->gl && t->is_rb) glDeleteRenderbuffers(1, &t->gl);
     else if (t->gl) glDeleteTextures(1, &t->gl);
     if (t->fbo_cache) glDeleteFramebuffers(1, &t->fbo_cache);
@@ -1170,6 +1171,7 @@ static GLuint tex_fbo(MTexture *t, int level);
 static void tex_upload(MTexture *t, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t level,
                        uint32_t slice, const uint8_t *src, uint32_t bpr)
 {
+    metal_fold_write(t);
     t->clear_valid = 0;
     GLFmt f;
     gl_format(t->format, &f);
@@ -1241,6 +1243,7 @@ static void t_getBytes(Ctx *c)
     GLFmt f;
     gl_format(t->format, &f);
     gpu_lock();
+    metal_fold_read(t);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, tex_fbo(t, (int)MARG(3)));
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
     glPixelStorei(GL_PACK_ROW_LENGTH, f.bpp ? (GLint)(MARG(1) / (uint64_t)f.bpp) : 0);
@@ -1512,6 +1515,7 @@ static void dr_present(Ctx *c) { metal_present(SELF); }
  * texture) to a region of a framebuffer (0: the screen), drawn with a quad:
  * vitaGL's glBlitFramebuffer draws only one triangle of its quad. flip_y
  * turns the copy upside down (Metal frames to the screen). */
+int g_copy_rgb;          /* vita_copy_quad leaves the destination's alpha alone */
 void vita_copy_quad(MTexture *src, float sx, float sy, float sw, float sh, GLuint dst_fbo, GLint dx, GLint dy,
                     GLsizei dw, GLsizei dh, int flip_y)
 {
@@ -1554,7 +1558,7 @@ void vita_copy_quad(MTexture *src, float sx, float sy, float sw, float sh, GLuin
     glDisable(GL_BLEND);
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_STENCIL_TEST);
-    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, g_copy_rgb ? GL_FALSE : GL_TRUE);
     glUseProgram(prog);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, src->gl);

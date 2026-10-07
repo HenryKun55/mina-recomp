@@ -76,6 +76,7 @@ typedef struct REnc {
     int stencil_value;
     int vp_set, sc_set;
     int to_display;                      /* Vita: the drawable's pass draws to the screen */
+    int folded;                          /* Vita: its copy was folded (fold_pass), nothing drawn yet */
     double vp[6];
     int sc[4];
 } REnc;
@@ -133,7 +134,8 @@ static void framelog_pass(REnc *e, uint64_t *color, uint64_t depth, uint64_t ste
                       pb_getd(color[0], "clearColor", 1, 0.0), pb_getd(color[0], "clearColor", 2, 0.0),
                       pb_getd(color[0], "clearColor", 3, 1.0));
     if (depth && pb_get(depth, "texture", 0))
-        n += snprintf(buf + n, sizeof buf - n, " depth load %u", (uint32_t)pb_get(depth, "loadAction", 0));
+        n += snprintf(buf + n, sizeof buf - n, " depth load %u#%04x", (uint32_t)pb_get(depth, "loadAction", 0),
+                      (unsigned)(((uintptr_t)objc_host(pb_get(depth, "texture", 0)) >> 4) & 0xffff));
     if (stencil && pb_get(stencil, "texture", 0))
         n += snprintf(buf + n, sizeof buf - n, " stencil load %u", (uint32_t)pb_get(stencil, "loadAction", 0));
     rt_log("%s\n", buf);
@@ -164,11 +166,265 @@ static void apply_viewport(REnc *e)
 #endif
 }
 
+/* a stencil face that never changes the stencil */
+static int stencil_keeps(const MStencil *s)
+{
+    return s->write_mask == 0 || (s->fail == 0 && s->depth_fail == 0 && s->pass == 0);
+}
+
+/* ---- folded copy passes (Vita) ---------------------------------------------------------
+ * The game draws its frame into one texture, then copies it whole into another
+ * (a shader raising the colour to a gamma of 1, alpha 1) that only a shader
+ * reading the colour samples: a GXM scene of its own for nothing. That pass is
+ * not drawn (fold_pass): its target reads as the source (MTexture.read_alias),
+ * and is drawn for real (fold_draw) only when something needs it as it is: a
+ * shader reading its alpha, a blit, a pass loading it. When the source changes
+ * first the target goes stale: the game draws it again before reading it, and
+ * if it ever reads it instead, that texture is never folded again (logged).
+ * MINA_NO_FOLD: every copy is drawn. */
+#if defined(__vita__)
+extern int g_copy_rgb;
+#define MAX_FOLDS 8
+static MTexture *folds[MAX_FOLDS];
+static int nfolds;
+
+static void fold_drop(MTexture *x)
+{
+    x->read_alias = NULL;
+    for (int i = 0; i < nfolds; i++)
+        if (folds[i] == x) {
+            folds[i] = folds[--nfolds];
+            break;
+        }
+}
+
+/* the copy, drawn: the source's colour with alpha 1 */
+static void fold_draw(MTexture *x)
+{
+    MTexture *src = x->read_alias;
+    fold_drop(x);
+    GLuint fbo = metal_tex_fbo(x, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glDisable(GL_SCISSOR_TEST);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    g_copy_rgb = 1;
+    vita_copy_quad(src, 0, 0, (float)src->width, (float)src->height, fbo, 0, 0, (GLsizei)x->width,
+                   (GLsizei)x->height, 0);
+    g_copy_rgb = 0;
+}
+
+/* contents lost to a fold read before being drawn again */
+static void fold_check_stale(MTexture *t)
+{
+    if (!t->fold_stale)
+        return;
+    t->fold_stale = 0;
+    t->no_fold = 1;
+    rt_log("metal: a %ux%u texture was read after the copy folded into it went stale: not folded again\n",
+           t->width, t->height);
+}
+
+/* t changes: textures reading as t go stale */
+static void fold_source_changes(MTexture *t)
+{
+    for (int i = 0; i < nfolds;)
+        if (folds[i]->read_alias == t) {
+            folds[i]->fold_stale = 1;
+            fold_drop(folds[i]);
+        } else {
+            i++;
+        }
+}
+
+void metal_fold_read(MTexture *t)
+{
+    if (t->read_alias)
+        fold_draw(t);
+    fold_check_stale(t);
+}
+void metal_fold_write(MTexture *t)
+{
+    fold_source_changes(t);
+    metal_fold_read(t);             /* a partial write keeps the rest */
+}
+void metal_fold_forget(MTexture *t)
+{
+    fold_source_changes(t);
+    if (t->read_alias)
+        fold_drop(t);
+}
+
+static int fold_off = -1;
+static int fold_blend_ok(const MBlend *b)
+{
+    if (!b->enabled)
+        return 1;
+    /* with the shader's alpha of 1 these all write the source colour, alpha 1 */
+    return (b->src_rgb == 1 || b->src_rgb == 4) && (b->dst_rgb == 0 || b->dst_rgb == 5) &&
+           (b->src_a == 1 || b->src_a == 4) && (b->dst_a == 0 || b->dst_a == 5) && b->rgb_op == 0 && b->alpha_op == 0;
+}
+static const uint8_t *binding_data(const Binding *b, uint32_t *avail);
+
+/* A pass whose first draw copies a texture whole into its cleared target: not
+ * drawn (see above). */
+/* MINA_FOLDLOG: why a copy pass was not folded */
+static int fold_no(int why)
+{
+    static int log = -1, n;
+    if (log < 0)
+        log = getenv("MINA_FOLDLOG") != NULL;
+    if (log && n++ < 20)
+        rt_log("[fold] not folded (%d)\n", why);
+    return 0;
+}
+static int fold_pass(REnc *e, MPipeline *p, uint32_t count, uint32_t instances)
+{
+    if (fold_off < 0)
+        fold_off = getenv("MINA_NO_FOLD") != NULL || getenv("MINA_NO_SKIP") != NULL;
+    MTexture *owe = NULL;
+    if (fold_off || e->begun || e->folded || p->fs < 0 || !g_shaders[p->fs].gamma_copy0 || count != 6 ||
+        instances != 1)
+        return 0;
+    MTexture *x = e->color[0];
+    if (!x || x->no_fold || x->is_drawable || x->is_rb || x->shift || e->levels[0] || e->resolve[0] ||
+        !(e->clear_mask & 1) || x->type != 2)
+        return fold_no(2);
+    for (int i = 1; i < MAX_COLOR; i++)
+        if (e->color[i])
+            return fold_no(3);
+    MTexture *t = e->ftex[0] ? objc_host(e->ftex[0]) : NULL;
+    if (!t || t == x || t->is_rb || t->shift || t->read_alias || t->fold_stale || t->width != x->width ||
+        t->height != x->height || t->format != x->format || t->type != 2)
+        return fold_no(4);
+    uint32_t avail = 0;
+    const uint8_t *cb = binding_data(&e->fb[1], &avail);
+    float gamma;
+    if (!cb || avail < 4)
+        return fold_no(5);
+    memcpy(&gamma, cb, 4);
+    if (gamma != 1.0f || p->color[0].write_mask != 0xf || !fold_blend_ok(&p->color[0]))
+        return fold_no(6);
+    if (e->vp_set && (e->vp[0] != 0 || e->vp[1] != 0 || e->vp[2] != e->tw || e->vp[3] != e->th))
+        return fold_no(7);
+    if (e->sc_set && (e->sc[0] != 0 || e->sc[1] != 0 || e->sc[2] != (int)e->tw || e->sc[3] != (int)e->th))
+        return fold_no(8);
+    if (e->dtex || e->stex) {
+        MDepthStencil *ds = e->ds ? objc_host(e->ds) : NULL;
+        if (ds && (ds->write || ds->compare != 7 ||
+                   (ds->stencil_enabled && !(stencil_keeps(&ds->front) && stencil_keeps(&ds->back)))))
+            return fold_no(9);
+        /* its depth/stencil clear: nothing to do, or owed to the next pass loading them */
+        MTexture *d = e->dtex ? e->dtex : e->stex;
+        if ((e->clear_depth || e->clear_stencil) &&
+            !(d->clear_valid && d->clear_value[0] == e->depth_value && d->clear_value[1] == (float)e->stencil_value)) {
+            if (!e->clear_depth || !e->clear_stencil || e->dtex != e->stex || !d->is_rb || d->sampled)
+                return fold_no(10);
+            owe = d;
+        }
+    }
+    if (nfolds == MAX_FOLDS)
+        return fold_no(11);
+    if (owe) {
+        owe->owe_clear = 1;
+        owe->owe_value[0] = e->depth_value;
+        owe->owe_value[1] = (float)e->stencil_value;
+        owe->clear_valid = 0;
+    }
+    fold_source_changes(x);
+    if (x->read_alias)
+        fold_drop(x);
+    x->fold_stale = 0;
+    x->clear_valid = 0;
+    x->read_alias = t;
+    folds[nfolds++] = x;
+    e->folded = 1;
+    if (g_framelog)
+        rt_log("[frame %d]   (folded: #%04x reads as #%04x)\n", g_framelog, (unsigned)(((uintptr_t)x >> 4) & 0xffff),
+               (unsigned)(((uintptr_t)t >> 4) & 0xffff));
+    return 1;
+}
+
+/* before a pass draws into its targets */
+static void fold_pass_targets(REnc *e)
+{
+    for (int i = 0; i < MAX_COLOR; i++) {
+        MTexture *x = e->color[i];
+        if (!x)
+            continue;
+        fold_source_changes(x);
+        if (x->read_alias) {
+            if (e->folded && i == 0) {
+                fold_draw(x);           /* more draws after the folded copy: it is needed */
+                e->clear_mask &= ~1u;
+            } else if (e->clear_mask & (1u << i)) {
+                fold_drop(x);
+            } else {
+                fold_draw(x);
+            }
+        } else if (x->fold_stale) {
+            if (e->clear_mask & (1u << i))
+                x->fold_stale = 0;
+            else
+                fold_check_stale(x);
+        }
+        if (e->resolve[i])
+            metal_fold_write(e->resolve[i]);
+    }
+    e->folded = 0;
+}
+
+/* before a draw: textures read whole are drawn now (colour-only reads take the
+ * source in bind_tex); returns whether the framebuffer binding changed */
+static int fold_draw_reads(REnc *e, MPipeline *p)
+{
+    int moved = 0;
+    unsigned rgb = p->fs >= 0 ? g_shaders[p->fs].rgb_only : 0;
+    for (int k = 0; k < p->ntex; k++) {
+        int t = p->texb[k].tex & 15;
+        uint64_t to = p->texb[k].stage ? e->ftex[t] : e->vtex[t];
+        MTexture *mt = to ? objc_host(to) : NULL;
+        if (!mt)
+            continue;
+        if (mt->read_alias && !(p->texb[k].stage && (rgb >> t & 1))) {
+            fold_draw(mt);
+            moved = 1;
+        }
+        fold_check_stale(mt);
+    }
+    return moved;
+}
+#else
+void metal_fold_read(MTexture *t) { (void)t; }
+void metal_fold_write(MTexture *t) { (void)t; }
+void metal_fold_forget(MTexture *t) { (void)t; }
+#endif
+
 /* The pass's framebuffer, clears and recorded viewport/scissor: at its first
  * draw, or at its end when it only clears. */
 static void pass_begin(REnc *e)
 {
     e->begun = 1;
+#if defined(__vita__)
+    fold_pass_targets(e);
+#endif
+#if defined(__vita__)
+    {   /* a clear a folded pass owed: this pass does it if it loads them */
+        MTexture *d = e->dtex ? e->dtex : e->stex;
+        if (d && d->owe_clear) {
+            d->owe_clear = 0;
+            if (e->dtex && !e->clear_depth) {
+                e->clear_depth = 1;
+                e->depth_value = d->owe_value[0];
+            }
+            if (e->stex && !e->clear_stencil) {
+                e->clear_stencil = 1;
+                e->stencil_value = (int)d->owe_value[1];
+            }
+        }
+    }
+#endif
 #if defined(__vita__)
     /* the drawable is the screen: its passes draw there, no copy at present */
     if (e->color[0] && e->color[0]->is_drawable && !e->dtex && !e->stex && direct_display()) {
@@ -209,8 +465,16 @@ static void pass_begin(REnc *e)
         glColorMaski((GLuint)i, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         glClearBufferfv(GL_COLOR, i, e->clear_color[i]);
     }
-    if (e->dtex)
-        e->dtex->clear_valid = 0;
+    {   /* depth/stencil: known clear until a draw writes them (apply_state) */
+        MTexture *d = e->dtex ? e->dtex : e->stex;
+        if (d && e->clear_depth && e->clear_stencil && e->dtex == e->stex) {
+            d->clear_valid = 1;
+            d->clear_value[0] = e->depth_value;
+            d->clear_value[1] = (float)e->stencil_value;
+        } else if (d && (e->clear_depth || e->clear_stencil || e->dtex != e->stex)) {
+            d->clear_valid = 0;
+        }
+    }
     if (e->clear_depth) {
         glDepthMask(GL_TRUE);
         glClearBufferfv(GL_DEPTH, 0, &e->depth_value);
@@ -340,7 +604,7 @@ static void re_endEncoding(Ctx *c)
     if (e->ended)
         return;
     e->ended = 1;
-    if (!e->begun)
+    if (!e->begun && !e->folded)
         pass_end_empty(e);
     for (int i = 0; i < MAX_COLOR && e->begun; i++) {
         if (!e->resolve[i])
@@ -521,6 +785,10 @@ static void apply_state(REnc *e, MPipeline *p)
         glDisable(GL_DEPTH_TEST);
         glDepthMask(GL_FALSE);
     }
+    if (ds && (ds->write || (ds->stencil_enabled && !(stencil_keeps(&ds->front) && stencil_keeps(&ds->back))))) {
+        MTexture *d = e->dtex ? e->dtex : e->stex;
+        d->clear_valid = 0;             /* written from now on */
+    }
     if (ds && ds->stencil_enabled
 #if defined(__vita__)
         && !no_stencil
@@ -580,7 +848,12 @@ static void bind_tex(int unit, uint64_t tex, uint64_t samp)
     }
     MTexture *t = objc_host(tex);
 #if defined(__vita__)
+    if (t->read_alias)       /* a folded copy read for its colour: the source (fold_draw_reads) */
+        t = t->read_alias;
     if (t->is_rb) {          /* a depth/stencil renderbuffer: its depth texture */
+        t->sampled = 1;
+        if (t->owe_clear)
+            rt_log("metal: a depth buffer is sampled before the clear a folded pass owed it\n");
         glBindTexture(GL_TEXTURE_2D, t->depth_tex);
         glBindSampler((GLuint)unit, samp ? ((MSampler *)objc_host(samp))->gl : 0);
         return;
@@ -760,6 +1033,25 @@ static MPipeline *draw_setup(REnc *e)
     MPipeline *p = objc_host(e->pipeline);
     if (draw_is_noop(e, p))
         return NULL;
+#if defined(__vita__)
+    if (fold_draw_reads(e, p) && e->begun) {
+        /* back to this pass (its depth/stencil kept) */
+        MTexture *ds = e->dtex ? e->dtex : e->stex;
+        if (ds && ds->is_rb) {
+            void vglRenderbufferForceLoad(GLuint rb, GLboolean load);
+            vglRenderbufferForceLoad(ds->gl, GL_TRUE);
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, e->fbo);
+        glViewport(0, 0, (GLsizei)e->tw, (GLsizei)e->th);
+        glDepthRange(-1.0, 1.0);
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(0, 0, (GLsizei)e->tw, (GLsizei)e->th);
+        if (e->vp_set)
+            apply_viewport(e);
+        if (e->sc_set)
+            glScissor(e->sc[0], screen_y(e, e->sc[1], e->sc[3]), e->sc[2], e->sc[3]);
+    }
+#endif
     if (!e->begun)
         pass_begin(e);
     {   /* MINA_SKIP_FS=n,m: draws with these fragment shaders are skipped (debug) */
@@ -872,6 +1164,10 @@ static void framelog_draw(REnc *e, MPipeline *p, const char *kind, uint32_t coun
 static void draw_arrays(Ctx *c, uint32_t instances)
 {
     REnc *e = objc_host(SELF);
+#if defined(__vita__)
+    if (e->pipeline && fold_pass(e, objc_host(e->pipeline), (uint32_t)MARG(2), instances))
+        return;
+#endif
     MPipeline *p = draw_setup(e);
     if (!p)
         return;
@@ -1012,6 +1308,8 @@ int direct_display(void);
 static void be_copyTextureRegion(Ctx *c)
 {
     MTexture *s = objc_host(MARG(0)), *d = objc_host(MARG(5));
+    metal_fold_read(s);
+    metal_fold_write(d);
     d->clear_valid = 0;
     uint64_t so = MARG(3), sz = MARG(4), sp = c->sp;
     uint32_t dlevel = (uint32_t)rt_ld64(G(sp + 8));
@@ -1041,6 +1339,8 @@ static void be_copyTextureRegion(Ctx *c)
 static void be_copyTexture(Ctx *c)
 {
     MTexture *s = objc_host(MARG(0)), *d = objc_host(MARG(1));
+    metal_fold_read(s);
+    metal_fold_write(d);
     d->clear_valid = 0;
 #if defined(__vita__)
     /* the frame copied whole into the drawable: present shows it from there */
@@ -1116,6 +1416,7 @@ static void be_fillBuffer(Ctx *c)
 static void be_generateMipmaps(Ctx *c)
 {
     MTexture *t = objc_host(MARG(0));
+    metal_fold_write(t);
     glBindTexture(metal_tex_target(t), t->gl);
     glGenerateMipmap(metal_tex_target(t));
 }

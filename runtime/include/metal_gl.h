@@ -72,7 +72,22 @@ typedef struct MTexture {
     struct MTexture *alias;  /* Vita drawable: the texture a whole-texture blit would have copied in */
     int on_display;          /* Vita drawable: this frame's passes drew it straight to the screen */
     float clear_value[4];    /* color, or depth and stencil */
+    /* Vita, a folded copy pass (metal_enc.c): this texture reads as read_alias's
+     * colour with alpha 1, not drawn; fold_stale: read_alias changed since (the
+     * contents are lost, the game redraws them first); no_fold: never again */
+    struct MTexture *read_alias;
+    int fold_stale, no_fold;
+    /* Vita depth/stencil of a folded pass: the clear it skipped, done by the next
+     * pass that loads them (sampled: they were read as a texture, never owed) */
+    int owe_clear, sampled;
+    float owe_value[2];
 } MTexture;
+
+/* Vita: a texture is about to be written / read outside a render pass, or freed
+ * (folded copies are drawn or dropped first); no-ops elsewhere */
+void metal_fold_write(MTexture *t);
+void metal_fold_read(MTexture *t);
+void metal_fold_forget(MTexture *t);
 
 #if defined(__vita__) && !defined(MINA_NULL_GL)
 void vita_copy_quad(MTexture *src, float sx, float sy, float sw, float sh, GLuint dst_fbo, GLint dx, GLint dy,
@@ -141,6 +156,8 @@ typedef struct ShaderSrc {
     int stage;
     const char *glsl;
     int discards_clear0;     /* fragment: discards where texture 0's alpha is 0 (a cleared layer draws nothing) */
+    int gamma_copy0;         /* fragment: (pow(texture 0 .rgb, fcb1[0].x), 1) at the quad's coordinates */
+    unsigned rgb_only;       /* fragment: bit N, texture N's alpha is never read */
 } ShaderSrc;
 extern const ShaderSrc g_shaders[];
 extern const int g_shader_count;
