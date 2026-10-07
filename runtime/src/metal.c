@@ -79,10 +79,63 @@ static Class cls_PropBag;
 
 static PropBag *bag(uint64_t obj) { return objc_host(obj); }
 
+/* Interned strings: one permanent copy of each key. Insert-only, so readers need
+ * no lock (an entry's string is published before its hash). */
+#define INTERN_CAP 4096
+static struct { uint32_t hash; const char *s; } interned[INTERN_CAP];
+static pthread_mutex_t intern_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t str_hash(const char *s, size_t n)
+{
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < n; i++)
+        h = (h ^ (uint8_t)s[i]) * 16777619u;
+    return h | 1;
+}
+static const char *intern_n(const char *s, size_t n)
+{
+    uint32_t h = str_hash(s, n);
+    for (int locked = 0;; locked = 1) {
+        uint32_t i = h & (INTERN_CAP - 1);
+        for (uint32_t eh; (eh = __atomic_load_n(&interned[i].hash, __ATOMIC_ACQUIRE)); i = (i + 1) & (INTERN_CAP - 1))
+            if (eh == h && strncmp(interned[i].s, s, n) == 0 && interned[i].s[n] == 0) {
+                if (locked)
+                    pthread_mutex_unlock(&intern_lock);
+                return interned[i].s;
+            }
+        if (locked) {
+            char *copy = malloc(n + 1);
+            memcpy(copy, s, n);
+            copy[n] = 0;
+            interned[i].s = copy;
+            __atomic_store_n(&interned[i].hash, h, __ATOMIC_RELEASE);
+            pthread_mutex_unlock(&intern_lock);
+            return copy;
+        }
+        pthread_mutex_lock(&intern_lock);
+    }
+}
+static const char *intern(const char *s) { return intern_n(s, strlen(s)); }
+
+/* "@<n>" and "<n>" without printf */
+static const char *index_key(const char *prefix, uint64_t n)
+{
+    char k[32], *q = k + sizeof k;
+    *--q = 0;
+    do
+        *--q = (char)('0' + n % 10);
+    while (n /= 10);
+    for (size_t pl = strlen(prefix); pl; pl--)
+        *--q = prefix[pl - 1];
+    return intern(q);
+}
+
 static int pb_find(PropBag *b, const char *key)
 {
     for (int i = 0; i < b->n; i++)
-        if (strcmp(b->p[i].key, key) == 0)
+        if (b->p[i].key == key)
+            return i;
+    for (int i = 0; i < b->n; i++)
+        if (b->p[i].key[0] == key[0] && strcmp(b->p[i].key, key) == 0)
             return i;
     return -1;
 }
@@ -94,10 +147,19 @@ static int pb_slot(PropBag *b, const char *key)
     if (b->n >= PB_MAX)
         rt_fatal("property bag full (%s)", key);
     i = b->n++;
-    b->p[i].key = strdup(key);
+    b->p[i].key = intern(key);
     b->p[i].v = 0;
-    memset(b->p[i].d, 0, sizeof b->p[i].d);
+    b->di[i] = -1;
     return i;
+}
+static double *pb_dslot(PropBag *b, int i)
+{
+    if (b->di[i] < 0) {
+        if (b->nd >= PB_MAX_D)
+            rt_fatal("property bag: too many floating-point properties (%s)", b->p[i].key);
+        b->di[i] = (int8_t)b->nd++;
+    }
+    return b->d[b->di[i]];
 }
 uint64_t pb_get(uint64_t obj, const char *key, uint64_t def)
 {
@@ -109,61 +171,104 @@ double pb_getd(uint64_t obj, const char *key, int k, double def)
 {
     PropBag *b = obj ? bag(obj) : NULL;
     int i = b ? pb_find(b, key) : -1;
-    return i < 0 ? def : b->p[i].d[k];
+    return i < 0 ? def : b->di[i] < 0 ? 0.0 : b->d[b->di[i]][k];
 }
 void pb_set(uint64_t obj, const char *key, uint64_t v) { bag(obj)->p[pb_slot(bag(obj), key)].v = v; }
 
 static void bag_dealloc(void *h)
 {
     PropBag *b = h;
-    for (int i = 0; i < b->n; i++) {
+    for (int i = 0; i < b->n; i++)
         if (b->p[i].key[0] == '@')
             objc_release_obj(b->p[i].v);
-        free((void *)b->p[i].key);
-    }
 }
 
+/* What a selector means to a bag, worked out once per selector (insert-only
+ * table keyed by the selector's address, readers without a lock). */
+enum { SEL_GET, SEL_SET, SEL_SET_F64, SEL_SET_F32, SEL_OTHER };
+#define SELMAP_CAP 2048
+static struct { uint32_t sel; uint8_t kind; const char *key; } selmap[SELMAP_CAP];
+static pthread_mutex_t selmap_lock = PTHREAD_MUTEX_INITIALIZER;
 static const char *const fp_props[] = { "clearColor", "clearDepth", "lodMinClamp", "lodMaxClamp", NULL };
 
-/* setFoo: / isFoo / foo */
+static int sel_info(uint64_t sel_addr, const char **key)
+{
+    uint32_t a = (uint32_t)sel_addr, i = (a * 0x9E3779B1u >> 21) & (SELMAP_CAP - 1);
+    for (uint32_t e; (e = __atomic_load_n(&selmap[i].sel, __ATOMIC_ACQUIRE)); i = (i + 1) & (SELMAP_CAP - 1))
+        if (e == a) {
+            *key = selmap[i].key;
+            return selmap[i].kind;
+        }
+    /* setFoo: / isFoo / foo */
+    const char *sel = gstr(sel_addr);
+    size_t n = strlen(sel);
+    int kind;
+    const char *k;
+    if (strncmp(sel, "set", 3) == 0 && n > 4 && strchr(sel, ':') == sel + n - 1) {
+        char buf[96];
+        size_t kl = n - 4 < sizeof buf ? n - 4 : sizeof buf - 1;
+        memcpy(buf, sel + 3, kl);
+        buf[kl] = 0;
+        buf[0] += ('a' - 'A') * (buf[0] >= 'A' && buf[0] <= 'Z');
+        k = intern(buf);
+        kind = SEL_SET;
+        for (const char *const *p = fp_props; *p; p++)
+            if (strcmp(*p, k) == 0)
+                kind = strncmp(k, "lod", 3) == 0 ? SEL_SET_F32 : SEL_SET_F64;
+    } else if (strchr(sel, ':')) {
+        k = sel;
+        kind = SEL_OTHER;
+    } else if (strncmp(sel, "is", 2) == 0 && sel[2] >= 'A' && sel[2] <= 'Z') {
+        char buf[96];
+        size_t kl = n - 2 < sizeof buf ? n - 2 : sizeof buf - 1;
+        memcpy(buf, sel + 2, kl);
+        buf[kl] = 0;
+        buf[0] += 'a' - 'A';
+        k = intern(buf);
+        kind = SEL_GET;
+    } else {
+        k = intern(sel);
+        kind = SEL_GET;
+    }
+    pthread_mutex_lock(&selmap_lock);
+    for (uint32_t e; (e = selmap[i].sel) && e != a; i = (i + 1) & (SELMAP_CAP - 1))
+        ;
+    if (!selmap[i].sel) {
+        selmap[i].kind = (uint8_t)kind;
+        selmap[i].key = k;
+        __atomic_store_n(&selmap[i].sel, a, __ATOMIC_RELEASE);
+    }
+    pthread_mutex_unlock(&selmap_lock);
+    *key = k;
+    return kind;
+}
+
 static void bag_fallback(Ctx *c)
 {
-    const char *sel = gstr(c->x[1]);
-    char key[96];
-    size_t n = strlen(sel);
-    if (strncmp(sel, "set", 3) == 0 && n > 4 && strchr(sel, ':') == sel + n - 1) {
-        snprintf(key, sizeof key, "%c%.*s", sel[3] + ('a' - 'A') * (sel[3] >= 'A' && sel[3] <= 'Z'),
-                 (int)(n - 5), sel + 4);
-        PropBag *b = bag(SELF);
-        int i = pb_slot(b, key);
-        int fp = 0;
-        for (const char *const *p = fp_props; *p; p++)
-            if (strcmp(*p, key) == 0)
-                fp = 1;
-        if (fp) {
-            for (int k = 0; k < 4; k++)
-                b->p[i].d[k] = strcmp(key, "lodMinClamp") == 0 || strcmp(key, "lodMaxClamp") == 0
-                                   ? (double)c->v[k].f[0] : c->v[k].df[0];
-        } else {
-            b->p[i].v = MARG(0);
-        }
+    const char *key;
+    int kind = sel_info(c->x[1], &key);
+    PropBag *b = bag(SELF);
+    switch (kind) {
+    case SEL_SET:
+        b->p[pb_slot(b, key)].v = MARG(0);
+        return;
+    case SEL_SET_F64:
+    case SEL_SET_F32: {
+        double *d = pb_dslot(b, pb_slot(b, key));
+        for (int k = 0; k < 4; k++)
+            d[k] = kind == SEL_SET_F32 ? (double)c->v[k].f[0] : c->v[k].df[0];
         return;
     }
-    if (strchr(sel, ':')) {
-        rt_log("metal: unhandled %s on %s\n", sel, objc_class_of(SELF)->name);
+    case SEL_OTHER:
+        rt_log("metal: unhandled %s on %s\n", key, objc_class_of(SELF)->name);
         RET(0);
         return;
     }
-    if (strncmp(sel, "is", 2) == 0 && sel[2] >= 'A' && sel[2] <= 'Z')
-        snprintf(key, sizeof key, "%c%s", sel[2] + ('a' - 'A'), sel + 3);
-    else
-        snprintf(key, sizeof key, "%s", sel);
-    PropBag *b = bag(SELF);
     int i = pb_find(b, key);
     RET(i < 0 ? 0 : b->p[i].v);
-    if (i >= 0)
+    if (i >= 0 && b->di[i] >= 0)
         for (int k = 0; k < 4; k++)
-            c->v[k] = vset_f64(b->p[i].d[k]);
+            c->v[k] = vset_f64(b->d[b->di[i]][k]);
 }
 
 /* children: getters that return a sub-descriptor */
@@ -172,53 +277,64 @@ typedef struct ChildDef {
     const char *key;
     Class *child;
     Class *elem;             /* for arrays */
+    const char *at_key;      /* "@<key>", interned */
 } ChildDef;
 static ChildDef children[32];
 static int nchildren;
 
-uint64_t pb_child(uint64_t obj, const char *key, Class *cls)
+static uint64_t pb_child_at(uint64_t obj, const char *at_key, Class *cls)
 {
-    char k[64];
-    snprintf(k, sizeof k, "@%s", key);
     PropBag *b = bag(obj);
-    int i = pb_find(b, k);
+    int i = pb_find(b, at_key);
     if (i >= 0)
         return b->p[i].v;
     uint64_t ch = objc_new_object(cls);
-    b->p[pb_slot(b, k)].v = ch;
+    b->p[pb_slot(b, at_key)].v = ch;
     return ch;
 }
+static const char *at_key(const char *key)
+{
+    char k[64];
+    k[0] = '@';
+    size_t n = strlen(key);
+    if (n > sizeof k - 2)
+        n = sizeof k - 2;
+    memcpy(k + 1, key, n);
+    k[n + 1] = 0;
+    return intern(k);
+}
+uint64_t pb_child(uint64_t obj, const char *key, Class *cls) { return pb_child_at(obj, at_key(key), cls); }
 
 static void bag_child_getter(Ctx *c)
 {
-    const char *sel = gstr(c->x[1]);
-    Class *k = objc_class_of(SELF);
-    for (int i = 0; i < nchildren; i++) {
-        for (Class *o = k; o; o = o->super)
-            if (children[i].owner == o && strcmp(children[i].key, sel) == 0) {
-                uint64_t ch = pb_child(SELF, sel, children[i].child);
-                if (children[i].elem)
-                    pb_set(ch, "__elem", (uint64_t)(uintptr_t)children[i].elem);
-                RET(ch);
-                return;
-            }
+    const char *key;
+    if (sel_info(c->x[1], &key) == SEL_GET) {
+        Class *k = objc_class_of(SELF);
+        for (int i = 0; i < nchildren; i++) {
+            if (children[i].key != key)
+                continue;
+            for (Class *o = k; o; o = o->super)
+                if (children[i].owner == o) {
+                    uint64_t ch = pb_child_at(SELF, children[i].at_key, children[i].child);
+                    if (children[i].elem)
+                        pb_set(ch, "__elem", (uint64_t)(uintptr_t)children[i].elem);
+                    RET(ch);
+                    return;
+                }
+        }
     }
     bag_fallback(c);
 }
 
 static void array_object_at(Ctx *c)
 {
-    char k[32];
-    snprintf(k, sizeof k, "%llu", (unsigned long long)MARG(0));
     Class *elem = (Class *)(uintptr_t)pb_get(SELF, "__elem", 0);
-    RET(pb_child(SELF, k, elem));
+    RET(pb_child_at(SELF, index_key("@", MARG(0)), elem));
 }
 static void array_set_object(Ctx *c)
 {
-    char k[32];
-    snprintf(k, sizeof k, "@%llu", (unsigned long long)MARG(1));
     PropBag *b = bag(SELF);
-    int i = pb_slot(b, k);
+    int i = pb_slot(b, index_key("@", MARG(1)));
     objc_retain_obj(MARG(0));
     if (b->p[i].v)
         objc_release_obj(b->p[i].v);
@@ -226,18 +342,8 @@ static void array_set_object(Ctx *c)
 }
 
 /* element of a descriptor array if it exists (no creation) */
-static uint64_t pb_elem(uint64_t arr, int i)
-{
-    char k[32];
-    snprintf(k, sizeof k, "@%d", i);
-    return arr ? pb_get(arr, k, 0) : 0;
-}
-static uint64_t pb_existing_child(uint64_t obj, const char *key)
-{
-    char k[64];
-    snprintf(k, sizeof k, "@%s", key);
-    return obj ? pb_get(obj, k, 0) : 0;
-}
+static uint64_t pb_elem(uint64_t arr, int i) { return arr ? pb_get(arr, index_key("@", (uint64_t)i), 0) : 0; }
+static uint64_t pb_existing_child(uint64_t obj, const char *key) { return obj ? pb_get(obj, at_key(key), 0) : 0; }
 
 static const Method bag_methods[] = { { NULL, NULL } };
 static const Method array_methods[] = {
@@ -277,6 +383,10 @@ static void define_children(void)
     };
     memcpy(children, defs, sizeof defs);
     nchildren = (int)(sizeof defs / sizeof defs[0]);
+    for (int i = 0; i < nchildren; i++) {
+        children[i].key = intern(children[i].key);    /* compared with sel_info's keys */
+        children[i].at_key = at_key(children[i].key);
+    }
 }
 
 /* +[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:width:height:mipmapped:] */
@@ -1520,6 +1630,10 @@ void metal_present(uint64_t drawable)
                 rt_log("[fps] %.1f fps, %.1f ms/frame (worst %.1f), %.1f ms of it waiting in swap\n",
                        frames * 1e6 / (double)(t1 - window), (t1 - window) / 1000.0 / frames, frame_max / 1000.0,
                        swap_us / 1000.0 / frames);
+                if (getenv("MINA_OBJSTATS")) {
+                    void objc_stats(void);
+                    objc_stats();
+                }
                 frames = 0;
                 window = t1;
                 swap_us = frame_max = 0;

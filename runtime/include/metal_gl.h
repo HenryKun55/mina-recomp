@@ -26,10 +26,14 @@
 /* ---- property bags ------------------------------------------------------------ */
 
 #define PB_MAX 40
+#define PB_MAX_D 2      /* properties with floating-point values (clearColor, lodMinClamp...) */
 
+/* Keys are permanent strings (interned or literals), never freed. */
 typedef struct PropBag {
-    struct { const char *key; uint64_t v; double d[4]; } p[PB_MAX];
-    int n;
+    struct { const char *key; uint64_t v; } p[PB_MAX];
+    int8_t di[PB_MAX];          /* index into d, or -1 */
+    double d[PB_MAX_D][4];
+    int n, nd;
 } PropBag;
 
 uint64_t pb_get(uint64_t obj, const char *key, uint64_t def);

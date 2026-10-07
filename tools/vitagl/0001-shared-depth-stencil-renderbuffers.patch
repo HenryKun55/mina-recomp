@@ -1,5 +1,5 @@
 diff --git a/source/framebuffers.c b/source/framebuffers.c
-index 15e59ea..0e8b123 100644
+index 15e59ea..2526f2b 100644
 --- a/source/framebuffers.c
 +++ b/source/framebuffers.c
 @@ -243,6 +243,7 @@ void glGenRenderbuffers(GLsizei n, GLuint *ids) {
@@ -88,7 +88,7 @@ index 15e59ea..0e8b123 100644
  }
  
  void glNamedRenderbufferStorage(GLuint target, GLenum internalformat, GLsizei width, GLsizei height) {
-@@ -956,6 +980,22 @@ void vglTexImageDepthBuffer(GLenum target) {
+@@ -956,6 +980,31 @@ void vglTexImageDepthBuffer(GLenum target) {
  	}
  }
  
@@ -106,6 +106,15 @@ index 15e59ea..0e8b123 100644
 +	sceGxmDepthStencilSurfaceSetForceStoreMode(&r->depthbuffer, SCE_GXM_DEPTH_STENCIL_FORCE_STORE_ENABLED);
 +	sceGxmTextureInitLinear(&tex->gxm_tex, r->depthbuffer.depthData, SCE_GXM_TEXTURE_FORMAT_DF32M, width, height, 0);
 +	tex->status = TEX_VALID;
++}
++
++// Whether a renderbuffer's depth/stencil is loaded from memory when a scene
++// starts (with STORE_DEPTH_STENCIL always, by default): not needed when the
++// pass clears them anyway.
++void vglRenderbufferForceLoad(GLuint rb, GLboolean load) {
++	renderbuffer *r = (renderbuffer *)rb;
++	if (r && r->has_surface)
++		sceGxmDepthStencilSurfaceSetForceLoadMode(&r->depthbuffer, load ? SCE_GXM_DEPTH_STENCIL_FORCE_LOAD_ENABLED : SCE_GXM_DEPTH_STENCIL_FORCE_LOAD_DISABLED);
 +}
 +
  GLboolean glIsFramebuffer(GLuint fb) {
@@ -155,14 +164,15 @@ index 7b5d704..5f8f260 100644
  								fb->depthbuffer_ptr = NULL;
  								fb->depthbuffer_state = DEPTHBUFFER_MISSING;
 diff --git a/source/vitaGL.h b/source/vitaGL.h
-index eeec610..e3dfb33 100644
+index eeec610..51251ce 100644
 --- a/source/vitaGL.h
 +++ b/source/vitaGL.h
-@@ -1301,6 +1301,7 @@ GLboolean vglSwapResolution(int width, int height);
+@@ -1301,6 +1301,8 @@ GLboolean vglSwapResolution(int width, int height);
  
  // Loads the depth buffer of the currently bound renderbuffer into the currently bound GL texture.
  void vglTexImageDepthBuffer(GLenum target);
 +void vglTexImageRenderbufferDepth(GLuint rb, GLsizei width, GLsizei height); // Binds a renderbuffer's depth to the bound 2D texture
++void vglRenderbufferForceLoad(GLuint rb, GLboolean load); // Loads a renderbuffer's depth/stencil at scene start (or not)
  
  // Makes vitaGL use cached memory instead of uncached memory for its internal memory pools. Must be called before vglInit*.
  void vglUseCachedMem(GLboolean use);

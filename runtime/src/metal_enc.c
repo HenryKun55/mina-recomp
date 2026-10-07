@@ -179,6 +179,15 @@ static void pass_begin(REnc *e)
     } else
 #endif
     e->fbo = metal_pass_fbo(e->color, e->levels, e->dtex, e->stex);
+#if defined(__vita__)
+    {   /* depth/stencil come from memory only when the pass loads them */
+        MTexture *ds = e->dtex ? e->dtex : e->stex;
+        if (ds && ds->is_rb) {
+            void vglRenderbufferForceLoad(GLuint rb, GLboolean load);   /* deps/vitaGL patch */
+            vglRenderbufferForceLoad(ds->gl, !(e->clear_depth || !e->dtex) || !(e->clear_stencil || !e->stex));
+        }
+    }
+#endif
     glBindFramebuffer(GL_FRAMEBUFFER, e->fbo);
     glViewport(0, 0, (GLsizei)e->tw, (GLsizei)e->th);
     glDepthRange(0.0, 1.0);

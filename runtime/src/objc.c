@@ -13,15 +13,24 @@ typedef struct Map {
 } Map;
 
 static void map_put(Map *m, uint32_t k, void *v);
+static uint64_t stat_gets, stat_probes;
 
-static uint32_t mhash(uint32_t k) { return (k >> 3) * 0x9E3779B1u; }
+/* the high bits of the product, folded down: addresses are 16-byte aligned, so the
+ * low bits of a plain multiply would leave most slots unused */
+static uint32_t mhash(uint32_t k)
+{
+    k *= 0x9E3779B1u;
+    return k ^ (k >> 16);
+}
 
 static void *map_get(const Map *m, uint32_t k)
 {
     if (!m->cap)
         return NULL;
     uint32_t h = mhash(k) & (m->cap - 1);
+    stat_gets++;
     while (m->keys[h]) {
+        stat_probes++;
         if (m->keys[h] == k)
             return m->vals[h];
         h = (h + 1) & (m->cap - 1);
@@ -56,25 +65,56 @@ static void map_put(Map *m, uint32_t k, void *v)
     m->vals[h] = v;
 }
 
-/* Deleting leaves the key with a NULL value (a tombstone that lookups skip). */
+/* Deleting shifts the rest of the probe chain back (no tombstones: tables of
+ * objects made and freed every frame would fill with them). */
 static void map_del(Map *m, uint32_t k)
 {
     if (!m->cap)
         return;
-    uint32_t h = mhash(k) & (m->cap - 1);
-    while (m->keys[h]) {
-        if (m->keys[h] == k) {
-            m->vals[h] = NULL;
-            return;
+    uint32_t mask = m->cap - 1, h = mhash(k) & mask;
+    while (m->keys[h] && m->keys[h] != k)
+        h = (h + 1) & mask;
+    if (!m->keys[h])
+        return;
+    uint32_t hole = h;
+    for (uint32_t j = (h + 1) & mask; m->keys[j]; j = (j + 1) & mask) {
+        uint32_t home = mhash(m->keys[j]) & mask;
+        /* the entry at j may move to the hole if its home is not in (hole, j] */
+        if (((j - home) & mask) >= ((j - hole) & mask)) {
+            m->keys[hole] = m->keys[j];
+            m->vals[hole] = m->vals[j];
+            hole = j;
         }
-        h = (h + 1) & (m->cap - 1);
     }
+    m->keys[hole] = 0;
+    m->vals[hole] = NULL;
+    m->count--;
 }
 
 static pthread_mutex_t objc_lock = PTHREAD_MUTEX_INITIALIZER;
-static Map class_by_obj;        /* class object / metaclass -> Class */
-static Map meta_addrs;          /* metaclass address -> Class (class-method lookups) */
-static Map objects;             /* object address -> Obj */
+static Map class_by_obj, meta_addrs, objects;
+
+/* MINA_OBJSTATS: the object tables (size, lookups, probes per lookup) */
+static void map_stats(const char *name, const Map *m)
+{
+    uint64_t probes = 0;
+    for (uint32_t i = 0; i < m->cap; i++)
+        if (m->keys[i])
+            probes += ((i - (mhash(m->keys[i]) & (m->cap - 1))) & (m->cap - 1)) + 1;
+    rt_log("[objstats] %s: %u of %u, %.2f probes per hit\n", name, m->count, m->cap,
+           m->count ? (double)probes / m->count : 0.0);
+}
+void objc_stats(void)
+{
+    map_stats("objects", &objects);
+    map_stats("classes", &class_by_obj);
+    map_stats("metaclasses", &meta_addrs);
+    rt_log("[objstats] %llu lookups, %.2f probes each\n", (unsigned long long)stat_gets,
+           stat_gets ? (double)stat_probes / stat_gets : 0.0);
+    stat_gets = stat_probes = 0;
+}
+/* class_by_obj: class object / metaclass -> Class; meta_addrs: metaclass address ->
+ * Class (class-method lookups); objects: object address -> Obj */
 static Class *classes[512];
 static int nclasses;
 
