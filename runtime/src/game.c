@@ -2,6 +2,7 @@
  * then replaced where the recompiled code is too slow for the Vita. */
 #include "runtime.h"
 
+#include <arm_neon.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,6 +28,24 @@ static uint64_t now_us(void)
 #define lp(a) ((uint64_t)rt_ld32(GP(a)))
 #define ldfp(a) ({ float f_; memcpy(&f_, GP(a), 4); f_; })
 #define stfp(a, v) do { float f_ = (v); memcpy(GP(a), &f_, 4); } while (0)
+
+/* 64- and 24-byte float blocks into guest memory (any alignment) with NEON:
+ * GCC's memcpy for them is a loop of four single stores per 16 bytes */
+static inline void put_mat(void *dst, const float *m)
+{
+    float *d = dst;
+    const float32x4_t a = vld1q_f32(m), b = vld1q_f32(m + 4), c = vld1q_f32(m + 8), e = vld1q_f32(m + 12);
+    vst1q_f32(d, a);
+    vst1q_f32(d + 4, b);
+    vst1q_f32(d + 8, c);
+    vst1q_f32(d + 12, e);
+}
+static inline void put_box(void *dst, const float *b)
+{
+    float *d = dst;
+    vst1q_f32(d, vld1q_f32(b));
+    vst1_f32(d + 4, vld1_f32(b + 4));
+}
 
 /* MINA_FPS: fixed updates (Game::FixedUpdate) and updates per presented frame,
  * and the time spent in them */
@@ -248,12 +267,12 @@ static void update_bounds(Ctx *c)
             box[3 + a] = e;
         }
     }
-    memcpy(GP(lp(self + 0x80)), box, sizeof box);
+    put_box(GP(lp(self + 0x80)), box);
     for (int k = 1; k < 4; k++) {
         uint64_t p = lp(self + 0x80 + 8 * k);
         if (!p)
             break;
-        memcpy(GP(p), box, sizeof box);
+        put_box(GP(p), box);
     }
 }
 void f_d3e24_orig(Ctx *c);
@@ -482,12 +501,12 @@ static void recalc_world_transform(Ctx *c)
             break;
         stfp(p + 4, hook);
     }
-    memcpy(GP(lp(O + 0x60)), m, sizeof m);
+    put_mat(GP(lp(O + 0x60)), m);
     for (int k = 1; k < 4; k++) {
         uint64_t p = lp(O + 0x60 + 8 * k);
         if (!p)
             break;
-        memcpy(GP(p), m, sizeof m);
+        put_mat(GP(p), m);
     }
     c->x[0] = O;
     update_bounds(c);
