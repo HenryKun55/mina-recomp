@@ -119,6 +119,9 @@ class Program:
         stub_map = m.stub_imports()
         for b in m.binds:
             self._imp(b.name)
+        # GOT slots of objc_msgSend: the selector stubs that branch through one
+        # get a send cache of their own (objc_msgSend_site)
+        self.msgsend_got = {b.addr for b in m.binds if b.name == "_objc_msgSend"}
         for name in stub_map.values():
             self._imp(name)
         self.stub_import = {}
@@ -878,7 +881,25 @@ class Lower:
             self.emit("default: rt_bad_jump(c, 0x%xu, %s);" % (rel(ins.addr), r))
             self.emit("}")
             return
+        if self.msgsend_stub():
+            self.tail_seq("{ extern void objc_msgSend_site(Ctx *, uint32_t, const void **); "
+                          "static const void *site_; objc_msgSend_site(c, (uint32_t)%s, &site_); }" % self.X(1, 1))
+            return
         self.tail_seq("{ static const GuestFunc *ic_; RT_CALL_IC(c, %s, ic_); }" % r)
+
+    def msgsend_stub(self):
+        """An _objc_msgSend$sel stub: x1 = the selector, then br x16 = objc_msgSend."""
+        st = self.p.objc_stubs
+        if not st or not (st.addr <= self.fn.start < st.end) or self.test_mode:
+            return False
+        page = got = None
+        for ins in self.fn.insns:
+            if ins.op == "adrp" and ins.rd == 16:
+                page = ins.target
+            elif ins.op == "ldst" and ins.load and ins.rt == 16 and ins.rn == 16 and ins.mode == "off" \
+                    and ins.size == 8 and page is not None:
+                got = page + ins.imm
+        return got in self.p.msgsend_got
 
     def i_blr(self, ins):
         r = self.X(ins.rn, 1)

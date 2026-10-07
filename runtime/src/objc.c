@@ -390,13 +390,15 @@ typedef struct CacheEnt {
 } CacheEnt;
 static CacheEnt *cache[8192];
 
-static int cached_lookup(Class *k, int meta, uint32_t sel, Imp *out)
+static int cached_lookup_ent(Class *k, int meta, uint32_t sel, Imp *out, const CacheEnt **ent)
 {
     uint32_t h = (uint32_t)(((uintptr_t)k >> 4) * 31u + sel * 2654435761u + (uint32_t)meta) & 8191;
     /* lock-free readers: entries are published with release, read with acquire */
     for (CacheEnt *e = __atomic_load_n(&cache[h], __ATOMIC_ACQUIRE); e; e = e->next)
         if (e->cls == k && e->sel == sel && e->meta == meta) {
             *out = e->imp;
+            if (ent)
+                *ent = e;
             return out->host || out->guest;
         }
     Imp imp = { 0, 0 };
@@ -411,8 +413,11 @@ static int cached_lookup(Class *k, int meta, uint32_t sel, Imp *out)
     __atomic_store_n(&cache[h], e, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&objc_lock);
     *out = imp;
+    if (ent)
+        *ent = e;
     return found;
 }
+static int cached_lookup(Class *k, int meta, uint32_t sel, Imp *out) { return cached_lookup_ent(k, meta, sel, out, NULL); }
 
 static void nil_result(Ctx *c)
 {
@@ -444,23 +449,10 @@ static void dispatch(Ctx *c, Class *k, int meta, uint32_t sel)
         rt_call(c, imp.guest);
 }
 
-/* An object of a host class keeps its Obj in guest bytes the game never reads
- * (they hold only the isa for it): the pointer at +8 and a tag at +16 that
- * matches only that address and pointer; objc_obj takes it without the lock. */
-#define OBJ_TAG_KEY 0xA5C3E1F7u
-static uint32_t obj_tag(uint32_t a, const Obj *o) { return a ^ OBJ_TAG_KEY ^ (uint32_t)(uintptr_t)o ^ 0x00010001u; }
-/* the heap span objects were made in: only there is reading a+8..a+20 safe */
-static uint32_t obj_lo = 0xFFFFFFFFu, obj_hi;
-/* the Obj of a host-class instance, from its tag (NULL: not one) */
-static inline Obj *obj_tagged(uint64_t a)
-{
-    if (a < obj_lo || a > obj_hi)
-        return NULL;
-    uint64_t p;
-    memcpy(&p, G(a + 8), 8);
-    Obj *t = (Obj *)(uintptr_t)p;
-    return t && rt_ld32(G(a + 16)) == obj_tag((uint32_t)a, t) ? t : NULL;
-}
+/* tagged host objects: see objc_rt.h (objc_obj_tagged) */
+uint32_t g_obj_lo = 0xFFFFFFFFu, g_obj_hi;
+#define obj_tagged objc_obj_tagged
+#define obj_tag objc_obj_tag
 
 static void resolve_receiver(uint64_t recv, Class **k, int *meta)
 {
@@ -484,6 +476,40 @@ static void resolve_receiver(uint64_t recv, Class **k, int *meta)
     }
     *k = map_get(&class_by_obj, (uint32_t)rt_ld64(G(recv)));
     *meta = 0;
+}
+
+static void resolve_receiver(uint64_t recv, Class **k, int *meta);
+
+/* A selector stub of the game (_objc_msgSend$sel): the method cache entry of
+ * its last receiver class stays with the stub (entries never change), so a
+ * repeat send is the class check and the call. */
+void objc_msgSend_site(Ctx *c, uint32_t sel, const void **site)
+{
+    uint64_t recv = c->x[0];
+    if (!recv) {
+        nil_result(c);
+        return;
+    }
+    Class *k;
+    int meta;
+    resolve_receiver(recv, &k, &meta);
+    const CacheEnt *e = __atomic_load_n((const CacheEnt **)site, __ATOMIC_RELAXED);
+    if (!e || e->cls != k || e->meta != meta || e->sel != sel || g_trace_imports) {
+        Imp imp;
+        if (!k || !cached_lookup_ent(k, meta, sel, &imp, &e)) {
+            dispatch(c, k, meta, sel);           /* reports it */
+            return;
+        }
+        __atomic_store_n((const CacheEnt **)site, e, __ATOMIC_RELAXED);
+        if (g_trace_imports) {
+            dispatch(c, k, meta, sel);
+            return;
+        }
+    }
+    if (e->imp.host)
+        e->imp.host(c);
+    else
+        rt_call(c, e->imp.guest);
 }
 
 static void imp_objc_msgSend(Ctx *c)
@@ -630,21 +656,25 @@ uint32_t objc_new_object(Class *k)
     o->cls = k;
     o->refs = 1;
     /* host state: the biggest host_size along the chain (subclasses extend it) */
-    uint32_t hs = 0;
+    uint32_t hs = 0, hz = 0;
     for (Class *c = k; c; c = c->super)
-        if (!c->guest && c->host_size > hs)
+        if (!c->guest && c->host_size > hs) {
             hs = c->host_size;
-    if (hs)
-        o->host = calloc(1, hs);
+            hz = c->host_zero;
+        }
+    if (hs) {
+        o->host = malloc(hs);
+        memset(o->host, 0, hz && hz < hs ? hz : hs);
+    }
     pthread_mutex_lock(&objc_lock);
     map_put(&objects, a, o);
     pthread_mutex_unlock(&objc_lock);
     if (tagged) {
         pthread_mutex_lock(&objc_lock);
-        if (a < obj_lo)
-            obj_lo = a;
-        if (a > obj_hi)
-            obj_hi = a;
+        if (a < g_obj_lo)
+            g_obj_lo = a;
+        if (a > g_obj_hi)
+            g_obj_hi = a;
         pthread_mutex_unlock(&objc_lock);
         uint64_t p = (uint64_t)(uintptr_t)o;
         memcpy(G(a + 8), &p, 8);
@@ -666,7 +696,7 @@ Obj *objc_obj(uint64_t a)
     return o;
 }
 
-void *objc_host(uint64_t a)
+void *objc_host_slow(uint64_t a)
 {
     Obj *o = objc_obj(a);
     return o ? o->host : NULL;

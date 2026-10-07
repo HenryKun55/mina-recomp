@@ -30,10 +30,10 @@
 
 /* Keys are permanent strings (interned or literals), never freed. */
 typedef struct PropBag {
+    int n, nd;                  /* first: a new bag zeroes only these (Class.host_zero) */
     struct { const char *key; uint64_t v; } p[PB_MAX];
     int8_t di[PB_MAX];          /* index into d, or -1 */
     double d[PB_MAX_D][4];
-    int n, nd;
 } PropBag;
 
 uint64_t pb_get(uint64_t obj, const char *key, uint64_t def);

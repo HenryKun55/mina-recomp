@@ -147,7 +147,7 @@ static int pb_slot(PropBag *b, const char *key)
     if (b->n >= PB_MAX)
         rt_fatal("property bag full (%s)", key);
     i = b->n++;
-    b->p[i].key = intern(key);
+    b->p[i].key = key;                   /* interned by the caller */
     b->p[i].v = 0;
     b->di[i] = -1;
     return i;
@@ -173,7 +173,11 @@ double pb_getd(uint64_t obj, const char *key, int k, double def)
     int i = b ? pb_find(b, key) : -1;
     return i < 0 ? def : b->di[i] < 0 ? 0.0 : b->d[b->di[i]][k];
 }
-void pb_set(uint64_t obj, const char *key, uint64_t v) { bag(obj)->p[pb_slot(bag(obj), key)].v = v; }
+void pb_set(uint64_t obj, const char *key, uint64_t v)
+{
+    PropBag *b = bag(obj);
+    b->p[pb_slot(b, intern(key))].v = v;
+}
 
 static void bag_dealloc(void *h)
 {
@@ -350,7 +354,8 @@ static const Method array_methods[] = {
     { "objectAtIndexedSubscript:", array_object_at }, { "setObject:atIndexedSubscript:", array_set_object },
     { NULL, NULL },
 };
-static Class cls_PropBag = { "MTLPropBag", "NSObject", bag_methods, NULL, sizeof(PropBag), bag_dealloc, bag_child_getter };
+static Class cls_PropBag = { "MTLPropBag", "NSObject", bag_methods, NULL, sizeof(PropBag), bag_dealloc, bag_child_getter,
+                              .host_zero = offsetof(PropBag, p) };
 static Class cls_BagArray = { "MTLBagArray", "MTLPropBag", array_methods, NULL, 0, NULL };
 
 #define BAG_CLASS(var, name) static Class var = { name, "MTLPropBag", NULL, NULL, 0, NULL }

@@ -39,6 +39,7 @@ struct Class {
     int guest;                   /* defined in the executable */
     uint32_t guest_imethods;     /* method_list_t of a guest class */
     uint32_t guest_cmethods;
+    uint32_t host_zero;          /* bytes of host state zeroed for a new object (0: all) */
 };
 
 typedef struct Obj {
@@ -56,7 +57,33 @@ void objc_register(Class *cls);
 /* Objects */
 uint32_t objc_new_object(Class *cls);          /* refcount 1 */
 Obj *objc_obj(uint64_t addr);                 /* NULL if unknown / nil */
-void *objc_host(uint64_t addr);               /* host state of an object */
+
+/* An object of a host class keeps its Obj in guest bytes the game never reads
+ * (they hold only the isa for it): the pointer at +8 and a tag at +16 that
+ * matches only that address and pointer. Only in the heap span objects were
+ * made in (g_obj_lo..g_obj_hi) is reading those bytes safe. */
+extern uint32_t g_obj_lo, g_obj_hi;
+#define OBJ_TAG_KEY 0xA5C3E1F7u
+static inline uint32_t objc_obj_tag(uint32_t a, const Obj *o)
+{
+    return a ^ OBJ_TAG_KEY ^ (uint32_t)(uintptr_t)o ^ 0x00010001u;
+}
+static inline Obj *objc_obj_tagged(uint64_t a)
+{
+    if (a < g_obj_lo || a > g_obj_hi)
+        return NULL;
+    uint64_t p;
+    memcpy(&p, G(a + 8), 8);
+    Obj *t = (Obj *)(uintptr_t)p;
+    return t && rt_ld32(G(a + 16)) == objc_obj_tag((uint32_t)a, t) ? t : NULL;
+}
+void *objc_host_slow(uint64_t addr);
+/* host state of an object */
+static inline void *objc_host(uint64_t addr)
+{
+    Obj *o = objc_obj_tagged(addr);
+    return o ? o->host : objc_host_slow(addr);
+}
 Class *objc_class_named(const char *name);
 Class *objc_class_of(uint64_t addr);
 int objc_is_class_object(uint64_t addr);
