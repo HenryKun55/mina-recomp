@@ -58,8 +58,29 @@ GuestFn cpu_lookup(uint32_t a)
     return e ? e->fn : NULL;
 }
 
+/* the guest function whose recompiled code contains host address pc (for
+ * reports: which function made a bad call) */
+static const char *guest_func_at_host(const void *pc)
+{
+    uintptr_t best = 0;
+    uint32_t bi = UINT32_MAX;
+    for (uint32_t k = 0; k < g_guest_func_count; k++) {
+        uintptr_t f = (uintptr_t)g_guest_funcs[k].fn;
+        if (f <= (uintptr_t)pc && f > best) {
+            best = f;
+            bi = k;
+        }
+    }
+    return bi == UINT32_MAX ? "?" : g_guest_func_names[bi];
+}
+
 void rt_call_ic(Ctx *c, uint64_t addr, const GuestFunc **ic)
 {
+    if (addr >> 32) {
+        const void *ra = __builtin_return_address(0);
+        rt_log("bad call from the recompiled %s (host %p)\n", guest_func_at_host(ra), ra);
+        rt_bad_jump(c, 0, addr);
+    }
     uint32_t a = (uint32_t)addr;
     if (!(addr >> 32) && !(a >= GUEST_THUNK_BASE && a < GUEST_THUNK_END)) {
         const GuestFunc *e = cpu_entry(a);

@@ -990,3 +990,213 @@ void nat__ZN12ycRenderPass6UpdateEv(Ctx *c)
     }
     render_pass_update(c);
 }
+
+/* ---- ycInputState::UpdateDerivedState ---------------------------------------------------------
+ * For two arrays of inputs (43 at +0x2f4, 137 at +0x650): the value when just
+ * pressed, the time held when just released, the time held; three groups of
+ * five (26-30, 31-35, 36-40 of the first) summed up; then this frame's values
+ * become the previous ones. s0 = dt. */
+void f_a3a00_orig(Ctx *c);
+static void input_array(uint8_t *cur, uint8_t *prev, uint8_t *pressed, uint8_t *hold, uint8_t *released, int n,
+                        float dt)
+{
+    for (int i = 0; i < n; i++) {
+        float cv, pv, h;
+        memcpy(&cv, cur + 4 * i, 4);
+        memcpy(&pv, prev + 4 * i, 4);
+        memcpy(&h, hold + 4 * i, 4);
+        const float p = (pv == 0.0f && cv > 0.0f) ? cv : 0.0f;
+        const float r = (pv > 0.0f && !(cv > 0.0f)) ? h : 0.0f;
+        const float nh = cv > 0.0f ? h + dt : 0.0f;
+        memcpy(pressed + 4 * i, &p, 4);
+        memcpy(released + 4 * i, &r, 4);
+        memcpy(hold + 4 * i, &nh, 4);
+    }
+}
+static void update_derived_state(Ctx *c)
+{
+    uint8_t *s = G(c->x[0]);
+    const float dt = c->v[0].f[0];
+    uint8_t *a = s + 0x2f4;
+    input_array(a, a + 0xac, a + 0x158, a + 0x204, a + 0x2b0, 43, dt);
+    input_array(s + 0x650, s + 0x874, s + 0xa98, s + 0xcbc, s + 0xee0, 137, dt);
+    const float one = 1.0f, zero = 0.0f;
+    for (int g = 0; g < 3; g++) {
+        memcpy(s + 0x1104 + 4 * g, &zero, 4);
+        memcpy(s + 0x111c + 4 * g, &zero, 4);
+        float m = 0.0f;
+        for (int k = 0; k < 5; k++) {
+            const int i = 26 + 5 * g + k;
+            float p, h, r;
+            memcpy(&p, a + 0x158 + 4 * i, 4);
+            memcpy(&h, a + 0x204 + 4 * i, 4);
+            memcpy(&r, a + 0x2b0 + 4 * i, 4);
+            if (p > 0.0f)
+                memcpy(s + 0x1104 + 4 * g, &one, 4);
+            m = k == 0 ? fmax_f32(h, 0.0f) : (m > h ? m : h);
+            if (r > 0.0f)
+                memcpy(s + 0x111c + 4 * g, &one, 4);
+        }
+        memcpy(s + 0x1110 + 4 * g, &m, 4);
+    }
+    memcpy(a + 0xac, a, 0xac);
+    memcpy(s + 0x874, s + 0x650, 0x224);
+}
+void nat__ZN12ycInputState18UpdateDerivedStateEf(Ctx *c)
+{
+    if (verify_xform()) {
+        static uint8_t before[0x1130], mine[0x1130];
+        static uint32_t checked, bad;
+        uint8_t *s = G(c->x[0]);
+        memcpy(before, s, sizeof before);
+        Ctx save = *c;
+        update_derived_state(c);
+        memcpy(mine, s, sizeof mine);
+        memcpy(s, before, sizeof before);
+        *c = save;
+        f_a3a00_orig(c);
+        checked++;
+        if (memcmp(mine, s, sizeof mine) != 0 && bad++ < 10) {
+            size_t i = 0;
+            while (mine[i] == s[i])
+                i++;
+            rt_log("[verify] UpdateDerivedState differs at %#zx\n", i);
+        }
+        if ((checked & 0xfff) == 0)
+            rt_log("[verify] UpdateDerivedState: %u calls checked, %u differ\n", checked, bad);
+        return;
+    }
+    update_derived_state(c);
+}
+
+/* ---- ycCutterAnimComponent::UpdateFrame -------------------------------------------------------
+ * x0 component, s0 dt, w1 whether to update the render frame. The clock (after
+ * a start delay at +0x1c4) times the speed (+0x178) moves the times at +0x15c,
+ * +0x164, +0x168; the frame index (+0x158) steps over the frame durations of
+ * the current animation (+0x17c), forward or backward, looping (+0x170 loops
+ * left, +0x16c loops done) or stopping at the end. If the frame changed (+0x174)
+ * and w1: UpdateRenderFrame. */
+void f_d3b20_orig(Ctx *c);
+void f_d3d2c(Ctx *c);            /* ycCutterAnimComponent::UpdateRenderFrame */
+static void update_frame(Ctx *c)
+{
+    GM_BEGIN;
+    const uint64_t O = c->x[0];
+    float dt = c->v[0].f[0];
+    float adv = 0.0f;
+    if (!*(uint8_t *)GP(O + 0x1ca)) {
+        const float delay = ldfp(O + 0x1c4);
+        if (delay == 0.0f) {
+            adv = dt;
+        } else {
+            float left = delay - dt;
+            left = (left > 0.0f || left != left) ? left : 0.0f;      /* fcsel ls: <= 0 gives 0 */
+            stfp(O + 0x1c4, left);
+            adv = fmax_f32(dt - delay, 0.0f);
+        }
+    }
+    const float speed = ldfp(O + 0x178);
+    const float step = adv * speed;
+    const float a = step + ldfp(O + 0x164);
+    float t = step + ldfp(O + 0x168);
+    stfp(O + 0x164, a);
+    stfp(O + 0x168, t);
+    const float prev = ldfp(O + 0x15c);
+    stfp(O + 0x160, prev);
+    stfp(O + 0x15c, step + prev);
+    *(uint8_t *)GP(O + 0x174) = 0;
+    uint32_t loops = rt_ld32(GP(O + 0x170));
+    int changed = 0;
+    if (loops) {
+        const uint64_t anims = lp(lp(lp(O + 0x40) + 0x10) + 0x30);
+        const uint32_t an = rt_ld32(GP(O + 0x17c));
+        const uint64_t A = anims + 0x38 * (uint64_t)an;
+        const uint64_t frames0 = lp(A + 0x20);
+        uint32_t fi = rt_ld32(GP(O + 0x158));
+        uint64_t fr = frames0 + 0x18 * (uint64_t)fi;
+        int32_t wraps = 4;
+        const float eps = hexf(0xb8d1b717);
+        for (;;) {
+            int dir;
+            const float dur = ldfp(fr + 4);
+            if (speed >= 0.0f && t >= dur + eps) {
+                t = t - dur;
+                dir = 1;
+            } else if (speed < 0.0f && t <= -(dur + eps)) {
+                t = dur + t;
+                dir = -1;
+            } else {
+                break;
+            }
+            stfp(O + 0x168, t);
+            fi = fi + (uint32_t)dir;
+            rt_st32(GP(O + 0x158), fi);
+            *(uint8_t *)GP(O + 0x174) = 1;
+            changed = 1;
+            const uint64_t count = ld_ptr(A + 0x18) >> 34;
+            if ((uint64_t)fi < count) {
+                fr = frames0 + 0x18 * (uint64_t)fi;
+                if (!loops || wraps < 0)
+                    break;
+                continue;
+            }
+            /* past the end: one loop less */
+            if ((int32_t)(loops - 1) >= 0) {
+                loops = loops - 1;
+                rt_st32(GP(O + 0x170), loops);
+            }
+            if (!loops) {
+                const uint32_t idx = (speed >= 0.0f || speed != speed) ? (uint32_t)count - 1 : 0u;
+                rt_st32(GP(O + 0x158), idx);
+                changed = frames0 + 0x18 * (uint64_t)idx != fr;
+                *(uint8_t *)GP(O + 0x174) = (uint8_t)changed;
+                break;
+            }
+            fi = speed < 0.0f ? (uint32_t)count - 1 : 0u;
+            rt_st32(GP(O + 0x158), fi);
+            stfp(O + 0x164, t);
+            rt_st32(GP(O + 0x16c), rt_ld32(GP(O + 0x16c)) + 1);
+            *(uint8_t *)GP(O + 0x174) = 1;
+            if (count == 1)
+                break;
+            wraps--;
+            fr = frames0 + 0x18 * (uint64_t)fi;
+            if (wraps < 0)
+                break;
+        }
+    }
+    if (changed && (uint32_t)c->x[1] & 0xff) {
+        c->x[0] = O;
+        f_d3d2c(c);
+    }
+}
+void nat__ZN21ycCutterAnimComponent11UpdateFrameEfb(Ctx *c)
+{
+    if (verify_xform()) {
+        static uint8_t before[0x200], mine[0x200];
+        static uint32_t checked, bad;
+        uint8_t *s = G(c->x[0]);
+        memcpy(before, s, sizeof before);
+        Ctx save = *c;
+        save.x[1] = 0;                   /* the render frame part is not compared */
+        Ctx run = save;
+        update_frame(&run);
+        memcpy(mine, s, sizeof mine);
+        memcpy(s, before, sizeof before);
+        run = save;
+        f_d3b20_orig(&run);
+        checked++;
+        if (memcmp(mine, s, sizeof mine) != 0 && bad++ < 10) {
+            size_t i = 0;
+            while (mine[i] == s[i])
+                i++;
+            rt_log("[verify] UpdateFrame differs at %#zx\n", i);
+        }
+        if ((checked & 0xfffff) == 0)
+            rt_log("[verify] UpdateFrame: %u calls checked, %u differ\n", checked, bad);
+        memcpy(s, before, sizeof before);
+        update_frame(c);
+        return;
+    }
+    update_frame(c);
+}
