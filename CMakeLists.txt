@@ -88,6 +88,8 @@ target_compile_options(mina_gen PRIVATE ${MINA_ARCH_FLAGS} ${MINA_GEN_FLAGS} -ff
 
 # ---- runtime ----------------------------------------------------------------
 file(GLOB RUNTIME_SOURCES runtime/src/*.c)
+# the game's hot code ported to C (runtime/src/game.c): worth the bigger build
+set_source_files_properties(runtime/src/game.c PROPERTIES COMPILE_OPTIONS "-O3")
 add_executable(mina ${RUNTIME_SOURCES} ${GEN_DIR}/shaders.c $<TARGET_OBJECTS:mina_gen>)
 target_include_directories(mina PRIVATE runtime/include ${GEN_DIR})
 target_compile_definitions(mina PRIVATE ${MINA_DEFS} ${MINA_RUNTIME_DEFS})
