@@ -313,7 +313,8 @@ static void bag_child_getter(Ctx *c)
 {
     const char *key;
     if (sel_info(c->x[1], &key) == SEL_GET) {
-        Class *k = objc_class_of(SELF);
+        Obj *self_o = objc_obj_tagged(SELF);
+        Class *k = self_o ? self_o->cls : objc_class_of(SELF);
         for (int i = 0; i < nchildren; i++) {
             if (children[i].key != key)
                 continue;
@@ -355,7 +356,7 @@ static const Method array_methods[] = {
     { NULL, NULL },
 };
 static Class cls_PropBag = { "MTLPropBag", "NSObject", bag_methods, NULL, sizeof(PropBag), bag_dealloc, bag_child_getter,
-                              .host_zero = offsetof(PropBag, p) };
+                              .host_zero = offsetof(PropBag, p), .poolable = 1 };
 static Class cls_BagArray = { "MTLBagArray", "MTLPropBag", array_methods, NULL, 0, NULL };
 
 #define BAG_CLASS(var, name) static Class var = { name, "MTLPropBag", NULL, NULL, 0, NULL }

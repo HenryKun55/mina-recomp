@@ -3,6 +3,7 @@
 
 #include <pthread.h>
 #include <string.h>
+#include <time.h>
 
 /* ---- small hash map: uint32 key -> pointer -------------------------------- */
 
@@ -643,12 +644,81 @@ static Class *host_ancestor(Class *k)
     return k;
 }
 
+/* MINA_NEWSTATS: objects made per second, by class */
+static void new_stats(Class *k)
+{
+    static int on = -1;
+    static Class *ks[128];
+    static uint32_t n[128], nk;
+    static time_t t0;
+    if (on < 0)
+        on = getenv("MINA_NEWSTATS") != NULL;
+    if (!on)
+        return;
+    uint32_t i = 0;
+    while (i < nk && ks[i] != k)
+        i++;
+    if (i == nk && nk < 128)
+        ks[nk++] = k;
+    if (i < 128)
+        n[i]++;
+    time_t t = time(NULL);
+    if (!t0)
+        t0 = t;
+    if (t - t0 >= 4) {
+        for (uint32_t j = 0; j < nk; j++)
+            if (n[j])
+                rt_log("[new] %s: %u per s (host %u bytes)\n", ks[j]->name, n[j] / (uint32_t)(t - t0), ks[j]->host_size);
+        memset(n, 0, sizeof n);
+        t0 = t;
+    }
+}
+
+/* Objects of host classes are made again from their class's pool: the game
+ * makes and frees descriptors by the hundred per frame (a depth-stencil
+ * descriptor per draw). A pooled object keeps its guest block, its Obj, its
+ * host state and its entry in the object table; it is untagged and its count
+ * is far below zero (a stray release of a stale pointer never frees it). */
+#define POOL_MAX 256
+#define POOL_DEAD (-0x40000000)
+static pthread_mutex_t pool_lock = PTHREAD_MUTEX_INITIALIZER;
+
 uint32_t objc_new_object(Class *k)
 {
+    new_stats(k);
     uint32_t size = k->instance_size < 16 ? 16 : k->instance_size;
     int tagged = !k->guest && size <= 16;
     if (tagged)
         size = 24;
+    if (tagged && k->pool) {
+        pthread_mutex_lock(&pool_lock);
+        Obj *o = k->pool;
+        if (o) {
+            k->pool = o->next;
+            k->pooled--;
+        }
+        pthread_mutex_unlock(&pool_lock);
+        if (o) {
+            uint32_t a = o->addr;
+            rt_st64(G(a), k->obj);
+            o->refs = 1;
+            o->traced = 0;
+            o->next = NULL;
+            if (o->host) {
+                uint32_t hs = 0, hz = 0;
+                for (Class *c = k; c; c = c->super)
+                    if (!c->guest && c->host_size > hs) {
+                        hs = c->host_size;
+                        hz = c->host_zero;
+                    }
+                memset(o->host, 0, hz && hz < hs ? hz : hs);
+            }
+            uint64_t p = (uint64_t)(uintptr_t)o;
+            memcpy(G(a + 8), &p, 8);
+            rt_st32(G(a + 16), obj_tag(a, o));
+            return a;
+        }
+    }
     uint32_t a = gcalloc(1, size);
     rt_st64(G(a), k->obj);
     Obj *o = calloc(1, sizeof *o);
@@ -693,6 +763,26 @@ Obj *objc_obj(uint64_t a)
     pthread_mutex_lock(&objc_lock);
     Obj *o = map_get(&objects, (uint32_t)a);
     pthread_mutex_unlock(&objc_lock);
+    {   /* MINA_OBJSTATS: untagged lookups, by class */
+        static int on = -1;
+        if (on < 0)
+            on = getenv("MINA_OBJSTATS") != NULL;
+        if (on) {
+            static const char *names[64];
+            static uint32_t n[64], nn, total;
+            const char *nm = o ? o->cls->name : "(none)";
+            uint32_t i = 0;
+            while (i < nn && names[i] != nm)
+                i++;
+            if (i == nn && nn < 64)
+                names[nn++] = nm;
+            if (i < 64)
+                n[i]++;
+            if ((++total & 0xffff) == 0)
+                for (uint32_t j = 0; j < nn; j++)
+                    rt_log("[untagged] %s: %u\n", names[j], n[j]);
+        }
+    }
     return o;
 }
 
@@ -747,8 +837,21 @@ static void m_dealloc(Ctx *c)
     for (Class *k = o->cls; k; k = k->super)
         if (!k->guest && k->dealloc && o->host)
             k->dealloc(o->host);
-    if (rt_ld32(G(a + 16)) == obj_tag((uint32_t)a, o))
+    const int tagged = rt_ld32(G(a + 16)) == obj_tag((uint32_t)a, o);
+    if (tagged)
         rt_st32(G(a + 16), 0);                  /* untagged before the memory is reused */
+    int poolable = 0;
+    for (Class *k = o->cls; k && !poolable; k = k->super)
+        poolable = k->poolable;
+    if (tagged && poolable && o->cls->pooled < POOL_MAX && !o->cls->guest) {
+        o->refs = POOL_DEAD;
+        pthread_mutex_lock(&pool_lock);
+        o->next = o->cls->pool;
+        o->cls->pool = o;
+        o->cls->pooled++;
+        pthread_mutex_unlock(&pool_lock);
+        return;
+    }
     pthread_mutex_lock(&objc_lock);
     map_del(&objects, (uint32_t)a);
     pthread_mutex_unlock(&objc_lock);
