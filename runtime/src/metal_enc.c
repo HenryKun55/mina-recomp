@@ -1418,7 +1418,7 @@ static void be_copyBuffer(Ctx *c)
         static int keep = -1;
         if (keep < 0)
             keep = getenv("MINA_KEEP_STAGING") != NULL;
-        if (!keep && so == 0 && n == s->length && !s->fresh) {
+        if (!keep && so == 0 && n == s->length && !s->fresh && !s->keep_contents) {
             gfree(s->contents);
             s->contents = 0;
         }

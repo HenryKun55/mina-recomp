@@ -450,6 +450,16 @@ static void scripted_input(void)
             s += len;
         }
     }
+    {   /* MINA_INPUT_UNTIL_PLAY: no more keys once gameplay starts (after a key's release) */
+        extern int g_in_play;
+        static int until = -1;
+        if (until < 0)
+            until = getenv("MINA_INPUT_UNTIL_PLAY") != NULL;
+        if (until && g_in_play && next < n && !ev[next].up) {
+            rt_log("[input] gameplay: the remaining keys are dropped\n");
+            next = n;
+        }
+    }
     while (next < n && SDL_GetTicks() >= ev[next].at) {
         SDL_Event e;
         memset(&e, 0, sizeof e);

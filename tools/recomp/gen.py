@@ -822,7 +822,7 @@ class Lower:
             self.emit("default: rt_bad_jump(c, 0x%xu, %s);" % (rel(ins.addr), r))
             self.emit("}")
             return
-        self.tail_seq("rt_call(c, %s);" % r)
+        self.tail_seq("{ static const GuestFunc *ic_; RT_CALL_IC(c, %s, ic_); }" % r)
 
     def i_blr(self, ins):
         r = self.X(ins.rn, 1)
@@ -830,7 +830,7 @@ class Lower:
         self.xs.add(30)
         self.wx.add(30)
         self.emit("x30 = 0x%xull;" % rel(ins.addr + 4))
-        self.call_seq("rt_call(c, t_); }")
+        self.call_seq("static const GuestFunc *ic_; RT_CALL_IC(c, t_, ic_); }")
 
     def i_ret(self, ins):
         self.emit("@RET@")

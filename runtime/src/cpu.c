@@ -7,11 +7,21 @@
 #include <execinfo.h>
 #endif
 
-static uint32_t *hash_addr;
-static GuestFn *hash_fn;
+/* address -> function: open addressing over entries that never change once
+ * made (call sites keep pointers to them, see RT_CALL_IC) */
+static GuestFunc *hash_ent;
 static uint32_t hash_mask;
 
 #define HASH(a) (((a) >> 2) * 0x9E3779B1u)
+
+static void hash_put(uint32_t a, GuestFn fn)
+{
+    uint32_t h = HASH(a) & hash_mask;
+    while (hash_ent[h].addr)
+        h = (h + 1) & hash_mask;
+    hash_ent[h].addr = a;
+    hash_ent[h].fn = fn;
+}
 
 void cpu_init(void)
 {
@@ -19,23 +29,23 @@ void cpu_init(void)
     while (size < g_guest_func_count * 2 + g_stub_count * 2)
         size <<= 1;
     hash_mask = size - 1;
-    hash_addr = calloc(size, sizeof *hash_addr);
-    hash_fn = calloc(size, sizeof *hash_fn);
-    for (uint32_t k = 0; k < g_guest_func_count; k++) {
-        uint32_t a = g_guest_funcs[k].addr, h = HASH(a) & hash_mask;
-        while (hash_addr[h])
-            h = (h + 1) & hash_mask;
-        hash_addr[h] = a;
-        hash_fn[h] = g_guest_funcs[k].fn;
-    }
+    hash_ent = calloc(size, sizeof *hash_ent);
+    for (uint32_t k = 0; k < g_guest_func_count; k++)
+        hash_put(g_guest_funcs[k].addr, g_guest_funcs[k].fn);
     /* stubs: code that takes the address of a stub calls the import */
-    for (uint32_t k = 0; k < g_stub_count; k++) {
-        uint32_t a = g_stubs[k].addr, h = HASH(a) & hash_mask;
-        while (hash_addr[h])
-            h = (h + 1) & hash_mask;
-        hash_addr[h] = a;
-        hash_fn[h] = g_import_fns[g_stubs[k].import];
+    for (uint32_t k = 0; k < g_stub_count; k++)
+        hash_put(g_stubs[k].addr, g_import_fns[g_stubs[k].import]);
+}
+
+static const GuestFunc *cpu_entry(uint32_t a)
+{
+    uint32_t h = HASH(a) & hash_mask;
+    while (hash_ent[h].addr) {
+        if (hash_ent[h].addr == a)
+            return &hash_ent[h];
+        h = (h + 1) & hash_mask;
     }
+    return NULL;
 }
 
 GuestFn cpu_lookup(uint32_t a)
@@ -44,13 +54,22 @@ GuestFn cpu_lookup(uint32_t a)
         uint32_t i = (a - GUEST_THUNK_BASE) / 4;
         return i < g_import_count ? g_import_fns[i] : NULL;
     }
-    uint32_t h = HASH(a) & hash_mask;
-    while (hash_addr[h]) {
-        if (hash_addr[h] == a)
-            return hash_fn[h];
-        h = (h + 1) & hash_mask;
+    const GuestFunc *e = cpu_entry(a);
+    return e ? e->fn : NULL;
+}
+
+void rt_call_ic(Ctx *c, uint64_t addr, const GuestFunc **ic)
+{
+    uint32_t a = (uint32_t)addr;
+    if (!(addr >> 32) && !(a >= GUEST_THUNK_BASE && a < GUEST_THUNK_END)) {
+        const GuestFunc *e = cpu_entry(a);
+        if (e) {
+            __atomic_store_n(ic, e, __ATOMIC_RELAXED);
+            e->fn(c);
+            return;
+        }
     }
-    return NULL;
+    rt_call(c, addr);
 }
 
 void rt_call(Ctx *c, uint64_t addr)

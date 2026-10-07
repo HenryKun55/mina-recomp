@@ -23,14 +23,27 @@ static uint64_t now_us(void)
  * and the time spent in them */
 uint32_t g_fixed_updates, g_updates;
 uint64_t g_fixed_us, g_update_us;
+uint32_t g_composites, g_bounds;        /* calls (MINA_FPS) */
+/* gameplay (as opposed to menus and cut-scenes): fixed updates moving
+ * thousands of transforms for a second; MINA_INPUT_UNTIL_PLAY stops the
+ * scripted keys there */
+int g_in_play;
+static uint32_t composites_total;
 
 void f_99f430_orig(Ctx *c);
 void nat__ZN4Game11FixedUpdateEv(Ctx *c)
 {
     uint64_t t0 = now_us();
+    uint32_t before = composites_total;
     g_fixed_updates++;
     f_99f430_orig(c);
     g_fixed_us += now_us() - t0;
+    static int heavy;          /* consecutive fixed updates moving thousands of transforms */
+    heavy = composites_total - before > 4000 ? heavy + 1 : 0;
+    if (heavy == 60 && !g_in_play) {
+        g_in_play = 1;
+        rt_log("[play] gameplay (%u transforms in a fixed update)\n", composites_total - before);
+    }
 }
 
 void f_9a0638_orig(Ctx *c);
@@ -93,6 +106,8 @@ static void verify_against(Ctx *c, void (*nat)(Ctx *), void (*orig)(Ctx *), cons
 
 void nat__ZNK11ycTransform9CompositeERKS_y(Ctx *c)
 {
+    g_composites++;
+    composites_total++;
     if (verify_xform()) {
         verify_against(c, composite, f_1e4cdc_orig, "ycTransform::Composite", sizeof(XForm));
         return;
@@ -230,6 +245,7 @@ static void update_bounds(Ctx *c)
 void f_d3e24_orig(Ctx *c);
 void nat__ZN21ycCutterAnimComponent12UpdateBoundsEv(Ctx *c)
 {
+    g_bounds++;
     if (verify_xform()) {
         /* the outputs are the boxes the object points at */
         static uint32_t checked, bad;

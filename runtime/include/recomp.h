@@ -94,6 +94,17 @@ extern const uint32_t g_objc_classlist, g_objc_classlist_count, g_objc_methname,
 
 /* Indirect call / jump to a guest address (function or import thunk). */
 void rt_call(Ctx *c, uint64_t addr);
+/* The same through a call site's cache: the (never changing) table entry of the
+ * site's last target, one pointer, so threads may share it. Imports are not cached. */
+void rt_call_ic(Ctx *c, uint64_t addr, const GuestFunc **ic);
+#define RT_CALL_IC(c, t, ic)                                                         \
+    do {                                                                             \
+        const GuestFunc *e_ = __atomic_load_n(&(ic), __ATOMIC_RELAXED);              \
+        if (e_ != NULL && e_->addr == (t))                                          \
+            e_->fn(c);                                                               \
+        else                                                                         \
+            rt_call_ic((c), (t), &(ic));                                             \
+    } while (0)
 /* Import i called directly through its stub. */
 extern GuestFn g_import_fns[];
 #define IMPORT_CALL(c, i) ((c)->cur_import = (i), g_import_fns[i](c))

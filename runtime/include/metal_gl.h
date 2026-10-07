@@ -54,6 +54,7 @@ typedef struct MBuffer {
     int contents_asked;      /* times the game asked for the CPU pointer */
     int gpu_only;            /* MTLStorageModePrivate: only the GL buffer exists */
     uint8_t *shadow;         /* CPU copy of a small private buffer (index data) */
+    int keep_contents;       /* used again after its upload once: its memory stays (no churn) */
 } MBuffer;
 
 /* guest memory of a shared buffer (given back after a whole-buffer upload: made again on use) */

@@ -1141,8 +1141,9 @@ uint32_t metal_buf_mem(MBuffer *b)
     if (!b->contents && !b->gpu_only) {
         static int told;
         if (told++ < 8)
-            rt_log("metal: a %u-byte buffer is used again after its upload\n", b->length);
+            rt_log("metal: a %u-byte buffer is used again after its upload: it keeps its memory now\n", b->length);
         b->contents = gcalloc(1, b->length ? b->length : 16);
+        b->keep_contents = 1;
     }
     return b->contents;
 }
@@ -1638,6 +1639,9 @@ void metal_present(uint64_t drawable)
                        frames * 1e6 / (double)(t1 - window), (t1 - window) / 1000.0 / frames, frame_max / 1000.0,
                        swap_us / 1000.0 / frames, g_updates / (double)frames, g_update_us / 1000.0 / frames,
                        g_fixed_updates / (double)frames, g_fixed_us / 1000.0 / frames);
+                extern uint32_t g_composites, g_bounds;
+                rt_log("[fps]   per frame: %u Composite, %u UpdateBounds\n", g_composites / frames, g_bounds / frames);
+                g_composites = g_bounds = 0;
                 g_updates = g_fixed_updates = 0;
                 g_fixed_us = g_update_us = 0;
                 if (getenv("MINA_OBJSTATS")) {

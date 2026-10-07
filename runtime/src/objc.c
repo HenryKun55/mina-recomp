@@ -593,9 +593,20 @@ static Class *host_ancestor(Class *k)
     return k;
 }
 
+/* An object of a host class keeps its Obj in guest bytes the game never reads
+ * (they hold only the isa for it): the pointer at +8 and a tag at +16 that
+ * matches only that address and pointer; objc_obj takes it without the lock. */
+#define OBJ_TAG_KEY 0xA5C3E1F7u
+static uint32_t obj_tag(uint32_t a, const Obj *o) { return a ^ OBJ_TAG_KEY ^ (uint32_t)(uintptr_t)o ^ 0x00010001u; }
+/* the heap span objects were made in: only there is reading a+8..a+20 safe */
+static uint32_t obj_lo = 0xFFFFFFFFu, obj_hi;
+
 uint32_t objc_new_object(Class *k)
 {
     uint32_t size = k->instance_size < 16 ? 16 : k->instance_size;
+    int tagged = !k->guest && size <= 16;
+    if (tagged)
+        size = 24;
     uint32_t a = gcalloc(1, size);
     rt_st64(G(a), k->obj);
     Obj *o = calloc(1, sizeof *o);
@@ -612,6 +623,17 @@ uint32_t objc_new_object(Class *k)
     pthread_mutex_lock(&objc_lock);
     map_put(&objects, a, o);
     pthread_mutex_unlock(&objc_lock);
+    if (tagged) {
+        pthread_mutex_lock(&objc_lock);
+        if (a < obj_lo)
+            obj_lo = a;
+        if (a > obj_hi)
+            obj_hi = a;
+        pthread_mutex_unlock(&objc_lock);
+        uint64_t p = (uint64_t)(uintptr_t)o;
+        memcpy(G(a + 8), &p, 8);
+        rt_st32(G(a + 16), obj_tag(a, o));
+    }
     return a;
 }
 
@@ -619,6 +641,13 @@ Obj *objc_obj(uint64_t a)
 {
     if (!a)
         return NULL;
+    if (a >= obj_lo && a <= obj_hi) {
+        uint64_t p;
+        memcpy(&p, G(a + 8), 8);
+        Obj *t = (Obj *)(uintptr_t)p;
+        if (rt_ld32(G(a + 16)) == obj_tag((uint32_t)a, t) && t)
+            return t;
+    }
     pthread_mutex_lock(&objc_lock);
     Obj *o = map_get(&objects, (uint32_t)a);
     pthread_mutex_unlock(&objc_lock);
@@ -676,6 +705,8 @@ static void m_dealloc(Ctx *c)
     for (Class *k = o->cls; k; k = k->super)
         if (!k->guest && k->dealloc && o->host)
             k->dealloc(o->host);
+    if (rt_ld32(G(a + 16)) == obj_tag((uint32_t)a, o))
+        rt_st32(G(a + 16), 0);                  /* untagged before the memory is reused */
     pthread_mutex_lock(&objc_lock);
     map_del(&objects, (uint32_t)a);
     pthread_mutex_unlock(&objc_lock);
