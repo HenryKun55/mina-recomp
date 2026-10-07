@@ -1021,6 +1021,14 @@ static void link_program(MPipeline *p)
     }
     glGenVertexArrays(1, &p->vao);
     p->yflip_loc = glGetUniformLocation(p->prog, "mina_yflip");
+    p->depth_cmp_loc = glGetUniformLocation(p->prog, "mina_depth_cmp");
+    p->dst_xform_loc = glGetUniformLocation(p->prog, "mina_dst_xform");
+    p->dst_depth_unit = -1;
+    GLint dl = glGetUniformLocation(p->prog, "mina_dst_depth");
+    if (dl >= 0 && p->depth_cmp_loc >= 0) {
+        p->dst_depth_unit = p->ntex;
+        glUniform1i(dl, p->ntex);
+    }
 }
 
 /* ---- pipeline reflection: what the engine binds per draw ---------------------------- */

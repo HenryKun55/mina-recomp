@@ -77,6 +77,7 @@ typedef struct REnc {
     int vp_set, sc_set;
     int to_display;                      /* Vita: the drawable's pass draws to the screen */
     int folded;                          /* Vita: its copy was folded (fold_pass), nothing drawn yet */
+    int depth_stale;                     /* Vita: the depth in memory is not the pass's (depth_by_shader) */
     struct MTexture *ftex_folded;        /* the copy's source */
     double vp[6];
     int sc[4];
@@ -415,6 +416,7 @@ void metal_fold_forget(MTexture *t) { (void)t; }
 static void pass_begin(REnc *e)
 {
     e->begun = 1;
+    e->depth_stale = 1;
 #if defined(__vita__)
     fold_pass_targets(e);
 #endif
@@ -813,6 +815,10 @@ static void apply_state(REnc *e, MPipeline *p)
     if (ds && (ds->write || (ds->stencil_enabled && !(stencil_keeps(&ds->front) && stencil_keeps(&ds->back))))) {
         MTexture *d = e->dtex ? e->dtex : e->stex;
         d->clear_valid = 0;             /* written from now on */
+#if defined(__vita__)
+        if (p->dst_depth_unit < 0)      /* depth_by_shader's draws write none */
+            e->depth_stale = 1;
+#endif
     }
     if (ds && ds->stencil_enabled
 #if defined(__vita__)
@@ -945,7 +951,12 @@ static int vertex_format(uint32_t f, VFmt *v)
     case 37: *v = (VFmt){ 2, GL_UNSIGNED_INT, 0, 1 }; return 1;
     case 38: *v = (VFmt){ 3, GL_UNSIGNED_INT, 0, 1 }; return 1;
     case 39: *v = (VFmt){ 4, GL_UNSIGNED_INT, 0, 1 }; return 1;
+#if defined(__vita__)
+    /* vitaGL has no GL_BGRA size: the bytes are swapped at upload (apply_vertices) */
+    case 42: *v = (VFmt){ 4, GL_UNSIGNED_BYTE, 1, 0 }; return 1;
+#else
     case 42: *v = (VFmt){ GL_BGRA, GL_UNSIGNED_BYTE, 1, 0 }; return 1;
+#endif
     case 45: *v = (VFmt){ 1, GL_UNSIGNED_BYTE, 0, 0 }; return 1;
     case 47: *v = (VFmt){ 1, GL_UNSIGNED_BYTE, 1, 0 }; return 1;
     case 49: *v = (VFmt){ 1, GL_UNSIGNED_SHORT, 0, 0 }; return 1;
@@ -971,6 +982,14 @@ static void apply_vertices(REnc *e, MPipeline *p, uint32_t max_vertex, uint32_t 
         if (!(done & (1u << bi))) {
             const Binding *bd = &e->vb[bi];
             if (bd->buf && bd->buf->gpu_only) {
+#if defined(__vita__)
+                for (int a2 = 0; a2 < MAX_ATTRS; a2++)
+                    if ((p->attr_mask & (1u << a2)) && p->attrs[a2].format == 42 && p->attrs[a2].buffer % MAX_VBUF == bi) {
+                        static int told;
+                        if (!told++)
+                            rt_log("metal: BGRA vertex colors in a private buffer: drawn as RGBA\n");
+                    }
+#endif
                 /* private buffer: read in place */
                 vbo[bi] = bd->buf->gl;
                 base[bi] = bd->offset;
@@ -982,7 +1001,28 @@ static void apply_vertices(REnc *e, MPipeline *p, uint32_t max_vertex, uint32_t 
                 uint32_t need = lay->stride * count;
                 if (max_vertex == UINT32_MAX || need > avail)
                     need = avail;
+#if defined(__vita__)
+                /* BGRA byte attributes in this buffer: R and B swapped in the copy */
+                uint8_t *sw = NULL;
+                for (int a2 = 0; a2 < MAX_ATTRS && d && need; a2++) {
+                    const MVertexAttr *x = &p->attrs[a2];
+                    if (!(p->attr_mask & (1u << a2)) || x->format != 42 || x->buffer % MAX_VBUF != bi)
+                        continue;
+                    if (!sw) {
+                        sw = malloc(need);
+                        memcpy(sw, d, need);
+                    }
+                    for (uint32_t o = x->offset; lay->stride && o + 4 <= need; o += lay->stride) {
+                        const uint8_t t = sw[o];
+                        sw[o] = sw[o + 2];
+                        sw[o + 2] = t;
+                    }
+                }
+                base[bi] = d && need ? ring_upload(sw ? sw : d, need) : 0;
+                free(sw);
+#else
                 base[bi] = d && need ? ring_upload(d, need) : 0;
+#endif
                 vbo[bi] = ring;
             }
             done |= 1u << bi;
@@ -1050,6 +1090,60 @@ static int draw_is_noop(REnc *e, MPipeline *p)
         }
     return 0;
 }
+
+#if defined(__vita__)
+/* A fragment shader that writes its depth (a layer composited with the depth
+ * it was drawn with: the logo, the world's layers) tests it itself, against
+ * the target's depth sampled as a texture: the scene drawn so far ends (its
+ * depth stored) and another begins on the same target, loading it. The depth
+ * it would write is not: later depth-tested draws of the pass see the old one. */
+static void depth_by_shader(REnc *e, MPipeline *p)
+{
+    static int no_depth = -1, off;
+    if (no_depth < 0) {
+        no_depth = getenv("MINA_NO_DEPTH") != NULL;
+        off = getenv("MINA_NO_DEPTH_FS") != NULL;   /* the fixed-function test with the quad's depth, as before */
+    }
+    MDepthStencil *ds = e->ds && e->dtex ? objc_host(e->ds) : NULL;
+    int cmp = ds && !no_depth && !off && e->dtex->is_rb ? (int)ds->compare : 7;
+    if (cmp != 7) {
+        MTexture *d = e->dtex;
+        if (!d->depth_tex) {         /* a depth buffer never sampled before */
+            void vglTexImageRenderbufferDepth(GLuint rb, GLsizei width, GLsizei height);   /* deps/vitaGL patch */
+            glActiveTexture(GL_TEXTURE0 + (GLenum)p->dst_depth_unit);
+            glGenTextures(1, &d->depth_tex);
+            glBindTexture(GL_TEXTURE_2D, d->depth_tex);
+            vglTexImageRenderbufferDepth(d->gl, (GLsizei)d->width, (GLsizei)d->height);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        }
+        void vglRenderbufferForceLoad(GLuint rb, GLboolean load);   /* deps/vitaGL patch */
+        void vglRestartScene(void);
+        if (e->depth_stale) {        /* not in memory since the last restart */
+            vglRenderbufferForceLoad(d->gl, GL_TRUE);
+            vglRestartScene();
+            e->depth_stale = 0;
+        }
+        d->sampled = 1;
+        glActiveTexture(GL_TEXTURE0 + (GLenum)p->dst_depth_unit);
+        glBindTexture(GL_TEXTURE_2D, d->depth_tex);
+        glBindSampler((GLuint)p->dst_depth_unit, 0);
+        static int flip = -1;
+        if (flip < 0)
+            flip = getenv("MINA_DST_FLIP") != NULL;
+        float w = 1.0f / (float)d->width, h = 1.0f / (float)d->height;
+        glUniform4f(p->dst_xform_loc, w, flip ? -h : h, 0.0f, flip ? 1.0f : 0.0f);
+        glDisable(GL_DEPTH_TEST);
+        glDepthMask(GL_FALSE);
+        if (ds->write) {
+            static int n;
+            if (n++ < 4)
+                rt_log("metal: fs %d writes its depth: not kept on the Vita\n", p->fs);
+        }
+    }
+    glUniform1f(p->depth_cmp_loc, (float)cmp);
+}
+#endif
 
 static MPipeline *draw_setup(REnc *e)
 {
@@ -1137,6 +1231,10 @@ static MPipeline *draw_setup(REnc *e)
     apply_state(e, p);
     apply_uniforms(e, p);
     apply_textures(e, p);
+#if defined(__vita__)
+    if (p->dst_depth_unit >= 0)
+        depth_by_shader(e, p);
+#endif
     return p;
 }
 

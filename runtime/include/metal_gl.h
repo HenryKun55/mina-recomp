@@ -149,6 +149,11 @@ typedef struct MPipeline {
     int ntex;
     GLuint vao;
     GLint yflip_loc;         /* Vita: mina_yflip (-1 framebuffers, +1 the screen) */
+    /* Vita: a fragment shader that writes its depth tests it itself (GXM has
+     * no depth output): Metal's compare in mina_depth_cmp, the target's depth
+     * texture on unit dst_depth_unit, mina_dst_xform window position -> its coordinates */
+    GLint depth_cmp_loc, dst_xform_loc;
+    int dst_depth_unit;
 } MPipeline;
 
 /* GLSL translated from the game's metallibs (generated: build/gen/shaders.c) */
@@ -159,6 +164,7 @@ typedef struct ShaderSrc {
     int discards_clear0;     /* fragment: discards where texture 0's alpha is 0 (a cleared layer draws nothing) */
     int gamma_copy0;         /* fragment: (pow(texture 0 .rgb, fcb1[0].x), 1) at the quad's coordinates */
     unsigned rgb_only;       /* fragment: bit N, texture N's alpha is never read */
+    int writes_depth;        /* fragment: writes its depth (CG: tests it itself, mina_depth_pass) */
 } ShaderSrc;
 extern const ShaderSrc g_shaders[];
 extern const int g_shader_count;
