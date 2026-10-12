@@ -725,11 +725,11 @@ uint32_t objc_new_object(Class *k)
     o->addr = a;
     o->cls = k;
     o->refs = 1;
-    {   /* MINA_TRACE_CLASS=name: retains, releases and deallocs of that class's objects */
+    {   /* MINA_TRACE_CLASS=name[,name...]: retains, releases and deallocs of that class's objects */
         static const char *tc = (const char *)1;
         if (tc == (const char *)1)
             tc = getenv("MINA_TRACE_CLASS");
-        if (tc && !strcmp(tc, k->name)) {
+        if (tc && strstr(tc, k->name)) {     /* a list: names separated by commas */
             o->traced = 1;
             objc_trace_ref(o, "new");
         }

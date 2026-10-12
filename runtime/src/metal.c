@@ -754,9 +754,40 @@ static void sampler_dealloc(void *h)
     if (s->gl) glDeleteSamplers(1, &s->gl);
     gpu_unlock();
 }
+/* Metal hands out one sampler (and depth/stencil) state object per distinct
+ * descriptor, and keeps it: the game relies on that (it keeps using a sampler
+ * after releasing what it asked for, once another asked for the same one).
+ * The states made here are kept the same way: one per descriptor, never freed. */
+static pthread_mutex_t state_lock = PTHREAD_MUTEX_INITIALIZER;
+#define MAX_STATES 256
+static struct { MSampler key; uint64_t obj; } samplers_made[MAX_STATES];
+static struct { MDepthStencil key; uint64_t obj; } ds_made[MAX_STATES];
+static int nsamplers_made, nds_made;
+
 static void d_newSamplerState(Ctx *c)
 {
     uint64_t d = MARG(0);
+    MSampler k;
+    memset(&k, 0, sizeof k);
+    k.minf = (uint32_t)pb_get(d, "minFilter", 0);
+    k.magf = (uint32_t)pb_get(d, "magFilter", 0);
+    k.mipf = (uint32_t)pb_get(d, "mipFilter", 0);
+    k.s = (uint32_t)pb_get(d, "sAddressMode", 0);
+    k.t = (uint32_t)pb_get(d, "tAddressMode", 0);
+    k.r = (uint32_t)pb_get(d, "rAddressMode", 0);
+    k.aniso = (uint32_t)pb_get(d, "maxAnisotropy", 1);
+    k.compare = (uint32_t)pb_get(d, "compareFunction", 0);
+    k.lod_min = (float)pb_getd(d, "lodMinClamp", 0, 0.0);
+    k.lod_max = (float)pb_getd(d, "lodMaxClamp", 0, 1000.0);
+    pthread_mutex_lock(&state_lock);
+    for (int i = 0; i < nsamplers_made; i++)
+        if (!memcmp(&samplers_made[i].key, &k, sizeof k)) {
+            uint64_t o = samplers_made[i].obj;
+            pthread_mutex_unlock(&state_lock);
+            RET(objc_retain_obj(o));
+            return;
+        }
+    pthread_mutex_unlock(&state_lock);
     uint64_t o = objc_new_object(&cls_Sampler);
     MSampler *s = objc_host(o);
     s->minf = (uint32_t)pb_get(d, "minFilter", 0);
@@ -788,6 +819,12 @@ static void d_newSamplerState(Ctx *c)
         glSamplerParameteri(s->gl, GL_TEXTURE_COMPARE_FUNC, (GLint)gl_compare(s->compare));
     }
     gpu_unlock();
+    pthread_mutex_lock(&state_lock);
+    if (nsamplers_made < MAX_STATES) {
+        samplers_made[nsamplers_made].key = k;
+        samplers_made[nsamplers_made++].obj = objc_retain_obj(o);     /* kept */
+    }
+    pthread_mutex_unlock(&state_lock);
     RET(o);
 }
 
@@ -803,14 +840,29 @@ static void read_stencil(uint64_t d, MStencil *s)
 static void d_newDepthStencilState(Ctx *c)
 {
     uint64_t d = MARG(0);
-    uint64_t o = objc_new_object(&cls_DepthStencil);
-    MDepthStencil *s = objc_host(o);
-    s->compare = (uint32_t)pb_get(d, "depthCompareFunction", 7);
-    s->write = (uint32_t)pb_get(d, "depthWriteEnabled", 0) & 1;
+    MDepthStencil k;
+    memset(&k, 0, sizeof k);
+    k.compare = (uint32_t)pb_get(d, "depthCompareFunction", 7);
+    k.write = (uint32_t)pb_get(d, "depthWriteEnabled", 0) & 1;
     uint64_t f = pb_existing_child(d, "frontFaceStencil"), b = pb_existing_child(d, "backFaceStencil");
-    s->stencil_enabled = f || b;
-    read_stencil(f, &s->front);
-    read_stencil(b ? b : f, &s->back);
+    k.stencil_enabled = f || b;
+    read_stencil(f, &k.front);
+    read_stencil(b ? b : f, &k.back);
+    pthread_mutex_lock(&state_lock);
+    for (int i = 0; i < nds_made; i++)
+        if (!memcmp(&ds_made[i].key, &k, sizeof k)) {
+            uint64_t o = ds_made[i].obj;
+            pthread_mutex_unlock(&state_lock);
+            RET(objc_retain_obj(o));
+            return;
+        }
+    uint64_t o = objc_new_object(&cls_DepthStencil);
+    *(MDepthStencil *)objc_host(o) = k;
+    if (nds_made < MAX_STATES) {
+        ds_made[nds_made].key = k;
+        ds_made[nds_made++].obj = objc_retain_obj(o);     /* kept */
+    }
+    pthread_mutex_unlock(&state_lock);
     RET(o);
 }
 

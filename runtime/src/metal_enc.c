@@ -880,19 +880,32 @@ static void apply_uniforms(REnc *e, MPipeline *p)
     }
 }
 
+/* an object bound to a draw that is not of the class it is used as: one the
+ * game released (its address reused by another object), logged with where
+ * the game is */
+static int bound_wrong(uint64_t a, const char *want, const char *what)
+{
+    Obj *o = objc_obj(a);
+    if (o && !strcmp(o->cls->name, want))
+        return 0;
+    static int n;
+    if (n++ < 12) {
+        char bt[512];
+        guest_backtrace(bt, sizeof bt, 6);
+        rt_log("metal: the %s %#llx bound to a draw is %s: %s\n", what, (unsigned long long)a,
+               o ? o->cls->name : "not a live object", bt);
+    }
+    return 1;
+}
+
 /* a sampler state's GL sampler (0, the texture's own state, for none) */
 static GLuint sampler_gl(uint64_t samp)
 {
     if (!samp)
         return 0;
-    MSampler *s = objc_host(samp);
-    if (!s) {                /* not a live object (released too early somewhere) */
-        static int n;
-        if (n++ < 8)
-            rt_log("metal: sampler %#llx bound to a draw is not a live object\n", (unsigned long long)samp);
+    if (bound_wrong(samp, "MTLSamplerState_GL", "sampler"))
         return 0;
-    }
-    return s->gl;
+    return ((MSampler *)objc_host(samp))->gl;
 }
 
 static void bind_tex(int unit, uint64_t tex, uint64_t samp)
@@ -902,14 +915,11 @@ static void bind_tex(int unit, uint64_t tex, uint64_t samp)
         glBindTexture(GL_TEXTURE_2D, 0);
         return;
     }
-    MTexture *t = objc_host(tex);
-    if (!t) {
-        static int n;
-        if (n++ < 8)
-            rt_log("metal: texture %#llx bound to a draw is not a live object\n", (unsigned long long)tex);
+    if (bound_wrong(tex, "MTLTexture_GL", "texture")) {
         glBindTexture(GL_TEXTURE_2D, 0);
         return;
     }
+    MTexture *t = objc_host(tex);
 #if defined(__vita__)
     if (t->read_alias)       /* a folded copy read for its colour: the source (fold_draw_reads) */
         t = t->read_alias;
