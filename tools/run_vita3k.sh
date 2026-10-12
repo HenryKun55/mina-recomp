@@ -36,7 +36,8 @@ rm -f "$DATA/mina.log"
 
 pkill -9 -f "Vita3K -r MINA00001" 2>/dev/null
 rm -f "${PROFILE:-$BUILD/vita3k-profile.txt}"
-(VITA3K_CPU_MHZ=${MHZ:-444} VITA3K_GPU_SCALE=${GPU_SCALE:-37} VITA3K_GPU_LOG=${GPU_LOG:-1} VITA3K_GPU_MEDIAN=${GPU_MEDIAN:-31} \
+# this run's Vita FS, whatever Vita3K's config.yml points at (other ports share the emulator)
+(VITA3K_PREF_PATH="$(dirname "$UX0")/" VITA3K_CPU_MHZ=${MHZ:-444} VITA3K_GPU_SCALE=${GPU_SCALE:-37} VITA3K_GPU_LOG=${GPU_LOG:-1} VITA3K_GPU_MEDIAN=${GPU_MEDIAN:-31} \
  VITA3K_PROFILE="${PROFILE:-$BUILD/vita3k-profile.txt}" "$VITA3K" -r MINA00001 > "$BUILD/vita3k.log" 2>&1 &)
 echo "Vita3K started (log: $BUILD/vita3k.log, game log: ux0:data/mina/mina.log)"
 

@@ -542,9 +542,12 @@ static void rwt_put(uint64_t O, const RwtSnap *s)
         if (s->box[k]) memcpy(G(s->box[k]), s->b[k], 24);
     }
 }
+static int arm_defer(Ctx *c);
 void nat__ZN8GameAnim20RecalcWorldTransformERK11ycTransformS2_(Ctx *c)
 {
     recalcs_total++;
+    if (arm_defer(c))
+        return;
     if (verify_xform()) {
         static RwtSnap before, mine, theirs;
         static uint32_t checked, bad;
@@ -1304,4 +1307,115 @@ void nat__ZN8GameAnim12UpdateFacingEv(Ctx *c)
     if (ldfp(xy) == ldfp(O + 0x250) && ldfp(xy + 4) == ldfp(O + 0x254) && ldfp(z) == ldfp(O + 0x258))
         return;
     f_9a7c54_orig(c);
+}
+
+/* ---- ShipIntroBossArm::ApplySpline ------------------------------------------------------------
+ * The arm's 32 segments (A+0x510+0x28k) follow its spline, then 4 rounds of
+ * relaxation move pairs of them: each move recalculates the segment's world
+ * transform (GameAnim::RecalcWorldTransform, ~390 a call), though only the
+ * segments' positions (+0x19c) are read until GameAnim::GetFrameBound. That
+ * recalculation is a function of its inputs (what it changes for itself is
+ * restored), so the segments' recalculations wait: the last one of each runs,
+ * in the order of those last calls, before any GetFrameBound and at the end.
+ * MINA_VERIFY_XFORM=1 runs every call, and checks that running the last one
+ * again changes nothing. MINA_NO_ARM_DEFER=1: no waiting. */
+void f_66e660_orig(Ctx *c);
+void f_9a6dc4_orig(Ctx *c);
+static uint64_t arm_active;
+static uint32_t arm_skipped, arm_ran, arm_calls;
+/* the segments' components (read when the arm starts), and per segment its
+ * pending recalculation: arguments and the order of its last call (0: none) */
+static uint64_t arm_seg[32];
+static struct { uint64_t a1, a2; uint32_t seq; } arm_pend[32];
+static uint32_t arm_seq;
+
+static int arm_defer(Ctx *c)
+{
+    if (!arm_active)
+        return 0;
+    const uint64_t comp = c->x[0];
+    int k = 0;
+    while (k < 32 && arm_seg[k] != comp)
+        k++;
+    if (k == 32)
+        return 0;
+    arm_pend[k].a1 = c->x[1];
+    arm_pend[k].a2 = c->x[2];
+    arm_pend[k].seq = ++arm_seq;
+    if (verify_xform())
+        return 0;                    /* runs now too; the flush checks it */
+    arm_skipped++;
+    return 1;
+}
+static void arm_flush(Ctx *c)
+{
+    int order[32], n = 0;
+    for (int k = 0; k < 32; k++) {   /* pending ones by their last call */
+        if (!arm_pend[k].seq)
+            continue;
+        int i = n++;
+        while (i > 0 && arm_pend[order[i - 1]].seq > arm_pend[k].seq) {
+            order[i] = order[i - 1];
+            i--;
+        }
+        order[i] = k;
+    }
+    if (!n)
+        return;
+    const uint64_t x0 = c->x[0], x1 = c->x[1], x2 = c->x[2];
+    const uint64_t active = arm_active;
+    arm_active = 0;                  /* these run */
+    for (int i = 0; i < n; i++) {
+        const int k = order[i];
+        arm_pend[k].seq = 0;
+        c->x[0] = arm_seg[k];
+        c->x[1] = arm_pend[k].a1;
+        c->x[2] = arm_pend[k].a2;
+        if (verify_xform()) {
+            static RwtSnap ran, again;
+            static uint32_t checked, bad;
+            rwt_take(arm_seg[k], &ran);
+            recalc_world_transform(c);
+            rwt_take(arm_seg[k], &again);
+            checked++;
+            if (memcmp(&ran, &again, sizeof ran) != 0 && bad++ < 10)
+                rt_log("[verify] arm segment %#llx: its last recalculation run again differs\n",
+                       (unsigned long long)arm_seg[k]);
+            if ((checked & 0xfff) == 0)
+                rt_log("[verify] arm segments: %u checked, %u differ\n", checked, bad);
+        } else {
+            recalc_world_transform(c);
+            arm_ran++;
+        }
+    }
+    arm_active = active;
+    c->x[0] = x0;
+    c->x[1] = x1;
+    c->x[2] = x2;
+}
+void nat__ZN8GameAnim13GetFrameBoundEb(Ctx *c)
+{
+    arm_flush(c);
+    f_9a6dc4_orig(c);
+}
+void nat__ZN16ShipIntroBossArm11ApplySplineEv(Ctx *c)
+{
+    static int off = -1;
+    if (off < 0)
+        off = getenv("MINA_NO_ARM_DEFER") != NULL;
+    if (off || arm_active) {
+        f_66e660_orig(c);
+        return;
+    }
+    {
+        GM_BEGIN;
+        for (int k = 0; k < 32; k++)
+            arm_seg[k] = lp(c->x[0] + 0x510 + 0x28 * k);
+    }
+    arm_active = c->x[0];
+    f_66e660_orig(c);
+    arm_flush(c);
+    arm_active = 0;
+    if (++arm_calls % 600 == 0 && getenv("MINA_CALLERS"))
+        rt_log("[arm] %u calls: %u segment recalculations waited, %u ran\n", arm_calls, arm_skipped, arm_ran);
 }
