@@ -60,7 +60,7 @@ GuestFn cpu_lookup(uint32_t a)
 
 /* the guest function whose recompiled code contains host address pc (for
  * reports: which function made a bad call) */
-static const char *guest_func_at_host(const void *pc)
+const char *guest_func_at_host(const void *pc)
 {
     uintptr_t best = 0;
     uint32_t bi = UINT32_MAX;

@@ -578,6 +578,42 @@ void nat__ZN8GameAnim20RecalcWorldTransformERK11ycTransformS2_(Ctx *c)
  * Then each active component of the pages at E+0x38 gets RecalcWorldTransform
  * (virtual slot 0x48) with the new and the previous world. */
 void f_1cb43c_orig(Ctx *c);
+/* MINA_CALLERS=n: every n calls of a counted native, the recompiled
+ * functions that called it (by the host return address), most frequent first */
+const char *guest_func_at_host(const void *pc);
+typedef struct CallerHist { const char *what; uint32_t n, every, count[64]; const void *ra[64]; } CallerHist;
+static void caller_count(CallerHist *h, const void *ra)
+{
+    if (!h->every) {
+        const char *v = getenv("MINA_CALLERS");
+        h->every = v && atoi(v) > 0 ? (uint32_t)atoi(v) : ~0u;
+    }
+    if (h->every == ~0u)
+        return;
+    uint32_t i;
+    for (i = 0; i < 64 && h->ra[i] && h->ra[i] != ra; i++)
+        ;
+    if (i < 64) {
+        h->ra[i] = ra;
+        h->count[i]++;
+    }
+    if (++h->n % h->every)
+        return;
+    rt_log("[callers] %s, %u calls:\n", h->what, h->every);
+    for (int k = 0; k < 10; k++) {
+        uint32_t best = 0;
+        for (i = 1; i < 64; i++)
+            if (h->count[i] > h->count[best])
+                best = i;
+        if (!h->count[best])
+            break;
+        rt_log("[callers]   %6u  %s\n", h->count[best], guest_func_at_host(h->ra[best]));
+        h->count[best] = 0;
+    }
+    memset(h->ra, 0, sizeof h->ra);
+    memset(h->count, 0, sizeof h->count);
+}
+
 static void refresh_world_transform(Ctx *c)
 {
     GM_BEGIN;
@@ -612,6 +648,24 @@ static void refresh_world_transform(Ctx *c)
         compose(&r, P, GP(E + 0x80), flags);
         *world = r;
     }
+    {   /* MINA_CALLERS: how the world transform changed */
+        static uint32_t n, same, tonly, other;
+        static int on = -1;
+        if (on < 0)
+            on = getenv("MINA_CALLERS") != NULL;
+        if (on) {
+            if (!memcmp(world, prev, sizeof *world))
+                same++;
+            else if (!memcmp(world, prev, 28))
+                tonly++;
+            else
+                other++;
+            if (++n % 20000 == 0) {
+                rt_log("[callers] world transform: %u unchanged, %u only moved, %u rotated/scaled\n", same, tonly, other);
+                same = tonly = other = 0;
+            }
+        }
+    }
     for (uint64_t page = lp(E + 0x38); page; page = lp(page + 0x8)) {
         for (uint32_t i = 0; i < lp(page + 0x10); i++) {
             const uint64_t comp = lp(page + 0x18 + 8 * (uint64_t)i);
@@ -619,6 +673,16 @@ static void refresh_world_transform(Ctx *c)
             if (!(f & 1) || (f & 0x3000) == 0x1000)
                 continue;
             static const GuestFunc *ic;
+            {   /* MINA_CALLERS: which components' RecalcWorldTransform run */
+                static CallerHist h = { "component RecalcWorldTransform" };
+                static int on = -1;
+                if (on < 0)
+                    on = getenv("MINA_CALLERS") != NULL;
+                if (on) {
+                    GuestFn cpu_lookup(uint32_t a);
+                    caller_count(&h, (const void *)cpu_lookup((uint32_t)lp(lp(comp) + 0x48)));
+                }
+            }
             c->x[0] = comp;
             c->x[1] = E + 0xc0;
             c->x[2] = sp + 0x50;
@@ -629,6 +693,8 @@ static void refresh_world_transform(Ctx *c)
 }
 void nat__ZN8ycEntity21RefreshWorldTransformEb(Ctx *c)
 {
+    static CallerHist h = { "ycEntity::RefreshWorldTransform" };
+    caller_count(&h, __builtin_return_address(0));
     refresh_world_transform(c);
 }
 
