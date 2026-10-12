@@ -566,6 +566,25 @@ static inline uint16_t f2h(float f)
     return (uint16_t)r;
 }
 
+/* functions listed in runtime/timed.txt (gen.py --timed): time with what they
+ * call, and calls; MINA_FPS logs them per frame */
+#include <time.h>
+extern const char *const g_timed_names[];
+extern const int g_timed_count;
+extern uint64_t g_timed_ns[];
+extern uint32_t g_timed_calls[];
+static inline uint64_t rt_now_ns(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+static inline void rt_timed_add(int k, uint64_t t0)
+{
+    __atomic_add_fetch(&g_timed_ns[k], rt_now_ns() - t0, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&g_timed_calls[k], 1, __ATOMIC_RELAXED);
+}
+
 #include "simd.h"
 
 #endif

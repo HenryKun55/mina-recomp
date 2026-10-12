@@ -1671,6 +1671,13 @@ void metal_present(uint64_t drawable)
                        g_draw_calls / frames, g_draw_ns / 1e6 / frames, g_endenc_ns / 1e6 / frames,
                        g_present_sem_ns / 1e6 / frames);
                 g_draw_ns = g_endenc_ns = g_present_sem_ns = 0;
+                for (int k = 0; k < g_timed_count; k++) {
+                    if (g_timed_calls[k])
+                        rt_log("[fps]   %6.2f ms %6.1f calls  %s\n", g_timed_ns[k] / 1e6 / frames,
+                               g_timed_calls[k] / (double)frames, g_timed_names[k]);
+                    g_timed_ns[k] = 0;
+                    g_timed_calls[k] = 0;
+                }
                 g_draw_calls = 0;
                 g_updates = g_fixed_updates = 0;
                 g_fixed_us = g_update_us = 0;

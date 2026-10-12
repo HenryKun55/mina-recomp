@@ -34,11 +34,12 @@ set(GEN_INPUTS
   ${CMAKE_SOURCE_DIR}/tools/recomp/simd.py
   ${CMAKE_SOURCE_DIR}/tools/analysis/macho.py
   ${CMAKE_SOURCE_DIR}/runtime/natives.txt
+  ${CMAKE_SOURCE_DIR}/runtime/timed.txt
   ${MINA_EXE})
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${GEN_INPUTS})
 execute_process(
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/recomp/gen.py ${MINA_EXE} ${GEN_DIR}
-          --natives ${CMAKE_SOURCE_DIR}/runtime/natives.txt
+          --natives ${CMAKE_SOURCE_DIR}/runtime/natives.txt --timed ${CMAKE_SOURCE_DIR}/runtime/timed.txt
   RESULT_VARIABLE GEN_RESULT)
 if(NOT GEN_RESULT EQUAL 0)
   message(FATAL_ERROR "recompilation failed")
