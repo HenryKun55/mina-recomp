@@ -82,3 +82,4 @@ __ZN21ycCutterAnimComponent11UpdateFrameEfb
 __ZN8GameAnim12UpdateFacingEv
 __ZN16ShipIntroBossArm11ApplySplineEv
 __ZN8GameAnim13GetFrameBoundEb
+__ZN4Game12InitFromSaveEv

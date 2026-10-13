@@ -1419,3 +1419,28 @@ void nat__ZN16ShipIntroBossArm11ApplySplineEv(Ctx *c)
     if (++arm_calls % 600 == 0 && getenv("MINA_CALLERS"))
         rt_log("[arm] %u calls: %u segment recalculations waited, %u ran\n", arm_calls, arm_skipped, arm_ran);
 }
+
+/* ---- Game::InitFromSave ----------------------------------------------------------------------
+ * The saved video options become the renderer's: among them the integer scale
+ * of the game's buffers (settings +0x668 -> s_bufferIntScale; 0 picks the
+ * biggest that fits: 3, 768x432, on the Vita's screen). The Vita draws them
+ * at 1x (256x144, the art's own pixels) unless the player chose a scale:
+ * MINA_BUFFER_SCALE=n picks another default (0: the game's). */
+void f_99d1a8_orig(Ctx *c);
+void nat__ZN4Game12InitFromSaveEv(Ctx *c)
+{
+    f_99d1a8_orig(c);
+#if defined(__vita__)
+    GM_BEGIN;
+    const char *v = getenv("MINA_BUFFER_SCALE");
+    const uint32_t want = v ? (uint32_t)atoi(v) : 1;
+    const uint64_t settings = lp(0x6051920);
+    rt_log("[video] saved buffer scale %u, pixel mode %u\n", settings ? rt_ld32(GP(settings + 0x668)) : 0xffffffffu,
+           settings ? rt_ld32(GP(settings + 0x664)) : 0xffffffffu);
+    if (want && settings && rt_ld32(GP(settings + 0x668)) == 0) {
+        rt_st32(GP(settings + 0x668), want);
+        rt_st32(GP(0x6045fc0), want);           /* (anonymous)::s_bufferIntScale */
+        rt_log("[video] game buffers at %ux (%ux%u)\n", want, 256 * want, 144 * want);
+    }
+#endif
+}
