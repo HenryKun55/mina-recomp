@@ -703,6 +703,8 @@ uint32_t objc_new_object(Class *k)
             rt_st64(G(a), k->obj);
             o->refs = 1;
             o->traced = 0;
+            o->weak = 0;
+            o->held = 0;
             o->next = NULL;
             if (o->host) {
                 uint32_t hs = 0, hz = 0;
@@ -801,11 +803,12 @@ void *objc_host_slow(uint64_t a)
     return o ? o->host : NULL;
 }
 
+static uint32_t frame_no;
 void objc_trace_ref(Obj *o, const char *op)
 {
     char bt[512];
     guest_backtrace(bt, sizeof bt, 4);
-    rt_log("[ref] %s %#x %s -> %d: %s\n", op, o->addr, o->cls->name, o->refs, bt);
+    rt_log("[ref] %s %#x %s -> %d (frame %u, held %d): %s\n", op, o->addr, o->cls->name, o->refs, frame_no, o->held, bt);
 }
 
 uint64_t objc_retain_obj(uint64_t a)
@@ -817,6 +820,98 @@ uint64_t objc_retain_obj(uint64_t a)
             objc_trace_ref(o, "retain");
     }
     return a;
+}
+
+/* ---- weak references -------------------------------------------------------------
+ * As the Objective-C runtime keeps them: a weak variable reads nil once its
+ * object's last reference is gone (the game keeps some textures that way).
+ * The variables (guest addresses) are kept with their objects; only objects
+ * with any are looked up when they die. */
+static pthread_mutex_t weak_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct { uint32_t obj, loc; } *weak_refs;
+static uint32_t nweak, weak_cap;
+
+static void weak_forget_loc(uint32_t loc)            /* weak_lock held */
+{
+    for (uint32_t i = 0; i < nweak; i++)
+        if (weak_refs[i].loc == loc) {
+            Obj *o = objc_obj(weak_refs[i].obj);
+            if (o)
+                o->weak--;
+            weak_refs[i] = weak_refs[--nweak];
+            return;
+        }
+}
+static void weak_clear(Obj *o)                        /* its last reference is gone */
+{
+    pthread_mutex_lock(&weak_lock);
+    for (uint32_t i = 0; i < nweak;) {
+        if (weak_refs[i].obj == o->addr) {
+            if ((uint32_t)rt_ld64(G(weak_refs[i].loc)) == o->addr)
+                rt_st64(G(weak_refs[i].loc), 0);
+            weak_refs[i] = weak_refs[--nweak];
+        } else {
+            i++;
+        }
+    }
+    o->weak = 0;
+    pthread_mutex_unlock(&weak_lock);
+}
+
+/* ---- GPU lifetimes ------------------------------------------------------------------
+ * Metal's command buffers keep what their commands use until the GPU is done
+ * with them, after the game has let go: the game's renderer relies on that
+ * (its GC thread frees textures when a command buffer completes, which here
+ * is at once, while draws queued for the render thread can still use them).
+ * A GPU resource's last release keeps it a few more frames instead. */
+#define GPU_FRAMES 3
+static pthread_mutex_t held_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct { Obj *o; uint32_t frame; } *held;
+static uint32_t nheld, held_cap;
+
+static int gpu_hold(Obj *o)                           /* refs is 0: held, or freed now */
+{
+    if (o->held == 2) {                               /* objc_frame_end lets go of it */
+        o->held = 0;
+        return 0;
+    }
+    pthread_mutex_lock(&held_lock);
+    if (nheld == held_cap) {
+        held_cap = held_cap ? held_cap * 2 : 256;
+        held = realloc(held, held_cap * sizeof *held);
+    }
+    held[nheld].o = o;
+    held[nheld++].frame = frame_no;
+    o->held = 1;
+    __atomic_add_fetch(&o->refs, 1, __ATOMIC_SEQ_CST);
+    pthread_mutex_unlock(&held_lock);
+    return 1;
+}
+void objc_frame_end(void)
+{
+    static Obj **go;
+    static uint32_t go_cap;
+    uint32_t n = 0;
+    pthread_mutex_lock(&held_lock);
+    const uint32_t now = ++frame_no;
+    if (go_cap < nheld) {
+        go_cap = nheld;
+        go = realloc(go, go_cap * sizeof *go);
+    }
+    uint32_t keep = 0;
+    for (uint32_t i = 0; i < nheld; i++) {
+        if (now - held[i].frame >= GPU_FRAMES)
+            go[n++] = held[i].o;
+        else
+            held[keep++] = held[i];
+    }
+    nheld = keep;
+    pthread_mutex_unlock(&held_lock);
+    for (uint32_t i = 0; i < n; i++) {
+        /* retained again meanwhile: only this reference goes; else it is freed */
+        go[i]->held = __atomic_load_n(&go[i]->refs, __ATOMIC_SEQ_CST) > 1 ? 0 : 2;
+        objc_release_obj(go[i]->addr);
+    }
 }
 
 static void destroy(Ctx *c, uint64_t a)
@@ -832,8 +927,13 @@ void objc_release_obj(uint64_t a)
         return;
     if (o->traced)
         objc_trace_ref(o, "release");
-    if (__atomic_sub_fetch(&o->refs, 1, __ATOMIC_SEQ_CST) == 0)
+    if (__atomic_sub_fetch(&o->refs, 1, __ATOMIC_SEQ_CST) == 0) {
+        if (o->cls->gpu_lifetime && gpu_hold(o))
+            return;
+        if (o->weak)
+            weak_clear(o);
         destroy(thread_ctx(), a);
+    }
 }
 
 /* NSObject -dealloc: host destructors along the chain, then the memory. */
@@ -937,9 +1037,49 @@ static void imp_objc_storeStrong(Ctx *c)
     rt_st64(G(loc), obj);
     objc_release_obj(old);
 }
-static void imp_objc_storeWeak(Ctx *c) { rt_st64(G(A0), A1); RET(A1); }
-static void imp_objc_loadWeakRetained(Ctx *c) { RET(objc_retain_obj(rt_ld64(G(A0)))); }
-static void imp_objc_destroyWeak(Ctx *c) { rt_st64(G(A0), 0); }
+static void imp_objc_storeWeak(Ctx *c)
+{
+    const uint32_t loc = (uint32_t)A0;
+    uint64_t obj = A1;
+    pthread_mutex_lock(&weak_lock);
+    weak_forget_loc(loc);
+    Obj *o = obj ? objc_obj(obj) : NULL;
+    if (o && o->refs > 0) {
+        if (nweak == weak_cap) {
+            weak_cap = weak_cap ? weak_cap * 2 : 64;
+            weak_refs = realloc(weak_refs, weak_cap * sizeof *weak_refs);
+        }
+        weak_refs[nweak].obj = o->addr;
+        weak_refs[nweak++].loc = loc;
+        o->weak++;
+    } else if (obj && !objc_class_of(obj)) {
+        obj = 0;                                      /* a dead object: nil */
+    }
+    rt_st64(G(loc), obj);
+    pthread_mutex_unlock(&weak_lock);
+    RET(obj);
+}
+static void imp_objc_loadWeakRetained(Ctx *c)
+{
+    pthread_mutex_lock(&weak_lock);
+    uint64_t obj = rt_ld64(G(A0));
+    Obj *o = obj ? objc_obj(obj) : NULL;
+    if (o && o->refs > 0)
+        objc_retain_obj(obj);
+    else if (obj && o)
+        obj = 0;                                      /* deallocating */
+    else if (obj && !objc_class_of(obj))
+        obj = 0;
+    pthread_mutex_unlock(&weak_lock);
+    RET(obj);
+}
+static void imp_objc_destroyWeak(Ctx *c)
+{
+    pthread_mutex_lock(&weak_lock);
+    weak_forget_loc((uint32_t)A0);
+    rt_st64(G(A0), 0);
+    pthread_mutex_unlock(&weak_lock);
+}
 static void imp_objc_opt_class(Ctx *c)
 {
     if (!A0) { RET(0); return; }

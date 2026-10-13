@@ -1644,6 +1644,7 @@ void vita_copy_quad(MTexture *src, float sx, float sy, float sw, float sh, GLuin
 
 void metal_present(uint64_t drawable)
 {
+    objc_frame_end();         /* GPU resources released 3 frames ago are freed */
     {
         extern int g_framelog;
         static int frames, every = -1;
@@ -1823,8 +1824,8 @@ static const Method drawable_m[] = { { "texture", dr_texture }, { "present", dr_
 static Class cls_Device = { "MTLDevice_GL", "NSObject", device_m, NULL, 0, NULL };
 static Class cls_Queue = { "MTLCommandQueue_GL", "NSObject", queue_m, NULL, 0, NULL };
 static Class cls_CmdBuf = { "MTLCommandBuffer_GL", "NSObject", cmdbuf_m, NULL, sizeof(MCmdBuf), NULL };
-static Class cls_Buffer = { "MTLBuffer_GL", "NSObject", buffer_m, NULL, sizeof(MBuffer), buf_dealloc };
-static Class cls_Texture = { "MTLTexture_GL", "NSObject", texture_m, NULL, sizeof(MTexture), tex_dealloc };
+static Class cls_Buffer = { "MTLBuffer_GL", "NSObject", buffer_m, NULL, sizeof(MBuffer), buf_dealloc, .gpu_lifetime = 1 };
+static Class cls_Texture = { "MTLTexture_GL", "NSObject", texture_m, NULL, sizeof(MTexture), tex_dealloc, .gpu_lifetime = 1 };
 static Class cls_Sampler = { "MTLSamplerState_GL", "NSObject", simple_m, NULL, sizeof(MSampler), sampler_dealloc };
 static Class cls_DepthStencil = { "MTLDepthStencilState_GL", "NSObject", simple_m, NULL, sizeof(MDepthStencil), NULL };
 static Class cls_Library = { "MTLLibrary_GL", "NSObject", library_m, NULL, sizeof(MLib), NULL };

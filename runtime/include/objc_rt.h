@@ -41,6 +41,7 @@ struct Class {
     uint32_t guest_cmethods;
     uint32_t host_zero;          /* bytes of host state zeroed for a new object (0: all) */
     int poolable;                /* value objects (descriptors): freed ones are made again (also subclasses) */
+    int gpu_lifetime;            /* GPU resources: freed some frames after their last release (objc_frame_end) */
     struct Obj *pool;            /* freed objects of this (host) class, made again from here */
     uint32_t pooled;
 };
@@ -51,9 +52,12 @@ typedef struct Obj {
     int32_t refs;
     void *host;                  /* host_size bytes, zeroed */
     int traced;                  /* debug: log its retains and releases */
+    int weak;                    /* weak references to it (objc_storeWeak) */
+    int held;                    /* gpu_lifetime: the reference objc_frame_end lets go of */
     struct Obj *next;            /* in its class's pool */
 } Obj;
 void objc_trace_ref(Obj *o, const char *op);
+void objc_frame_end(void);       /* a frame went to the screen (gpu_lifetime objects) */
 
 void objc_init(void);
 void objc_register(Class *cls);
