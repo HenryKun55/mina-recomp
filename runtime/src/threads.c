@@ -65,6 +65,15 @@ static __thread Ctx *tl_ctx;
 #endif
 
 Ctx *thread_ctx(void) { return tl_ctx; }
+/* every guest context, for the watchdog and the profiler */
+static Ctx *all_ctx[128];
+static int nall_ctx;
+/* the contexts of the threads made so far (the profiler reads them) */
+int rt_all_ctx(Ctx ***out)
+{
+    *out = all_ctx;
+    return nall_ctx;
+}
 
 /* ---- TLS ---------------------------------------------------------------- */
 
@@ -106,10 +115,6 @@ void rt_yield(void)
     sched_yield();
 #endif
 }
-
-/* every guest context, for the watchdog */
-static Ctx *all_ctx[128];
-static int nall_ctx;
 
 static Ctx *new_ctx(uint32_t stack_size)
 {

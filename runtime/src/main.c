@@ -67,6 +67,8 @@ int main(int argc, char **argv)
     void metal_vita_init(void);
     metal_vita_init();
 #endif
+    void rt_profile_start(void);
+    rt_profile_start();
 #endif
     const char *exe = getenv("MINA_EXE");
     if (!exe)

@@ -114,6 +114,7 @@ typedef struct Ctx {
     uint32_t cur_import;     /* index of the import being called (diagnostics) */
     void *thread;            /* runtime's thread record */
     uint32_t spin;           /* iterations of spin-wait loops (RT_SPIN) */
+    uint32_t cur_fn;         /* MINA_PROFILE builds: index of the guest function running (rt_profile) */
 } Ctx;
 
 /* The back edge of a small loop with atomics (a spin-wait) and the yield/wfe
@@ -579,6 +580,8 @@ static inline uint64_t rt_now_ns(void)
     clock_gettime(CLOCK_MONOTONIC, &t);
     return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
 }
+void rt_icall_add(uint64_t target, uint64_t t0);     /* "*name" in timed.txt: its indirect calls */
+void rt_icall_report(uint32_t frames);
 static inline void rt_timed_add(int k, uint64_t t0)
 {
     __atomic_add_fetch(&g_timed_ns[k], rt_now_ns() - t0, __ATOMIC_RELAXED);

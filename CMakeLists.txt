@@ -37,9 +37,18 @@ set(GEN_INPUTS
   ${CMAKE_SOURCE_DIR}/runtime/timed.txt
   ${MINA_EXE})
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${GEN_INPUTS})
+# MINA_PROFILE: every recompiled function records its index while it runs, for
+# the sampling profiler (runtime/src/profile.c, MINA_PROFILE=1 at run time)
+option(MINA_PROFILE "build with the sampling profiler's function marks" OFF)
+set(MINA_GEN_PROFILE "")
+if(MINA_PROFILE)
+  set(MINA_GEN_PROFILE --profile)
+  add_compile_definitions(MINA_PROFILE=1)
+endif()
 execute_process(
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/recomp/gen.py ${MINA_EXE} ${GEN_DIR}
           --natives ${CMAKE_SOURCE_DIR}/runtime/natives.txt --timed ${CMAKE_SOURCE_DIR}/runtime/timed.txt
+          ${MINA_GEN_PROFILE}
   RESULT_VARIABLE GEN_RESULT)
 if(NOT GEN_RESULT EQUAL 0)
   message(FATAL_ERROR "recompilation failed")

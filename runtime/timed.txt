@@ -2,13 +2,4 @@
 # shows, per frame, each one's time (with what it calls) and its calls.
 # One mangled name per line. Each call costs two clock reads: keep functions
 # called thousands of times per frame out.
-__ZN4Game11FixedUpdateEv
-__ZN4Game6UpdateEf
-__ZN13ycUpdateQueue6UpdateEf
-__ZN5World6UpdateEP20ycUpdateQueueContext
-__ZN5World18UpdateSpawnManagerEP20ycUpdateQueueContext
-__ZN14PhysicsManager6UpdateEP20ycUpdateQueueContext
-__ZN11RoomManager11UpdateStateEv
-__ZN16ShipIntroBossArm11ApplySplineEv
-__ZN12ycRenderPass6UpdateEv
-__ZN12ycRenderPass6RenderEP15ycRenderCmdListPK16ycRenderDrawCally
+# (empty: profile builds, -DMINA_PROFILE=ON, measure without clocks)

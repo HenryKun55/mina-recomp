@@ -201,6 +201,20 @@ void rt_bad_jump(Ctx *c, uint32_t pc, uint64_t target)
 #include <psp2/io/fcntl.h>
 static SceUID log_fd = -1;
 static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
+static char log_hold[16384];
+static int log_held;
+static void log_put(const char *p, int n)
+{
+    if (n <= 0)
+        return;
+    int flags = SCE_O_WRONLY | SCE_O_CREAT | (log_fd < 0 ? SCE_O_TRUNC : SCE_O_APPEND);
+    SceUID fd = sceIoOpen("ux0:data/mina/mina.log", flags, 0666);
+    if (fd >= 0) {
+        sceIoWrite(fd, p, (SceSize)n);
+        sceIoClose(fd);
+        log_fd = 1;
+    }
+}
 static void log_write(const char *fmt, va_list ap)
 {
     char buf[2048];
@@ -209,17 +223,36 @@ static void log_write(const char *fmt, va_list ap)
         return;
     if (n > (int)sizeof buf - 1)
         n = (int)sizeof buf - 1;
-    /* opened and closed every time: what is written survives a crash */
+    /* opened and closed every time: what is written survives a crash. The
+     * periodic reports ([fps], [prof]) wait in a buffer and go in one write
+     * (each open costs the memory card milliseconds); any other line writes
+     * them first. */
     pthread_mutex_lock(&log_lock);
-    int flags = SCE_O_WRONLY | SCE_O_CREAT | (log_fd < 0 ? SCE_O_TRUNC : SCE_O_APPEND);
-    SceUID fd = sceIoOpen("ux0:data/mina/mina.log", flags, 0666);
-    if (fd >= 0) {
-        sceIoWrite(fd, buf, (SceSize)n);
-        sceIoClose(fd);
-        log_fd = 1;
+    const int report = !strncmp(buf, "[fps]", 5) || !strncmp(buf, "[prof]", 6);
+    if (report && log_held + n < (int)sizeof log_hold) {
+        memcpy(log_hold + log_held, buf, (size_t)n);
+        log_held += n;
+    } else {
+        log_put(log_hold, log_held);
+        log_held = 0;
+        if (report) {
+            memcpy(log_hold, buf, (size_t)n);
+            log_held = n;
+        } else {
+            log_put(buf, n);
+        }
     }
     pthread_mutex_unlock(&log_lock);
 }
+void rt_log_flush(void)
+{
+    pthread_mutex_lock(&log_lock);
+    log_put(log_hold, log_held);
+    log_held = 0;
+    pthread_mutex_unlock(&log_lock);
+}
+#else
+void rt_log_flush(void) {}
 #endif
 
 void rt_log(const char *fmt, ...)
@@ -275,4 +308,49 @@ void guest_backtrace(char *out, size_t cap, int max)
 #else
     (void)cap; (void)max;
 #endif
+}
+
+/* ---- indirect calls timed by target (runtime/timed.txt "*name") ------------------------------- */
+#define ICALL_SLOTS 512
+static struct { uint32_t target, calls; uint64_t ns; } icalls[ICALL_SLOTS];
+void rt_icall_add(uint64_t target, uint64_t t0)
+{
+    const uint64_t dt = rt_now_ns() - t0;
+    uint32_t h = ((uint32_t)target * 2654435761u) >> 23;     /* 9 bits */
+    for (int i = 0; i < ICALL_SLOTS; i++, h = (h + 1) & (ICALL_SLOTS - 1)) {
+        if (icalls[h].target == (uint32_t)target || !icalls[h].target) {
+            icalls[h].target = (uint32_t)target;
+            icalls[h].calls++;
+            icalls[h].ns += dt;
+            return;
+        }
+    }
+}
+static const char *guest_name_at(uint32_t a)
+{
+    uint32_t lo = 0, hi = g_guest_func_count;
+    while (hi - lo > 1) {
+        uint32_t m = (lo + hi) / 2;
+        if (g_guest_funcs[m].addr <= a)
+            lo = m;
+        else
+            hi = m;
+    }
+    return g_guest_func_names[lo];
+}
+/* the 20 biggest, then all reset */
+void rt_icall_report(uint32_t frames)
+{
+    for (int k = 0; k < 20; k++) {
+        int best = -1;
+        for (int i = 0; i < ICALL_SLOTS; i++)
+            if (icalls[i].target && (best < 0 || icalls[i].ns > icalls[best].ns))
+                best = i;
+        if (best < 0 || !icalls[best].ns)
+            break;
+        rt_log("[fps]   %6.2f ms %7.1f calls  -> %s\n", icalls[best].ns / 1e6 / frames,
+               icalls[best].calls / (double)frames, guest_name_at(icalls[best].target));
+        icalls[best].ns = 0;
+    }
+    memset(icalls, 0, sizeof icalls);
 }
