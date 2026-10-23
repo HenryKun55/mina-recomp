@@ -206,6 +206,7 @@ static void fold_drop(MTexture *x)
 /* the copy, drawn: the source's colour with alpha 1 */
 static void fold_draw(MTexture *x)
 {
+    GL_DIRTY();
     MTexture *src = x->read_alias;
     if (g_framelog)
         rt_log("[frame %d]   (fold drawn: #%04x from #%04x)\n", g_framelog, (unsigned)(((uintptr_t)x >> 4) & 0xffff),
@@ -418,6 +419,7 @@ void metal_fold_forget(MTexture *t) { (void)t; }
  * draw, or at its end when it only clears. */
 static void pass_begin(REnc *e)
 {
+    GL_DIRTY();
     e->begun = 1;
     e->depth_stale = 1;
     e->depth_lost = 0;
@@ -631,6 +633,7 @@ uint64_t metal_render_encoder(Ctx *c, uint64_t pd)
 
 static void re_endEncoding(Ctx *c)
 {
+    GL_DIRTY();
     REnc *e = objc_host(SELF);
     if (e->ended)
         return;
@@ -782,28 +785,79 @@ static GLenum gl_stencil_op(uint32_t o)
     return o < 8 ? t[o] : GL_KEEP;
 }
 
+/* The GL state draws set, as last set within this epoch (GL_DIRTY: other
+ * code changed some): a draw sets only what differs from the draw before. */
+uint32_t g_gl_epoch;
+enum {
+    S_POLY_ON, S_POLY, S_DEPTH_ON, S_DEPTH_FUNC, S_DEPTH_MASK, S_ST_ON, S_ST_FUNC_F, S_ST_FUNC_B, S_ST_OP_F,
+    S_ST_OP_B, S_ST_MASK_F, S_ST_MASK_B, S_CULL_ON, S_CULL, S_FRONT, S_PROG, S_ACTIVE,
+    S_BLEND_ON, S_BLEND_FUNC = S_BLEND_ON + MAX_COLOR, S_BLEND_EQ = S_BLEND_FUNC + MAX_COLOR,
+    S_CMASK = S_BLEND_EQ + MAX_COLOR, S_TEX = S_CMASK + MAX_COLOR, S_SAMP = S_TEX + 16, S_COUNT = S_SAMP + 16
+};
+static uint64_t gs_v[S_COUNT];
+static uint32_t gs_epoch = ~0u;
+static int gs_off = -1;                /* MINA_NO_GLCACHE: every draw sets everything (to compare) */
+static void gs_begin(void)
+{
+    if (gs_off < 0)
+        gs_off = getenv("MINA_NO_GLCACHE") != NULL;
+    if (gs_epoch != g_gl_epoch || gs_off) {
+        memset(gs_v, 0xff, sizeof gs_v);      /* unknown: no value packs to all ones */
+        gs_epoch = g_gl_epoch;
+    }
+}
+/* 1 if the slot holds v already, else it does from now on */
+static inline int gs_same(int slot, uint64_t v)
+{
+    if (gs_v[slot] == v)
+        return 1;
+    gs_v[slot] = v;
+    return 0;
+}
+static void gs_cap(int slot, GLenum cap, int on)
+{
+    if (!gs_same(slot, (uint64_t)on)) {
+        if (on)
+            glEnable(cap);
+        else
+            glDisable(cap);
+    }
+}
+
 static void apply_state(REnc *e, MPipeline *p)
 {
+    gs_begin();
     if (e->depth_bias != 0.0f || e->depth_slope != 0.0f) {
-        glEnable(GL_POLYGON_OFFSET_FILL);
-        glPolygonOffset(e->depth_slope, e->depth_bias);
+        gs_cap(S_POLY_ON, GL_POLYGON_OFFSET_FILL, 1);
+        uint32_t a, b;
+        memcpy(&a, &e->depth_slope, 4);
+        memcpy(&b, &e->depth_bias, 4);
+        if (!gs_same(S_POLY, (uint64_t)a << 32 | b))
+            glPolygonOffset(e->depth_slope, e->depth_bias);
     } else {
-        glDisable(GL_POLYGON_OFFSET_FILL);
+        gs_cap(S_POLY_ON, GL_POLYGON_OFFSET_FILL, 0);
     }
     for (int i = 0; i < MAX_COLOR; i++) {
         if (!e->color[i])
             continue;
         const MBlend *b = &p->color[i];
         if (b->enabled) {
-            glEnablei(GL_BLEND, (GLuint)i);
-            glBlendFuncSeparatei((GLuint)i, gl_blend_factor(b->src_rgb), gl_blend_factor(b->dst_rgb),
-                                 gl_blend_factor(b->src_a), gl_blend_factor(b->dst_a));
-            glBlendEquationSeparatei((GLuint)i, gl_blend_op(b->rgb_op), gl_blend_op(b->alpha_op));
-        } else {
+            if (!gs_same(S_BLEND_ON + i, 1))
+                glEnablei(GL_BLEND, (GLuint)i);
+            const GLenum f0 = gl_blend_factor(b->src_rgb), f1 = gl_blend_factor(b->dst_rgb),
+                         f2 = gl_blend_factor(b->src_a), f3 = gl_blend_factor(b->dst_a);
+            if (!gs_same(S_BLEND_FUNC + i, (uint64_t)(f0 & 0xffff) << 48 | (uint64_t)(f1 & 0xffff) << 32 |
+                                               (uint64_t)(f2 & 0xffff) << 16 | (f3 & 0xffff)))
+                glBlendFuncSeparatei((GLuint)i, f0, f1, f2, f3);
+            const GLenum q0 = gl_blend_op(b->rgb_op), q1 = gl_blend_op(b->alpha_op);
+            if (!gs_same(S_BLEND_EQ + i, (uint64_t)q0 << 32 | q1))
+                glBlendEquationSeparatei((GLuint)i, q0, q1);
+        } else if (!gs_same(S_BLEND_ON + i, 0)) {
             glDisablei(GL_BLEND, (GLuint)i);
         }
-        glColorMaski((GLuint)i, (b->write_mask & 8) != 0, (b->write_mask & 4) != 0, (b->write_mask & 2) != 0,
-                     (b->write_mask & 1) != 0);
+        if (!gs_same(S_CMASK + i, b->write_mask & 15))
+            glColorMaski((GLuint)i, (b->write_mask & 8) != 0, (b->write_mask & 4) != 0, (b->write_mask & 2) != 0,
+                         (b->write_mask & 1) != 0);
     }
     /* Metal ignores depth/stencil state in a pass without those attachments;
      * the Vita's screen has its own, so it must not be tested there */
@@ -831,12 +885,16 @@ static void apply_state(REnc *e, MPipeline *p)
         && !no_depth
 #endif
         ) {
-        glEnable(GL_DEPTH_TEST);
-        glDepthFunc(metal_gl_compare(ds->compare));
-        glDepthMask(ds->write ? GL_TRUE : GL_FALSE);
+        gs_cap(S_DEPTH_ON, GL_DEPTH_TEST, 1);
+        const GLenum f = metal_gl_compare(ds->compare);
+        if (!gs_same(S_DEPTH_FUNC, f))
+            glDepthFunc(f);
+        if (!gs_same(S_DEPTH_MASK, ds->write != 0))
+            glDepthMask(ds->write ? GL_TRUE : GL_FALSE);
     } else {
-        glDisable(GL_DEPTH_TEST);
-        glDepthMask(GL_FALSE);
+        gs_cap(S_DEPTH_ON, GL_DEPTH_TEST, 0);
+        if (!gs_same(S_DEPTH_MASK, 0))
+            glDepthMask(GL_FALSE);
     }
     if (ds && (ds->write || (ds->stencil_enabled && !(stencil_keeps(&ds->front) && stencil_keeps(&ds->back))))) {
         MTexture *d = e->dtex ? e->dtex : e->stex;
@@ -851,26 +909,38 @@ static void apply_state(REnc *e, MPipeline *p)
         && !no_stencil
 #endif
         ) {
-        glEnable(GL_STENCIL_TEST);
-        glStencilFuncSeparate(GL_FRONT, metal_gl_compare(ds->front.compare), (GLint)e->stencil_ref, ds->front.read_mask);
-        glStencilFuncSeparate(GL_BACK, metal_gl_compare(ds->back.compare), (GLint)e->stencil_ref, ds->back.read_mask);
-        glStencilOpSeparate(GL_FRONT, gl_stencil_op(ds->front.fail), gl_stencil_op(ds->front.depth_fail),
-                            gl_stencil_op(ds->front.pass));
-        glStencilOpSeparate(GL_BACK, gl_stencil_op(ds->back.fail), gl_stencil_op(ds->back.depth_fail),
-                            gl_stencil_op(ds->back.pass));
-        glStencilMaskSeparate(GL_FRONT, ds->front.write_mask);
-        glStencilMaskSeparate(GL_BACK, ds->back.write_mask);
+        gs_cap(S_ST_ON, GL_STENCIL_TEST, 1);
+        const GLenum ff = metal_gl_compare(ds->front.compare), fb = metal_gl_compare(ds->back.compare);
+        if (!gs_same(S_ST_FUNC_F, (uint64_t)ds->front.read_mask << 32 | (e->stencil_ref & 0xffff) << 16 | (ff & 0xffff)))
+            glStencilFuncSeparate(GL_FRONT, ff, (GLint)e->stencil_ref, ds->front.read_mask);
+        if (!gs_same(S_ST_FUNC_B, (uint64_t)ds->back.read_mask << 32 | (e->stencil_ref & 0xffff) << 16 | (fb & 0xffff)))
+            glStencilFuncSeparate(GL_BACK, fb, (GLint)e->stencil_ref, ds->back.read_mask);
+        const GLenum o0 = gl_stencil_op(ds->front.fail), o1 = gl_stencil_op(ds->front.depth_fail),
+                     o2 = gl_stencil_op(ds->front.pass);
+        if (!gs_same(S_ST_OP_F, (uint64_t)(o0 & 0xffff) << 32 | (o1 & 0xffff) << 16 | (o2 & 0xffff)))
+            glStencilOpSeparate(GL_FRONT, o0, o1, o2);
+        const GLenum b0 = gl_stencil_op(ds->back.fail), b1 = gl_stencil_op(ds->back.depth_fail),
+                     b2 = gl_stencil_op(ds->back.pass);
+        if (!gs_same(S_ST_OP_B, (uint64_t)(b0 & 0xffff) << 32 | (b1 & 0xffff) << 16 | (b2 & 0xffff)))
+            glStencilOpSeparate(GL_BACK, b0, b1, b2);
+        if (!gs_same(S_ST_MASK_F, ds->front.write_mask))
+            glStencilMaskSeparate(GL_FRONT, ds->front.write_mask);
+        if (!gs_same(S_ST_MASK_B, ds->back.write_mask))
+            glStencilMaskSeparate(GL_BACK, ds->back.write_mask);
     } else {
-        glDisable(GL_STENCIL_TEST);
+        gs_cap(S_ST_ON, GL_STENCIL_TEST, 0);
     }
     if (e->cull) {
-        glEnable(GL_CULL_FACE);
-        glCullFace(e->cull == 1 ? GL_FRONT : GL_BACK);
+        gs_cap(S_CULL_ON, GL_CULL_FACE, 1);
+        if (!gs_same(S_CULL, e->cull == 1))
+            glCullFace(e->cull == 1 ? GL_FRONT : GL_BACK);
     } else {
-        glDisable(GL_CULL_FACE);
+        gs_cap(S_CULL_ON, GL_CULL_FACE, 0);
     }
     /* the y flip mirrors the winding: Metal clockwise is GL counter-clockwise */
-    glFrontFace((e->winding == 0) != e->to_display ? GL_CCW : GL_CW);   /* y mirrored on the screen */
+    const GLenum front = (e->winding == 0) != e->to_display ? GL_CCW : GL_CW;   /* y mirrored on the screen */
+    if (!gs_same(S_FRONT, front))
+        glFrontFace(front);
 }
 
 static void apply_uniforms(REnc *e, MPipeline *p)
@@ -924,15 +994,28 @@ static GLuint sampler_gl(uint64_t samp)
     return ((MSampler *)objc_host(samp))->gl;
 }
 
+/* a texture and sampler to a unit (only what differs from the unit's last) */
+static void bind_unit(int unit, GLenum target, GLuint tex, int has_samp, GLuint samp)
+{
+    const int same_tex = gs_same(S_TEX + (unit & 15), (uint64_t)target << 32 | tex);
+    const int same_samp = !has_samp || gs_same(S_SAMP + (unit & 15), samp);
+    if (same_tex && same_samp)
+        return;
+    if (!gs_same(S_ACTIVE, (uint64_t)unit))
+        glActiveTexture(GL_TEXTURE0 + (GLenum)unit);
+    if (!same_tex)
+        glBindTexture(target, tex);
+    if (!same_samp)
+        glBindSampler((GLuint)unit, samp);
+}
 static void bind_tex(int unit, uint64_t tex, uint64_t samp)
 {
-    glActiveTexture(GL_TEXTURE0 + (GLenum)unit);
     if (!tex) {
-        glBindTexture(GL_TEXTURE_2D, 0);
+        bind_unit(unit, GL_TEXTURE_2D, 0, 0, 0);
         return;
     }
     if (bound_wrong(tex, "MTLTexture_GL", "texture")) {
-        glBindTexture(GL_TEXTURE_2D, 0);
+        bind_unit(unit, GL_TEXTURE_2D, 0, 0, 0);
         return;
     }
     MTexture *t = objc_host(tex);
@@ -943,13 +1026,11 @@ static void bind_tex(int unit, uint64_t tex, uint64_t samp)
         t->sampled = 1;
         if (t->owe_clear)
             rt_log("metal: a depth buffer is sampled before the clear a folded pass owed it\n");
-        glBindTexture(GL_TEXTURE_2D, t->depth_tex);
-        glBindSampler((GLuint)unit, sampler_gl(samp));
+        bind_unit(unit, GL_TEXTURE_2D, t->depth_tex, 1, sampler_gl(samp));
         return;
     }
 #endif
-    glBindTexture(metal_tex_target(t), t->gl);
-    glBindSampler((GLuint)unit, sampler_gl(samp));
+    bind_unit(unit, metal_tex_target(t), t->gl, 1, sampler_gl(samp));
 }
 
 static void apply_textures(REnc *e, MPipeline *p)
@@ -1158,6 +1239,7 @@ uint32_t g_depth_fs_draws, g_depth_restarts;     /* MINA_FPS */
  * it would write is not: later depth-tested draws of the pass see the old one. */
 static void depth_by_shader(REnc *e, MPipeline *p)
 {
+    GL_DIRTY();
     static int no_depth = -1, off;
     if (no_depth < 0) {
         no_depth = getenv("MINA_NO_DEPTH") != NULL;
@@ -1279,7 +1361,9 @@ static MPipeline *draw_setup(REnc *e)
                    p->fs, e->cull, e->winding, e->vp_set, e->vp[0], e->vp[1], e->vp[2], e->vp[3], e->sc_set, e->sc[0],
                    e->sc[1], e->sc[2], e->sc[3], p->yflip_loc);
     }
-    glUseProgram(p->prog);
+    gs_begin();
+    if (!gs_same(S_PROG, p->prog))
+        glUseProgram(p->prog);
     if (p->yflip_loc >= 0)
         glUniform1f(p->yflip_loc, e->to_display ? 1.0f : -1.0f);
 #if defined(__vita__)
@@ -1387,10 +1471,24 @@ static void re_drawPrimitives(Ctx *c) { TIMED(g_draw_ns, draw_arrays(c, 1)); }
 static void re_drawPrimitivesInstanced(Ctx *c) { TIMED(g_draw_ns, draw_arrays(c, (uint32_t)MARG(3))); }
 
 /* drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:[instanceCount:] */
+/* MINA_DRAWPROF: the indexed draws' time by step (setup, vertices, indices, the GL draw), logged with MINA_FPS */
+uint64_t g_dp_ns[4];
+static int drawprof = -1;
+static uint64_t dp_now(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+#define DP_MARK(k) do { if (drawprof) { uint64_t t_ = dp_now(); g_dp_ns[k] += t_ - dp_t; dp_t = t_; } } while (0)
 static void draw_indexed(Ctx *c, uint32_t instances)
 {
+    if (drawprof < 0)
+        drawprof = getenv("MINA_DRAWPROF") != NULL;
+    uint64_t dp_t = drawprof ? dp_now() : 0;
     REnc *e = objc_host(SELF);
     MPipeline *p = draw_setup(e);
+    DP_MARK(0);
     if (!p)
         return;
     uint32_t count = (uint32_t)MARG(1), type = (uint32_t)MARG(2);
@@ -1409,6 +1507,7 @@ static void draw_indexed(Ctx *c, uint32_t instances)
         }
     }
     apply_vertices(e, p, maxv, instances);
+    DP_MARK(1);
     if (g_framelog)
         framelog_draw(e, p, "indexed", count);
     uint32_t ipos;
@@ -1419,12 +1518,14 @@ static void draw_indexed(Ctx *c, uint32_t instances)
         ipos = ring_upload(idx, count * isz);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ring);
     }
+    DP_MARK(2);
     if (instances == 1)
         glDrawElements(gl_prim((uint32_t)MARG(0)), (GLsizei)count, type ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT,
                        (const void *)(uintptr_t)ipos);
     else
         glDrawElementsInstanced(gl_prim((uint32_t)MARG(0)), (GLsizei)count, type ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT,
                                 (const void *)(uintptr_t)ipos, (GLsizei)instances);
+    DP_MARK(3);
     gl_check("drawElements");
 }
 static void re_drawIndexed(Ctx *c) { TIMED(g_draw_ns, draw_indexed(c, 1)); }
@@ -1513,6 +1614,7 @@ static void be_copyBufferToTexture(Ctx *c)
 int direct_display(void);
 static void be_copyTextureRegion(Ctx *c)
 {
+    GL_DIRTY();
     MTexture *s = objc_host(MARG(0)), *d = objc_host(MARG(5));
     metal_fold_read(s);
     metal_fold_write(d);
@@ -1560,6 +1662,7 @@ static void be_copyTextureRegion(Ctx *c)
 }
 static void be_copyTexture(Ctx *c)
 {
+    GL_DIRTY();
     MTexture *s = objc_host(MARG(0)), *d = objc_host(MARG(1));
     metal_fold_read(s);
     metal_fold_write(d);
@@ -1639,6 +1742,7 @@ static void be_fillBuffer(Ctx *c)
 }
 static void be_generateMipmaps(Ctx *c)
 {
+    GL_DIRTY();
     MTexture *t = objc_host(MARG(0));
     metal_fold_write(t);
     glBindTexture(metal_tex_target(t), t->gl);

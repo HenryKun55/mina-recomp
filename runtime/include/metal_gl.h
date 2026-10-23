@@ -179,6 +179,10 @@ extern const ShaderSrc g_shaders[];
 extern const int g_shader_count;
 
 /* ---- GPU lock: GL work happens with the context current on this thread ------------- */
+/* GL state the draws keep (metal_enc.c) is known only between draws: any
+ * other code that changes GL state (passes, copies, blits, uploads) says so */
+extern uint32_t g_gl_epoch;
+#define GL_DIRTY() (g_gl_epoch++)
 void gpu_lock(void);
 void gpu_unlock(void);
 

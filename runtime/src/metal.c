@@ -824,6 +824,7 @@ static GLenum tex_target(const MTexture *t)
 
 static void tex_create_gl(MTexture *t)
 {
+    GL_DIRTY();
     GLFmt f;
     if (!gl_format(t->format, &f))
         rt_fatal("metal: unsupported pixel format %u", t->format);
@@ -1297,6 +1298,7 @@ static void link_program(MPipeline *p)
 }
 static void link_program_here(MPipeline *p)
 {
+    GL_DIRTY();
 #if defined(__vita__)
     const char *fsrc = p->fs >= 0 ? g_shaders[p->fs].glsl : "void main(out float4 o0 : COLOR) { o0 = float4(0, 0, 0, 0); }\n";
     char *vsrc = strdup(g_shaders[p->vs].glsl);
@@ -1576,6 +1578,7 @@ static GLuint tex_fbo(MTexture *t, int level);
 static void tex_upload(MTexture *t, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t level,
                        uint32_t slice, const uint8_t *src, uint32_t bpr)
 {
+    GL_DIRTY();
     metal_fold_write(t);
     t->clear_valid = 0;
     GLFmt f;
@@ -1972,6 +1975,7 @@ int g_copy_rgb;          /* vita_copy_quad leaves the destination's alpha alone 
 void vita_copy_quad(MTexture *src, float sx, float sy, float sw, float sh, GLuint dst_fbo, GLint dx, GLint dy,
                     GLsizei dw, GLsizei dh, int flip_y)
 {
+    GL_DIRTY();
     static GLuint prog;
     static GLint tex_loc;
     if (!prog) {
@@ -2009,6 +2013,7 @@ void vita_copy_quad(MTexture *src, float sx, float sy, float sw, float sh, GLuin
 
 void metal_present(uint64_t drawable)
 {
+    GL_DIRTY();
     objc_frame_end();         /* GPU resources released 3 frames ago are freed */
     {
         extern int g_framelog;
@@ -2090,6 +2095,13 @@ void metal_present(uint64_t drawable)
                        g_draw_calls / frames, g_draw_ns / 1e6 / frames, g_endenc_ns / 1e6 / frames,
                        g_present_sem_ns / 1e6 / frames, g_pipelines_made / (double)frames);
                 g_pipelines_made = 0;
+                extern uint64_t g_dp_ns[4];
+                if (g_dp_ns[0] + g_dp_ns[1] + g_dp_ns[2] + g_dp_ns[3]) {
+                    rt_log("[fps]   indexed draws: setup %.1f ms, vertices %.1f ms, indices %.1f ms, GL draw %.1f ms\n",
+                           g_dp_ns[0] / 1e6 / frames, g_dp_ns[1] / 1e6 / frames, g_dp_ns[2] / 1e6 / frames,
+                           g_dp_ns[3] / 1e6 / frames);
+                    memset(g_dp_ns, 0, sizeof g_dp_ns);
+                }
                 g_draw_ns = g_endenc_ns = g_present_sem_ns = 0;
                 for (int k = 0; k < g_timed_count; k++) {
                     if (g_timed_calls[k])
