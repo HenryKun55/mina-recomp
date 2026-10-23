@@ -973,6 +973,14 @@ static void render_pass_update(Ctx *c)
                 grow_bounds_vis(vc, ve, box);
             }
         }
+        {   /* MINA_POISON_ALLBOUNDS: is the bounds of all objects read at all? */
+            static int poison = -1;
+            if (poison < 0)
+                poison = getenv("MINA_POISON_ALLBOUNDS") != NULL;
+            if (poison)
+                for (int k = 0; k < 6; k++)
+                    ab[k] = __builtin_nanf("");
+        }
         float *vb = GP(RP + 0x150 + 0x18 * v);
         vb[0] = vc[0]; vb[1] = vc[1]; vb[2] = vc[2];
         vb[3] = ve[0]; vb[4] = ve[1]; vb[5] = ve[2];
@@ -1441,6 +1449,16 @@ void nat__ZN4Game12InitFromSaveEv(Ctx *c)
         rt_st32(GP(settings + 0x668), want);
         rt_st32(GP(0x6045fc0), want);           /* (anonymous)::s_bufferIntScale */
         rt_log("[video] game buffers at %ux (%ux%u)\n", want, 256 * want, 144 * want);
+    }
+    /* The game steps its world (Game::FixedUpdate) s_targetFPS times a
+     * second, by 1/s_targetFPS: 60 or 120 (the Max FPS option), presenting
+     * after up to 2 steps. The Vita steps it 30 times (MINA_TARGET_FPS=n
+     * another rate, 0 the game's), a step a frame at 30 fps. */
+    const char *t = getenv("MINA_TARGET_FPS");
+    const uint32_t fps = t ? (uint32_t)atoi(t) : 30;
+    if (fps) {
+        rt_st32(GP(0x1e14de8), fps);            /* (anonymous)::s_targetFPS */
+        rt_log("[video] the world steps %u times a second\n", fps);
     }
 #endif
 }
