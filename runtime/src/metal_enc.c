@@ -975,11 +975,15 @@ static int bound_wrong(uint64_t a, const char *want, const char *what)
     if (o && !strcmp(o->cls->name, want))
         return 0;
     static int n;
-    if (n++ < 12) {
+    if (n++ < 12 || (n & 1023) == 0) {      /* the first ones, then one in 1024 (n counts them all) */
         char bt[512];
         guest_backtrace(bt, sizeof bt, 6);
-        rt_log("metal: the %s %#llx bound to a draw is %s: %s\n", what, (unsigned long long)a,
-               o ? o->cls->name : "not a live object", bt);
+        const char *objc_freed_info(uint64_t a, uint32_t *frames_ago);
+        uint32_t ago = 0;
+        const char *was = o ? NULL : objc_freed_info(a, &ago);
+        rt_log("metal: the %s %#llx bound to a draw is %s%s%s (%u frames ago) [%d so far]: %s\n", what,
+               (unsigned long long)a, o ? o->cls->name : "not a live object", was ? ": a freed " : "", was ? was : "",
+               ago, n, bt);
     }
     return 1;
 }
@@ -1616,6 +1620,13 @@ static void be_copyTextureRegion(Ctx *c)
 {
     GL_DIRTY();
     MTexture *s = objc_host(MARG(0)), *d = objc_host(MARG(5));
+    if (!s || !d) {          /* a texture that is not live (see bound_wrong): nothing to copy */
+        static int told;
+        if (told++ < 8)
+            rt_log("metal: a texture copy with a texture that is not live (%#llx -> %#llx)\n",
+                   (unsigned long long)MARG(0), (unsigned long long)MARG(5));
+        return;
+    }
     metal_fold_read(s);
     metal_fold_write(d);
     d->clear_valid = 0;
@@ -1664,6 +1675,13 @@ static void be_copyTexture(Ctx *c)
 {
     GL_DIRTY();
     MTexture *s = objc_host(MARG(0)), *d = objc_host(MARG(1));
+    if (!s || !d) {          /* a texture that is not live (see bound_wrong): nothing to copy */
+        static int told;
+        if (told++ < 8)
+            rt_log("metal: a texture copy with a texture that is not live (%#llx -> %#llx)\n",
+                   (unsigned long long)MARG(0), (unsigned long long)MARG(1));
+        return;
+    }
     metal_fold_read(s);
     metal_fold_write(d);
     d->clear_valid = 0;
@@ -1714,15 +1732,43 @@ static void be_copyBuffer(Ctx *c)
         return;
     }
     if (d->gpu_only) {
+        if (!s->contents && s->given_back) {
+            /* given back: uploaded again from its saved bytes (ycGpuBuffer keeps
+             * its staging buffers to fill its GPU buffer again) */
+            uint8_t *tmp = calloc(1, (size_t)so + n);
+            if (!tmp)
+                rt_fatal("metal: no memory to upload %u bytes again", n);
+            if (s->saved_len)
+                memcpy(tmp, s->saved, s->saved_len < so + n ? s->saved_len : so + n);
+            gpu_buffer_write(d, dof, tmp + so, n);
+            free(tmp);
+            return;
+        }
         gpu_buffer_write(d, dof, G(metal_buf_mem(s) + so), n);
-        /* A whole staging buffer uploaded to GPU memory: the game never reads
-         * it again (tile levels even keep them all), so its memory goes now. */
+        /* A whole staging buffer uploaded to GPU memory gives its memory back
+         * (tile levels keep them all, 1.25 MiB each, with a few KiB written):
+         * its bytes up to the last nonzero one are kept, for another upload. */
         static int keep = -1;
         if (keep < 0)
             keep = getenv("MINA_KEEP_STAGING") != NULL;
         if (!keep && so == 0 && n == s->length && !s->fresh && !s->keep_contents) {
-            gfree(s->contents);
-            s->contents = 0;
+            const uint8_t *m = G(s->contents);
+            uint32_t len = s->length;
+            while (len >= 8 && rt_ld64((const void *)(m + len - 8)) == 0)
+                len -= 8;
+            while (len && m[len - 1] == 0)
+                len--;
+            uint8_t *keepb = len ? malloc(len) : NULL;
+            if (!len || keepb) {
+                if (len)
+                    memcpy(keepb, m, len);
+                free(s->saved);
+                s->saved = keepb;
+                s->saved_len = len;
+                s->given_back = 1;
+                gfree(s->contents);
+                s->contents = 0;
+            }
         }
     } else
         memmove(G(metal_buf_mem(d) + dof), G(metal_buf_mem(s) + so), n);

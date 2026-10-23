@@ -739,6 +739,7 @@ static void buf_dealloc(void *h)
         gpu_unlock();
     }
     free(b->shadow);
+    free(b->saved);
     if (!b->fresh && !b->gpu_only)
         gfree(b->contents);
 }
@@ -751,7 +752,10 @@ static void d_newBufferWithLength(Ctx *c)
     {
         static int ntraced;
         char bt[512];
+        const char *len_only = getenv("MINA_BUFTRACE_LEN");     /* only buffers of this length */
         if (b->length >= (1u << 20) && getenv("MINA_BUFTRACE") && ntraced < 3 &&
+            (!len_only || (uint32_t)atoi(len_only) == b->length) &&
+            (!getenv("MINA_BUFTRACE_SHARED") || (b->options & 0xF0) != 0x20) &&
             (guest_backtrace(bt, sizeof bt, 8), strstr(bt, getenv("MINA_BUFTRACE")))) {
             ntraced++;
             Obj *ob = objc_obj(o);
@@ -1542,14 +1546,19 @@ static void d_newRenderPipelineState(Ctx *c)
 
 /* ---- buffers, textures, others: properties ------------------------------------------------- */
 
+/* a staging buffer's memory, made again with the bytes it had when given back */
 uint32_t metal_buf_mem(MBuffer *b)
 {
     if (!b->contents && !b->gpu_only) {
-        static int told;
-        if (told++ < 8)
-            rt_log("metal: a %u-byte buffer is used again after its upload: it keeps its memory now\n", b->length);
         b->contents = gcalloc(1, b->length ? b->length : 16);
-        b->keep_contents = 1;
+        if (!b->contents)
+            rt_fatal("metal: no guest memory for a %u-byte buffer", b->length);
+        if (b->saved)
+            memcpy(G(b->contents), b->saved, b->saved_len);
+        free(b->saved);
+        b->saved = NULL;
+        b->saved_len = 0;
+        b->given_back = 0;
     }
     return b->contents;
 }
@@ -1558,6 +1567,13 @@ static void b_contents(Ctx *c)
 {
     MBuffer *b = objc_host(SELF);
     b->contents_asked++;
+    if (!b->contents && !b->gpu_only) {
+        /* the game writes through this pointer whenever: never given back again */
+        static int told;
+        if (told++ < 8)
+            rt_log("metal: a %u-byte buffer's memory is asked for after its upload: it stays\n", b->length);
+        b->keep_contents = 1;
+    }
     RET(metal_buf_mem(b));
 }
 static void b_length(Ctx *c) { RET(((MBuffer *)objc_host(SELF))->length); }

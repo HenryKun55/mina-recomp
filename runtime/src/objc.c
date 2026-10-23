@@ -944,12 +944,33 @@ void objc_release_obj(uint64_t a)
 }
 
 /* NSObject -dealloc: host destructors along the chain, then the memory. */
+/* the last objects freed, for a report of one used after (objc_freed_info) */
+#define FREED_LOG 4096
+static struct { uint32_t addr, frame; const char *cls; } freed_log[FREED_LOG];
+static uint32_t freed_n;
+const char *objc_freed_info(uint64_t a, uint32_t *frames_ago)
+{
+    for (uint32_t k = 0; k < FREED_LOG && k < freed_n; k++) {
+        const uint32_t i = (freed_n - 1 - k) % FREED_LOG;
+        if (freed_log[i].addr == (uint32_t)a) {
+            *frames_ago = frame_no - freed_log[i].frame;
+            return freed_log[i].cls;
+        }
+    }
+    return NULL;
+}
 static void m_dealloc(Ctx *c)
 {
     uint64_t a = SELF;
     Obj *o = objc_obj(a);
     if (!o)
         return;
+    {
+        const uint32_t i = __atomic_fetch_add(&freed_n, 1, __ATOMIC_RELAXED) % FREED_LOG;
+        freed_log[i].addr = (uint32_t)a;
+        freed_log[i].frame = frame_no;
+        freed_log[i].cls = o->cls->name;
+    }
     if (o->traced)
         objc_trace_ref(o, "dealloc");
     for (Class *k = o->cls; k; k = k->super)
