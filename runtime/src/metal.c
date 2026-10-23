@@ -248,11 +248,52 @@ static int sel_info(uint64_t sel_addr, const char **key)
     return kind;
 }
 
+static int seq_left = -1;              /* MINA_SEQLOG: messages logged after a stencil REPLACE */
+static void seq_log(Ctx *c, const char *where)
+{
+    if (seq_left < 0)
+        seq_left = getenv("MINA_SEQLOG") ? 0 : -2;
+    if (seq_left <= 0)
+        return;
+    Class *k = objc_class_of(SELF);
+    if (!k || !strstr(k->name, "Stencil"))
+        return;
+    seq_left--;
+    rt_log("[seq] %s %s %#llx %s %#llx\n", where, k ? k->name : "?", (unsigned long long)SELF, gstr(c->x[1]),
+           (unsigned long long)MARG(0));
+}
 static void bag_fallback(Ctx *c)
 {
+    if (seq_left == 0 && strcmp(gstr(c->x[1]), "setDepthStencilPassOperation:") == 0 &&
+        MARG(0) == 2) {
+        static int once;
+        if (!once++)
+            seq_left = 400;
+    }
+    seq_log(c, "set");
     const char *key;
     int kind = sel_info(c->x[1], &key);
     PropBag *b = bag(SELF);
+    {   /* MINA_BAGLOG=name: the messages to bags of classes whose name contains it */
+        static const char *bl = (const char *)1;
+        if (bl == (const char *)1)
+            bl = getenv("MINA_BAGLOG");
+        static struct { uint32_t sel; uint64_t arg; } seen[256];
+        static int n;
+        if (bl) {
+            Class *k = objc_class_of(SELF);
+            if (k && strstr(k->name, bl)) {
+                int dup = 0;
+                for (int i = 0; i < n && !dup; i++)
+                    dup = seen[i].sel == (uint32_t)c->x[1] && seen[i].arg == MARG(0);
+                if (!dup && n < 256) {
+                    seen[n].sel = (uint32_t)c->x[1];
+                    seen[n++].arg = MARG(0);
+                    rt_log("[bag] %s %s %#llx\n", k->name, gstr(c->x[1]), (unsigned long long)MARG(0));
+                }
+            }
+        }
+    }
     switch (kind) {
     case SEL_SET: {
         /* as a Metal descriptor does, an object set is retained until it
@@ -324,6 +365,7 @@ uint64_t pb_child(uint64_t obj, const char *key, Class *cls) { return pb_child_a
 
 static void bag_child_getter(Ctx *c)
 {
+    seq_log(c, "get");
     const char *key;
     if (sel_info(c->x[1], &key) == SEL_GET) {
         Obj *self_o = objc_obj_tagged(SELF);
@@ -363,7 +405,40 @@ static void array_set_object(Ctx *c)
 static uint64_t pb_elem(uint64_t arr, int i) { return arr ? pb_get(arr, index_key("@", (uint64_t)i), 0) : 0; }
 static uint64_t pb_existing_child(uint64_t obj, const char *key) { return obj ? pb_get(obj, at_key(key), 0) : 0; }
 
-static const Method bag_methods[] = { { NULL, NULL } };
+/* -hash and -isEqual: by content, as Metal's descriptors have them: the game
+ * keeps one depth/stencil descriptor, changes it per draw and makes a new
+ * state only when its hash changes (ycRenderDevice::DrawCall); hashed by
+ * address, every draw of a pass got the state of its first one */
+static uint64_t bag_hash_of(uint64_t obj, int depth)
+{
+    PropBag *b = bag(obj);
+    uint64_t h = 1469598103934665603ull;
+    for (int i = 0; i < b->n; i++) {
+        uint64_t v = b->p[i].v;
+        if (b->p[i].key[0] == '@' && v && depth < 4)
+            v = bag_hash_of(v, depth + 1);
+        const uint64_t kh = (uint64_t)(uintptr_t)b->p[i].key;     /* interned */
+        /* order-independent: the same properties set in another order hash the same */
+        uint64_t x = (kh * 0x9E3779B97F4A7C15ull) ^ (v * 0xC2B2AE3D27D4EB4Full);
+        x ^= x >> 29;
+        h += x * 0xBF58476D1CE4E5B9ull;
+        if (b->di[i] >= 0)
+            for (int k = 0; k < 4; k++) {
+                uint64_t d;
+                memcpy(&d, &b->d[b->di[i]][k], 8);
+                h += (d ^ kh) * 0x94D049BB133111EBull;
+            }
+    }
+    return h;
+}
+static void bag_hash(Ctx *c) { RET(bag_hash_of(SELF, 0)); }
+static void bag_is_equal(Ctx *c)
+{
+    uint64_t o = MARG(0);
+    Class *a = objc_class_of(SELF), *b = o ? objc_class_of(o) : NULL;
+    RET(o == SELF || (a && a == b && bag_hash_of(SELF, 0) == bag_hash_of(o, 0)));
+}
+static const Method bag_methods[] = { { "hash", bag_hash }, { "isEqual:", bag_is_equal }, { NULL, NULL } };
 static const Method array_methods[] = {
     { "objectAtIndexedSubscript:", array_object_at }, { "setObject:atIndexedSubscript:", array_set_object },
     { NULL, NULL },
@@ -853,14 +928,61 @@ static void read_stencil(uint64_t d, MStencil *s)
 static void d_newDepthStencilState(Ctx *c)
 {
     uint64_t d = MARG(0);
+    if (seq_left > 0)
+        rt_log("[seq] newDepthStencilState with %#llx (front %#llx back %#llx)\n", (unsigned long long)d,
+               (unsigned long long)pb_existing_child(d, "frontFaceStencil"), (unsigned long long)pb_existing_child(d, "backFaceStencil"));
     MDepthStencil k;
     memset(&k, 0, sizeof k);
     k.compare = (uint32_t)pb_get(d, "depthCompareFunction", 7);
     k.write = (uint32_t)pb_get(d, "depthWriteEnabled", 0) & 1;
     uint64_t f = pb_existing_child(d, "frontFaceStencil"), b = pb_existing_child(d, "backFaceStencil");
+    static int dslog = -1;
+    if (dslog < 0)
+        dslog = getenv("MINA_DSLOG") != NULL;
+    if (dslog) {                         /* each distinct descriptor content once: keys, values */
+        char line[1024];
+        int n = 0;
+        PropBag *bg = bag(d);
+        for (int i = 0; i < bg->n && n < 900; i++) {
+            uint64_t v = bg->p[i].v;
+            Obj *o = v ? objc_obj(v) : NULL;
+            if (o && strstr(o->cls->name, "Stencil")) {
+                PropBag *sb = bag(v);
+                n += snprintf(line + n, sizeof line - n, " %s{", bg->p[i].key);
+                for (int j = 0; j < sb->n && n < 900; j++)
+                    n += snprintf(line + n, sizeof line - n, "%s=%llx ", sb->p[j].key, (unsigned long long)sb->p[j].v);
+                n += snprintf(line + n, sizeof line - n, "}");
+            } else {
+                n += snprintf(line + n, sizeof line - n, " %s=%llx", bg->p[i].key, (unsigned long long)v);
+            }
+        }
+        static char seen[64][1024];
+        static int nseen;
+        int dup = 0;
+        for (int i = 0; i < nseen && !dup; i++)
+            dup = strcmp(seen[i], line) == 0;
+        if (!dup && nseen < 64) {
+            strcpy(seen[nseen++], line);
+            rt_log("[ds]%s\n", line);
+        }
+    }
     k.stencil_enabled = f || b;
     read_stencil(f, &k.front);
     read_stencil(b ? b : f, &k.back);
+    if (dslog) {                         /* each distinct state built */
+        static MDepthStencil seen[64];
+        static int nseen;
+        int dup = 0;
+        for (int i = 0; i < nseen && !dup; i++)
+            dup = !memcmp(&seen[i], &k, sizeof k);
+        if (!dup && nseen < 64) {
+            seen[nseen++] = k;
+            rt_log("[dsk] cmp %u w %u st %d front %u/%u/%u/%u rm %x wm %x back %u/%u/%u/%u (f %#llx b %#llx)\n", k.compare,
+                   k.write, k.stencil_enabled, k.front.compare, k.front.pass, k.front.fail, k.front.depth_fail,
+                   k.front.read_mask, k.front.write_mask, k.back.compare, k.back.pass, k.back.fail, k.back.depth_fail,
+                   (unsigned long long)f, (unsigned long long)b);
+        }
+    }
     pthread_mutex_lock(&state_lock);
     for (int i = 0; i < nds_made; i++)
         if (!memcmp(&ds_made[i].key, &k, sizeof k)) {

@@ -732,7 +732,7 @@ class Lower:
         the recompiled code keeps those registers in C locals and never writes
         them back to the context, so the caller's values are intact without
         them. x29/x30 stay (frame chain). The sp writeback still happens."""
-        if self.test_mode:
+        if self.test_mode or os.environ.get("MINA_GEN_SAFE"):     # MINA_GEN_SAFE=1: kept (to rule it out)
             return set()
         SP_REG = 32                             # a64.py's number for sp
 

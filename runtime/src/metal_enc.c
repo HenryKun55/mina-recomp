@@ -76,6 +76,7 @@ typedef struct REnc {
     float depth_value;
     int stencil_value;
     int vp_set, sc_set;
+    float depth_bias, depth_slope;       /* setDepthBias:slopeScale:clamp: (applied at each draw) */
     int to_display;                      /* Vita: the drawable's pass draws to the screen */
     int folded;                          /* Vita: its copy was folded (fold_pass), nothing drawn yet */
     int depth_stale;                     /* Vita: the depth in memory is not the pass's (depth_by_shader) */
@@ -737,15 +738,13 @@ static void re_setScissor(Ctx *c)
     if (e->begun)
         glScissor(e->sc[0], screen_y(e, e->sc[1], e->sc[3]), e->sc[2], e->sc[3]);
 }
+/* kept with the encoder: set before its first draw, it was lost when the
+ * pass began (which turns the offset off) */
 static void re_setDepthBias(Ctx *c)
 {
-    float bias = c->v[0].f[0], slope = c->v[1].f[0];
-    if (bias == 0 && slope == 0) {
-        glDisable(GL_POLYGON_OFFSET_FILL);
-        return;
-    }
-    glEnable(GL_POLYGON_OFFSET_FILL);
-    glPolygonOffset(slope, bias);
+    REnc *e = objc_host(SELF);
+    e->depth_bias = c->v[0].f[0];
+    e->depth_slope = c->v[1].f[0];
 }
 static void re_nop(Ctx *c) { (void)c; }
 static void re_label(Ctx *c) { RET(0); }
@@ -774,6 +773,12 @@ static GLenum gl_stencil_op(uint32_t o)
 
 static void apply_state(REnc *e, MPipeline *p)
 {
+    if (e->depth_bias != 0.0f || e->depth_slope != 0.0f) {
+        glEnable(GL_POLYGON_OFFSET_FILL);
+        glPolygonOffset(e->depth_slope, e->depth_bias);
+    } else {
+        glDisable(GL_POLYGON_OFFSET_FILL);
+    }
     for (int i = 0; i < MAX_COLOR; i++) {
         if (!e->color[i])
             continue;
