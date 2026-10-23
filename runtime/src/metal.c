@@ -184,7 +184,7 @@ static void bag_dealloc(void *h)
 {
     PropBag *b = h;
     for (int i = 0; i < b->n; i++)
-        if (b->p[i].key[0] == '@')
+        if (b->p[i].key[0] == '@' || (b->held >> i & 1))
             objc_release_obj(b->p[i].v);
 }
 
@@ -254,9 +254,21 @@ static void bag_fallback(Ctx *c)
     int kind = sel_info(c->x[1], &key);
     PropBag *b = bag(SELF);
     switch (kind) {
-    case SEL_SET:
-        b->p[pb_slot(b, key)].v = MARG(0);
+    case SEL_SET: {
+        /* as a Metal descriptor does, an object set is retained until it
+         * is replaced or the bag goes (a function the game released after
+         * setting it was still read from the descriptor) */
+        const int i = pb_slot(b, key);
+        const uint64_t v = MARG(0), old = b->p[i].v, bit = 1ull << i;
+        const int had = (b->held & bit) != 0, obj = v && objc_obj(v) != NULL;
+        if (obj)
+            objc_retain_obj(v);
+        b->p[i].v = v;
+        b->held = obj ? b->held | bit : b->held & ~bit;
+        if (had)
+            objc_release_obj(old);
         return;
+    }
     case SEL_SET_F64:
     case SEL_SET_F32: {
         double *d = pb_dslot(b, pb_slot(b, key));
@@ -999,7 +1011,7 @@ static char *patch_vertex_outputs(const char *vs, const char *fs)
  * wrote over the heap (objects freed early, pointers like 0xd00000000). It
  * runs here, on one thread with a stack of its own, while the caller waits
  * (holding the GPU lock as before). */
-#define BIG_STACK (2u << 20)
+#define BIG_STACK (4u << 20)
 /* a Vita thread with Vita semaphores: a pthread for it never ran on the device
  * (the game stopped at its first shader) */
 static SceUID big_work = -1, big_done = -1;
@@ -1009,9 +1021,27 @@ static int big_worker(SceSize args, void *argp)
 {
     (void)args;
     (void)argp;
+    /* the stack below here painted: MINA_STACK_LOG logs the most the compiler used */
+    uint8_t here;
+    uint8_t *const top = &here - 256, *const lo = top - (BIG_STACK - 64 * 1024);
+    const int measure = getenv("MINA_STACK_LOG") != NULL;
+    if (measure)
+        memset(lo, 0xA5, (size_t)(top - lo));
+    size_t most = 0;
     for (;;) {
         sceKernelWaitSema(big_work, 1, NULL);
         big_fn(big_arg);
+        if (measure) {
+            const uint8_t *q = lo;
+            while (q < top && *q == 0xA5)
+                q++;
+            const size_t used = (size_t)(top - q);
+            if (used > most) {
+                most = used;
+                rt_log("[shader] the compiler used %u KiB of its stack (%u KiB never touched)\n", (unsigned)(used >> 10),
+                       (unsigned)((size_t)(q - lo) >> 10));
+            }
+        }
         sceKernelSignalSema(big_done, 1);
     }
     return 0;

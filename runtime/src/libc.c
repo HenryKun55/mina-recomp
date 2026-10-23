@@ -21,7 +21,10 @@
 
 /* ---- memory and strings ---------------------------------------------------- */
 
-static void imp_memcpy(Ctx *c) { memcpy(G(A0), G(A1), (size_t)A2); }
+/* macOS's memcpy is its memmove, and the game copies between overlapping
+ * ranges (ObjectUtil::GetObjectHashName): newlib's memcpy on the Vita
+ * corrupts such copies */
+static void imp_memcpy(Ctx *c) { memmove(G(A0), G(A1), (size_t)A2); }
 static void imp_memmove(Ctx *c) { memmove(G(A0), G(A1), (size_t)A2); }
 static void imp_memset(Ctx *c) { memset(G(A0), (int)A1, (size_t)A2); }
 static void imp_bzero(Ctx *c) { memset(G(A0), 0, (size_t)A1); }

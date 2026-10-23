@@ -428,6 +428,25 @@ static void canary_check(uint32_t a, const char *what)
     }
 }
 
+#define FREED 0xDDu
+#define QUARANTINE 8192
+static uint32_t quarantine[QUARANTINE], q_next;
+
+/* a freed block about to be reused: still painted after its free-list link? */
+static void freed_check(uint32_t a, uint64_t cap)
+{
+    const uint8_t *p = G(a);
+    for (uint64_t i = 4; i < cap; i++) {
+        if (p[i] != FREED) {
+            uint32_t w;
+            memcpy(&w, p + (i & ~3ull), 4);
+            rt_log("[heapcheck] freed block %#x (%llu bytes) written after its free at +%llu (word %#x)\n", a,
+                   (unsigned long long)cap, (unsigned long long)i, w);
+            return;
+        }
+    }
+}
+
 static uint32_t heap_top;
 static pthread_mutex_t heap_lock;
 
@@ -473,7 +492,6 @@ uint32_t gmalloc(uint64_t size)
             pthread_create(&t, NULL, heapcheck_thread, NULL);
         }
     }
-        heapcheck = getenv("MINA_HEAPCHECK") != NULL;
     uint64_t want = size;
     if (heapcheck)
         size += 16;
@@ -488,6 +506,8 @@ uint32_t gmalloc(uint64_t size)
         free_list[cls] = *(uint32_t *)G(a);
         if (h->magic != MAGIC_FREE)
             rt_fatal("guest heap corrupted at %#x", a);
+        if (heapcheck)
+            freed_check(a, class_cap(cls));
         h->magic = MAGIC_USED;
         h->size = want;
     } else {
@@ -554,9 +574,23 @@ void gfree(uint32_t a)
         if (class_cap(h->cls) >= (64u << 10))
             big_remove(a);
     }
+    heap_in_use -= class_cap(h->cls);
+    if (heapcheck > 0) {
+        /* painted, and reused only after QUARANTINE other frees: a write
+         * to it in between is a use after free (logged when it is reused) */
+        memset(G(a), FREED, (size_t)class_cap(h->cls));
+        uint32_t out = quarantine[q_next];
+        quarantine[q_next] = a;
+        q_next = (q_next + 1) % QUARANTINE;
+        if (!out) {
+            pthread_mutex_unlock(&heap_lock);
+            return;
+        }
+        a = out;
+        h = G(a - HDR);
+    }
     *(uint32_t *)G(a) = free_list[h->cls];
     free_list[h->cls] = a;
-    heap_in_use -= class_cap(h->cls);
     pthread_mutex_unlock(&heap_lock);
 }
 

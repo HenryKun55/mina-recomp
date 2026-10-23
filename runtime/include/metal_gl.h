@@ -31,6 +31,7 @@
 /* Keys are permanent strings (interned or literals), never freed. */
 typedef struct PropBag {
     int n, nd;                  /* first: a new bag zeroes only these (Class.host_zero) */
+    uint64_t held;              /* properties holding an object it retained (bit per slot) */
     struct { const char *key; uint64_t v; } p[PB_MAX];
     int8_t di[PB_MAX];          /* index into d, or -1 */
     double d[PB_MAX_D][4];

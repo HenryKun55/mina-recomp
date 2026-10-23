@@ -373,6 +373,7 @@ void nat__ZN7IsoAnim13CalcTransformERK11ycTransformS2_ybb(Ctx *c)
  * sees are in a guest stack frame, as in the game. */
 static inline float ldf(uint64_t a) { float f; memcpy(&f, G(a), 4); return f; }
 static inline void stf(uint64_t a, float f) { memcpy(G(a), &f, 4); }
+int g_no_natives;                       /* MINA_NO_NATIVES (main.c) */
 void f_9a65c4_orig(Ctx *c);
 static void recalc_world_transform(Ctx *c)
 {
@@ -1450,15 +1451,20 @@ void nat__ZN4Game12InitFromSaveEv(Ctx *c)
         rt_st32(GP(0x6045fc0), want);           /* (anonymous)::s_bufferIntScale */
         rt_log("[video] game buffers at %ux (%ux%u)\n", want, 256 * want, 144 * want);
     }
+#endif
     /* The game steps its world (Game::FixedUpdate) s_targetFPS times a
      * second, by 1/s_targetFPS: 60 or 120 (the Max FPS option), presenting
      * after up to 2 steps. The Vita steps it 30 times (MINA_TARGET_FPS=n
      * another rate, 0 the game's), a step a frame at 30 fps. */
     const char *t = getenv("MINA_TARGET_FPS");
+#if defined(__vita__)
     const uint32_t fps = t ? (uint32_t)atoi(t) : 30;
+#else
+    const uint32_t fps = t ? (uint32_t)atoi(t) : 0;
+#endif
     if (fps) {
+        GM_BEGIN;
         rt_st32(GP(0x1e14de8), fps);            /* (anonymous)::s_targetFPS */
         rt_log("[video] the world steps %u times a second\n", fps);
     }
-#endif
 }

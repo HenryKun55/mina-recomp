@@ -1791,7 +1791,12 @@ def gen_function(prog, start, end, natives=(), timed=None, timed_calls=(), profi
         # prototypes here, not in funcs.h: changing the natives must not touch every file
         code = code.replace("void %s(Ctx *c)" % cname(start), "void %s_orig(Ctx *c);\nvoid %s(Ctx *c);\nvoid %s_orig(Ctx *c)"
                             % (cname(start), native_ident(name), cname(start)), 1)
-        code += "void %s(Ctx *c) { %s(c); }\n" % (cname(start), native_ident(name))
+        if name.startswith("__ZN"):
+            # a game function made native: MINA_NO_NATIVES=1 runs the recompiled one
+            code += ("extern int g_no_natives;\nvoid %s(Ctx *c) { if (g_no_natives) %s_orig(c); else %s(c); }\n"
+                     % (cname(start), cname(start), native_ident(name)))
+        else:
+            code += "void %s(Ctx *c) { %s(c); }\n" % (cname(start), native_ident(name))
     if name in timed_calls:
         # --timed "*name": its indirect calls timed, by target (MINA_FPS logs the biggest)
         code = code.replace("RT_CALL_IC(c, t_, ic_);",

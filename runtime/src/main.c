@@ -70,6 +70,12 @@ int main(int argc, char **argv)
     void rt_profile_start(void);
     rt_profile_start();
 #endif
+    {   /* MINA_NO_NATIVES=1: the game's functions made native run recompiled */
+        extern int g_no_natives;
+        g_no_natives = getenv("MINA_NO_NATIVES") != NULL;
+        if (g_no_natives)
+            rt_log("[natives] the game's native functions are off\n");
+    }
     const char *exe = getenv("MINA_EXE");
     if (!exe)
 #if defined(__vita__)
