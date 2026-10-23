@@ -24,7 +24,7 @@
 int rt_all_ctx(Ctx ***out);
 void rt_log_flush(void);
 
-#define SLOTS 4              /* threads profiled: the first ones seen working */
+#define SLOTS 8              /* threads profiled: the first ones seen working */
 #define MAXT 128
 #define PERIOD_US 1000
 #define REPORT_US 5000000

@@ -992,7 +992,68 @@ static char *patch_vertex_outputs(const char *vs, const char *fs)
     return out;
 }
 
+#if defined(__vita__)
+/* The shader compiler (vitaShaRK, from glLinkProgram/glShaderSource) needs far
+ * more stack than the game's threads have (512 KiB): run past their end, it
+ * wrote over the heap (objects freed early, pointers like 0xd00000000). It
+ * runs here, on one thread with a stack of its own, while the caller waits
+ * (holding the GPU lock as before). */
+#define BIG_STACK (4u << 20)
+static pthread_mutex_t big_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t big_cv = PTHREAD_COND_INITIALIZER;
+static void (*big_fn)(void *);
+static void *big_arg;
+static int big_state;            /* 0 idle, 1 work given, 2 done */
+static void *big_worker(void *u)
+{
+    (void)u;
+    pthread_mutex_lock(&big_lock);
+    for (;;) {
+        while (big_state != 1)
+            pthread_cond_wait(&big_cv, &big_lock);
+        pthread_mutex_unlock(&big_lock);
+        big_fn(big_arg);
+        pthread_mutex_lock(&big_lock);
+        big_state = 2;
+        pthread_cond_broadcast(&big_cv);
+    }
+    return NULL;
+}
+static void run_on_big_stack(void (*fn)(void *), void *arg)
+{
+    static int started;
+    pthread_mutex_lock(&big_lock);
+    if (!started) {
+        pthread_attr_t a;
+        pthread_attr_init(&a);
+        pthread_attr_setstacksize(&a, BIG_STACK);
+        pthread_t t;
+        if (pthread_create(&t, &a, big_worker, NULL) != 0)
+            rt_fatal("metal: no thread for the shader compiler");
+        started = 1;
+    }
+    big_fn = fn;
+    big_arg = arg;
+    big_state = 1;
+    pthread_cond_broadcast(&big_cv);
+    while (big_state != 2)
+        pthread_cond_wait(&big_cv, &big_lock);
+    big_state = 0;
+    pthread_mutex_unlock(&big_lock);
+}
+#endif
+
+static void link_program_here(MPipeline *p);
+static void link_program_cb(void *p) { link_program_here(p); }
 static void link_program(MPipeline *p)
+{
+#if defined(__vita__)
+    run_on_big_stack(link_program_cb, p);
+#else
+    link_program_here(p);
+#endif
+}
+static void link_program_here(MPipeline *p)
 {
 #if defined(__vita__)
     const char *fsrc = p->fs >= 0 ? g_shaders[p->fs].glsl : "void main(out float4 o0 : COLOR) { o0 = float4(0, 0, 0, 0); }\n";
@@ -1147,8 +1208,10 @@ static uint64_t make_reflection(const MPipeline *p)
     return objc_autorelease_obj(r);
 }
 
+uint32_t g_pipelines_made;          /* MINA_FPS */
 static void d_newRenderPipelineState(Ctx *c)
 {
+    g_pipelines_made++;
     uint64_t reflection_out = strstr(gstr(c->x[1]), "reflection:") ? MARG(2) : 0;
     uint64_t d = MARG(0);
     uint64_t o = objc_new_object(&cls_Pipeline);
@@ -1582,6 +1645,33 @@ static void dr_present(Ctx *c) { metal_present(SELF); }
  * texture) to a region of a framebuffer (0: the screen), drawn with a quad:
  * vitaGL's glBlitFramebuffer draws only one triangle of its quad. flip_y
  * turns the copy upside down (Metal frames to the screen). */
+static void copy_program_make(void *out)
+{
+    /* vitaGL declares gl_Position (POSITION) and gl_FragColor (COLOR) itself */
+    static const char *vs =
+        "void main(float2 position, float2 texcoord, out float2 vtex : TEXCOORD0)"
+        " { vtex = texcoord; gl_Position = float4(position, 0.0, 1.0); }";
+    static const char *fs =
+        "uniform sampler2D tex;"
+        " void main(float2 vtex : TEXCOORD0) { gl_FragColor = tex2D(tex, vtex); }";
+    GLuint v = glCreateShader(GL_VERTEX_SHADER), f = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(v, 1, &vs, NULL);
+    glCompileShader(v);
+    glShaderSource(f, 1, &fs, NULL);
+    glCompileShader(f);
+    GLuint prog = glCreateProgram();
+    glAttachShader(prog, v);
+    glAttachShader(prog, f);
+    glBindAttribLocation(prog, 0, "position");
+    glBindAttribLocation(prog, 1, "texcoord");
+    glLinkProgram(prog);
+    GLint ok = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    if (!ok)
+        rt_fatal("metal: the copy shader does not link");
+    *(GLuint *)out = prog;
+}
+
 int g_copy_rgb;          /* vita_copy_quad leaves the destination's alpha alone */
 void vita_copy_quad(MTexture *src, float sx, float sy, float sw, float sh, GLuint dst_fbo, GLint dx, GLint dy,
                     GLsizei dw, GLsizei dh, int flip_y)
@@ -1589,28 +1679,7 @@ void vita_copy_quad(MTexture *src, float sx, float sy, float sw, float sh, GLuin
     static GLuint prog;
     static GLint tex_loc;
     if (!prog) {
-        /* vitaGL declares gl_Position (POSITION) and gl_FragColor (COLOR) itself */
-        static const char *vs =
-            "void main(float2 position, float2 texcoord, out float2 vtex : TEXCOORD0)"
-            " { vtex = texcoord; gl_Position = float4(position, 0.0, 1.0); }";
-        static const char *fs =
-            "uniform sampler2D tex;"
-            " void main(float2 vtex : TEXCOORD0) { gl_FragColor = tex2D(tex, vtex); }";
-        GLuint v = glCreateShader(GL_VERTEX_SHADER), f = glCreateShader(GL_FRAGMENT_SHADER);
-        glShaderSource(v, 1, &vs, NULL);
-        glCompileShader(v);
-        glShaderSource(f, 1, &fs, NULL);
-        glCompileShader(f);
-        prog = glCreateProgram();
-        glAttachShader(prog, v);
-        glAttachShader(prog, f);
-        glBindAttribLocation(prog, 0, "position");
-        glBindAttribLocation(prog, 1, "texcoord");
-        glLinkProgram(prog);
-        GLint ok = 0;
-        glGetProgramiv(prog, GL_LINK_STATUS, &ok);
-        if (!ok)
-            rt_fatal("metal: the copy shader does not link");
+        run_on_big_stack(copy_program_make, &prog);
         tex_loc = glGetUniformLocation(prog, "tex");
     }
     float u0 = sx / (float)src->width, u1 = (sx + sw) / (float)src->width;
@@ -1720,9 +1789,11 @@ void metal_present(uint64_t drawable)
                 g_depth_fs_draws = g_depth_restarts = 0;
                 extern uint64_t g_draw_ns, g_endenc_ns, g_present_sem_ns;
                 extern uint32_t g_draw_calls;
-                rt_log("[fps]   render: %u draws %.1f ms, pass ends %.1f ms; presenting thread blocked %.1f ms\n",
+                rt_log("[fps]   render: %u draws %.1f ms, pass ends %.1f ms; presenting thread blocked %.1f ms; "
+                       "%.1f pipelines made\n",
                        g_draw_calls / frames, g_draw_ns / 1e6 / frames, g_endenc_ns / 1e6 / frames,
-                       g_present_sem_ns / 1e6 / frames);
+                       g_present_sem_ns / 1e6 / frames, g_pipelines_made / (double)frames);
+                g_pipelines_made = 0;
                 g_draw_ns = g_endenc_ns = g_present_sem_ns = 0;
                 for (int k = 0; k < g_timed_count; k++) {
                     if (g_timed_calls[k])

@@ -808,7 +808,14 @@ void objc_trace_ref(Obj *o, const char *op)
 {
     char bt[512];
     guest_backtrace(bt, sizeof bt, 4);
-    rt_log("[ref] %s %#x %s -> %d (frame %u, held %d): %s\n", op, o->addr, o->cls->name, o->refs, frame_no, o->held, bt);
+    const char *in = "";
+#if defined(MINA_PROFILE)
+    Ctx *tc = thread_ctx();                  /* the guest function asking (profile builds know it) */
+    if (tc && tc->cur_fn < g_guest_func_count)
+        in = g_guest_func_names[tc->cur_fn];
+#endif
+    rt_log("[ref] %s %#x %s -> %d (frame %u, held %d) in %s: %s\n", op, o->addr, o->cls->name, o->refs, frame_no,
+           o->held, in, bt);
 }
 
 uint64_t objc_retain_obj(uint64_t a)
@@ -951,8 +958,11 @@ static void m_dealloc(Ctx *c)
     const int tagged = rt_ld32(G(a + 16)) == obj_tag((uint32_t)a, o);
     if (tagged)
         rt_st32(G(a + 16), 0);                  /* untagged before the memory is reused */
+    static int no_pool = -1;                   /* MINA_NO_POOL: freed objects are never reused */
+    if (no_pool < 0)
+        no_pool = getenv("MINA_NO_POOL") != NULL;
     int poolable = 0;
-    for (Class *k = o->cls; k && !poolable; k = k->super)
+    for (Class *k = o->cls; k && !poolable && !no_pool; k = k->super)
         poolable = k->poolable;
     if (tagged && poolable && o->cls->pooled < POOL_MAX && !o->cls->guest) {
         o->refs = POOL_DEAD;
