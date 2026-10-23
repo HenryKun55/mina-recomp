@@ -498,6 +498,7 @@ BAG_CLASS(cls_PipelineColorDesc, "MTLRenderPipelineColorAttachmentDescriptor");
 BAG_CLASS(cls_VertexDesc, "MTLVertexDescriptor");
 BAG_CLASS(cls_VertexAttrDesc, "MTLVertexAttributeDescriptor");
 BAG_CLASS(cls_VertexLayoutDesc, "MTLVertexBufferLayoutDescriptor");
+BAG_CLASS(cls_PipelineBufferDesc, "MTLPipelineBufferDescriptor");
 BAG_CLASS(cls_PassDesc, "MTLRenderPassDescriptor");
 BAG_CLASS(cls_PassColorDesc, "MTLRenderPassColorAttachmentDescriptor");
 BAG_CLASS(cls_PassDepthDesc, "MTLRenderPassDepthAttachmentDescriptor");
@@ -510,6 +511,10 @@ static void define_children(void)
         { &cls_DepthStencilDesc, "backFaceStencil", &cls_StencilDesc, NULL },
         { &cls_PipelineDesc, "vertexDescriptor", &cls_VertexDesc, NULL },
         { &cls_PipelineDesc, "colorAttachments", &cls_BagArray, &cls_PipelineColorDesc },
+        /* their mutability: the game sets it when it is not immutable yet, and
+         * makes a new pipeline state when it sets anything (nil here, every draw) */
+        { &cls_PipelineDesc, "vertexBuffers", &cls_BagArray, &cls_PipelineBufferDesc },
+        { &cls_PipelineDesc, "fragmentBuffers", &cls_BagArray, &cls_PipelineBufferDesc },
         { &cls_VertexDesc, "attributes", &cls_BagArray, &cls_VertexAttrDesc },
         { &cls_VertexDesc, "layouts", &cls_BagArray, &cls_VertexLayoutDesc },
         { &cls_PassDesc, "colorAttachments", &cls_BagArray, &cls_PassColorDesc },
@@ -749,11 +754,22 @@ static void d_newBufferWithBytes(Ctx *c)
     RET(o);
 }
 
+int metal_texlog(void)
+{   /* MINA_TEXLOG: textures made and deleted, copies between them (debug) */
+    static int on = -1;
+    if (on < 0)
+        on = getenv("MINA_TEXLOG") != NULL;
+    return on;
+}
+static void fbo_forget(GLuint gl);
 static void tex_dealloc(void *h)
 {
     MTexture *t = h;
     gpu_lock();
+    if (metal_texlog())
+        rt_log("[tex] delete %ux%u fmt %u gl %u fbo %u\n", t->width, t->height, t->format, t->gl, t->fbo_cache);
     metal_fold_forget(t);
+    fbo_forget(t->gl);
     if (t->gl && t->is_rb) glDeleteRenderbuffers(1, &t->gl);
     else if (t->gl) glDeleteTextures(1, &t->gl);
     if (t->fbo_cache) glDeleteFramebuffers(1, &t->fbo_cache);
@@ -848,6 +864,8 @@ uint64_t metal_new_texture(uint32_t type, uint32_t fmt, uint32_t w, uint32_t h, 
         t->type = 4;
     gpu_lock();
     tex_create_gl(t);
+    if (metal_texlog() && t->width >= 64)
+        rt_log("[tex] new %ux%u fmt %u gl %u\n", t->width, t->height, t->format, t->gl);
     gpu_unlock();
     return o;
 }
@@ -1602,6 +1620,27 @@ typedef struct FboEnt {
 static FboEnt fbos[256];
 static int nfbos;
 
+/* A texture goes: the passes' framebuffers with it go too (GL gives a new
+ * texture its name again, and a framebuffer kept for that name would draw
+ * into the deleted one: black after the game's pixel scale option made its
+ * targets again). gpu_lock held. */
+static void fbo_forget(GLuint gl)
+{
+    if (!gl)
+        return;
+    for (int i = 0; i < nfbos;) {
+        int uses = 0;
+        for (int k = 0; k <= MAX_COLOR && !uses; k++)
+            uses = fbos[i].tex[k] == gl;
+        if (uses) {
+            glDeleteFramebuffers(1, &fbos[i].fbo);
+            fbos[i] = fbos[--nfbos];
+        } else {
+            i++;
+        }
+    }
+}
+
 static GLuint pass_fbo(MTexture **color, const int *levels, MTexture *depth, MTexture *stencil)
 {
     FboEnt key;
@@ -2014,8 +2053,11 @@ void metal_present(uint64_t drawable)
     glBindFramebuffer(GL_READ_FRAMEBUFFER, tex_fbo(t, 0));
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
     glDisable(GL_SCISSOR_TEST);
-    /* Metal layout (row 0 at the top) to the window (row 0 at the bottom) */
-    glBlitFramebuffer(0, 0, (GLint)t->width, (GLint)t->height, 0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    /* Metal layout (row 0 at the top) to the window (row 0 at the bottom);
+     * the same size: GL_LINEAR draws nothing in a large window (3064x1990)
+     * on macOS, without an error */
+    glBlitFramebuffer(0, 0, (GLint)t->width, (GLint)t->height, 0, h, w, 0, GL_COLOR_BUFFER_BIT,
+                      t->width == (uint32_t)w && t->height == (uint32_t)h ? GL_NEAREST : GL_LINEAR);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     dump_frame(t);
     SDL_GL_SwapWindow(sdl_main_window());
@@ -2104,7 +2146,7 @@ void metal_init_classes(void);
 Class *const g_classes_metal[] = {
     &cls_PropBag, &cls_BagArray, &cls_TextureDesc, &cls_SamplerDesc, &cls_DepthStencilDesc, &cls_StencilDesc,
     &cls_PipelineDesc, &cls_PipelineColorDesc, &cls_VertexDesc, &cls_VertexAttrDesc, &cls_VertexLayoutDesc,
-    &cls_PassDesc, &cls_PassColorDesc, &cls_PassDepthDesc, &cls_PassStencilDesc,
+    &cls_PipelineBufferDesc, &cls_PassDesc, &cls_PassColorDesc, &cls_PassDepthDesc, &cls_PassStencilDesc,
     &cls_Device, &cls_Queue, &cls_CmdBuf, &cls_Buffer, &cls_Texture, &cls_Sampler, &cls_DepthStencil,
     &cls_Library, &cls_Function, &cls_Pipeline, &cls_Layer, &cls_Drawable, &cls_RenderEnc, &cls_BlitEnc,
     &cls_Arg, &cls_Refl,

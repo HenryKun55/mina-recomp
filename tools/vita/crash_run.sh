@@ -24,7 +24,7 @@ mkdir -p "$OUT"
 printf '%s\n' "$@" > "$OUT/env.txt"
 
 finish() {
-    pkill -f "Vita3K -r MINA00001" 2>/dev/null
+    pkill -f "MacOS/Vita3K -r MINA00001$" 2>/dev/null
     sleep 1
     cp "$DATA/mina.log" "$OUT/mina.log" 2>/dev/null
     cp "$ROOT/build-vita/vita3k.log" "$OUT/vita3k.log" 2>/dev/null
@@ -53,7 +53,7 @@ rm -f "$DATA/mina.log"
 "$ROOT/tools/run_vita3k.sh" "$MAX" > /dev/null 2>&1 &
 sleep 5
 t=5
-while pgrep -f "Vita3K -r MINA00001" > /dev/null && [ "$t" -lt "$MAX" ]; do
+while pgrep -f "MacOS/Vita3K -r MINA00001$" > /dev/null && [ "$t" -lt "$MAX" ]; do
     sleep 2
     t=$((t + 2))
 done

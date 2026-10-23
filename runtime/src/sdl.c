@@ -241,8 +241,22 @@ void nat_SDL_CreateWindow(Ctx *c)
     (void)flags;
     SDL_Window *w = (SDL_Window *)(uintptr_t)0x56495441u;
 #else
+    int ww = (int)A3, wh = (int)A4;
+    /* a window the size of the whole display (the game asks fullscreen
+     * desktop, which is dropped above) stays black on macOS: it fits the
+     * display's usable area instead, below the menu bar and above the Dock,
+     * with room for its title bar and the game's aspect */
+    SDL_Rect ub;
+    if (!(flags & SDL_WINDOW_FULLSCREEN) && SDL_GetDisplayUsableBounds(0, &ub) == 0 && ub.w > 0 && ub.h > 32) {
+        const int maxw = ub.w, maxh = ub.h - 32;
+        if (ww > maxw || wh > maxh) {
+            const double k = (double)maxw / ww < (double)maxh / wh ? (double)maxw / ww : (double)maxh / wh;
+            ww = (int)(ww * k);
+            wh = (int)(wh * k);
+        }
+    }
     SDL_Window *w = SDL_CreateWindow(gstr(A0), SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                                     (int)A3, (int)A4, flags);
+                                     ww, wh, flags);
 #endif
 #if !defined(__vita__)
     if (w)
@@ -286,7 +300,8 @@ void nat_SDL_GetWindowSize(Ctx *c)
     put_int(A1, w);
     put_int(A2, h);
 }
-void nat_SDL_SetWindowSize(Ctx *c) { ON_MAIN(nat_SDL_SetWindowSize); if (g_trace_imports) rt_log("[win] SetWindowSize(%#llx %lld %lld %lld %lld %#llx)\n", (unsigned long long)A0, (long long)A1, (long long)A2, (long long)A3, (long long)A4, (unsigned long long)A5); SDL_SetWindowSize(window_host(A0), (int)A1, (int)A2); }
+static void window_resize(SDL_Window *w, int width, int height);
+void nat_SDL_SetWindowSize(Ctx *c) { ON_MAIN(nat_SDL_SetWindowSize); if (g_trace_imports) rt_log("[win] SetWindowSize(%#llx %lld %lld %lld %lld %#llx)\n", (unsigned long long)A0, (long long)A1, (long long)A2, (long long)A3, (long long)A4, (unsigned long long)A5); window_resize(window_host(A0), (int)A1, (int)A2); }
 void nat_SDL_GetWindowPosition(Ctx *c)
 { ON_MAIN(nat_SDL_GetWindowPosition);
     int x = 0, y = 0;
@@ -422,8 +437,35 @@ void nat_SDL_RegisterEvents(Ctx *c) { RET(SDL_RegisterEvents((int)A0)); }
 /* MINA_INPUT="8:Return 12:Down 13.5:Return": scripted key taps (seconds since
  * start : SDL key name), injected as real key events for testing. */
 void mem_report(void);
+/* A window's size changes on the main thread, which updates the GL context
+ * the renderer may be drawing with on its thread: macOS's GL faults in a blit
+ * (or the window stays black) unless no frame is being drawn meanwhile. */
+static void window_resize(SDL_Window *w, int width, int height)
+{
+#if !defined(__vita__)
+    void gpu_lock(void);
+    void gpu_unlock(void);
+    gpu_lock();
+    SDL_SetWindowSize(w, width, height);
+    gpu_unlock();
+#else
+    SDL_SetWindowSize(w, width, height);
+#endif
+}
+static void test_resize(void)
+{   /* MINA_TEST_RESIZE="secs w h": the window is resized then (debug: the game's pixel scale option) */
+    static int done;
+    const char *v = getenv("MINA_TEST_RESIZE");
+    int secs, w, h;
+    if (done || !v || sscanf(v, "%d %d %d", &secs, &w, &h) != 3 || SDL_GetTicks() < (Uint32)secs * 1000u)
+        return;
+    done = 1;
+    window_resize(sdl_main_window(), w, h);
+    rt_log("[win] test resize to %dx%d\n", w, h);
+}
 static void scripted_input(void)
 {
+    test_resize();
     static Uint32 last_mem;
     if (getenv("MINA_MEMSTAT") && SDL_GetTicks() - last_mem > 5000) {
         last_mem = SDL_GetTicks();

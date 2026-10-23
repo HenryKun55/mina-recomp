@@ -1320,7 +1320,11 @@ static void framelog_draw(REnc *e, MPipeline *p, const char *kind, uint32_t coun
     if (p->color[0].enabled && n < (int)sizeof buf)
         n += snprintf(buf + n, sizeof buf - n, " blend %u/%u", p->color[0].src_rgb, p->color[0].dst_rgb);
     if (n < (int)sizeof buf)
-        snprintf(buf + n, sizeof buf - n, " mask %#x", p->color[0].write_mask);
+        n += snprintf(buf + n, sizeof buf - n, " mask %#x", p->color[0].write_mask);
+    if (e->vp_set && n < (int)sizeof buf)
+        n += snprintf(buf + n, sizeof buf - n, " vp %g %g %gx%g", e->vp[0], e->vp[1], e->vp[2], e->vp[3]);
+    if (e->sc_set && n < (int)sizeof buf)
+        snprintf(buf + n, sizeof buf - n, " sc %d %d %dx%d", e->sc[0], e->sc[1], e->sc[2], e->sc[3]);
     rt_log("%s\n", buf);
     /* MINA_FRAMELOG_FS=n: the fragment constant buffers of that shader too */
     static int dump_fs = -2;
@@ -1519,6 +1523,15 @@ static void be_copyTextureRegion(Ctx *c)
     GLint sx = (GLint)rt_ld64(G(so)), sy = (GLint)rt_ld64(G(so + 8));
     GLint w = (GLint)rt_ld64(G(sz)), h = (GLint)rt_ld64(G(sz + 8));
     GLint dx = (GLint)rt_ld64(G(dor)), dy = (GLint)rt_ld64(G(dor + 8));
+    /* the region within both textures: the frame of the old window size is
+     * copied into the drawable of the new one once (the game's pixel scale
+     * option); GL draws nothing or faults on the parts outside */
+    if (sx + w > (GLint)s->width) w = (GLint)s->width - sx;
+    if (sy + h > (GLint)s->height) h = (GLint)s->height - sy;
+    if (dx + w > (GLint)d->width) w = (GLint)d->width - dx;
+    if (dy + h > (GLint)d->height) h = (GLint)d->height - dy;
+    if (w <= 0 || h <= 0)
+        return;
 #if defined(__vita__)
     if (d->is_drawable && sx == 0 && sy == 0 && dx == 0 && dy == 0 && (uint32_t)w == s->width &&
         (uint32_t)h == s->height && s->width == d->width && s->height == d->height && direct_display()) {
@@ -1533,6 +1546,13 @@ static void be_copyTextureRegion(Ctx *c)
     glBindFramebuffer(GL_READ_FRAMEBUFFER, metal_tex_fbo(s, (int)MARG(2)));
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, metal_tex_fbo(d, (int)dlevel));
     glDisable(GL_SCISSOR_TEST);
+    {
+        int metal_texlog(void);
+        if (metal_texlog())
+            rt_log("[tex] copy gl %u %ux%u -> gl %u %ux%u%s: %dx%d (fb %#x %#x)\n", s->gl, s->width, s->height, d->gl,
+                   d->width, d->height, d->is_drawable ? " drawable" : "", w, h,
+                   glCheckFramebufferStatus(GL_READ_FRAMEBUFFER), glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER));
+    }
     glBlitFramebuffer(sx, sy, sx + w, sy + h, dx, dy, dx + w, dy + h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 #endif
     gl_check("copyTexture");
