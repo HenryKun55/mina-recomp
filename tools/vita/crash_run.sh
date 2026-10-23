@@ -1,6 +1,6 @@
 #!/bin/sh
-# Runs the Vita build in Vita3K until it is closed (by hand, or after
-# MAX seconds), then keeps its logs in build-vita/runs/<time>/ and prints a
+# Runs the Vita build in Vita3K for you to play until it is closed (by
+# hand, or after MAX seconds), then keeps its logs in build-vita/runs/<time>/ and prints a
 # summary: gameplay reached, dead objects, the first bad memory access with
 # the recompiled function it was in. Nothing is left running.
 #
@@ -10,8 +10,15 @@ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 MAX=${1:-600}
 [ $# -gt 0 ] && shift
 DATA="$HOME/Library/Application Support/Vita3K/Vita3K/fs/ux0/data/mina"
-KEYS=$(python3 -c "print(' '.join('%d:Return' % t for t in range(14, 200, 3)))")
-{ echo "MINA_FPS=1"; echo "MINA_INPUT_UNTIL_PLAY=1"; echo "MINA_INPUT=$KEYS"; for kv in "$@"; do echo "$kv"; done; } > "$DATA/env.txt"
+# you play; KEYS=1 presses Return until gameplay instead
+{
+    echo "MINA_FPS=1"
+    if [ "${KEYS:-0}" = 1 ]; then
+        echo "MINA_INPUT_UNTIL_PLAY=1"
+        echo "MINA_INPUT=$(python3 -c "print(' '.join('%d:Return' % t for t in range(14, 200, 3)))")"
+    fi
+    for kv in "$@"; do echo "$kv"; done
+} > "$DATA/env.txt"
 OUT="$ROOT/build-vita/runs/$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$OUT"
 printf '%s\n' "$@" > "$OUT/env.txt"

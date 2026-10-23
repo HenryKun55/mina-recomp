@@ -373,7 +373,25 @@ void nat__ZN7IsoAnim13CalcTransformERK11ycTransformS2_ybb(Ctx *c)
  * sees are in a guest stack frame, as in the game. */
 static inline float ldf(uint64_t a) { float f; memcpy(&f, G(a), 4); return f; }
 static inline void stf(uint64_t a, float f) { memcpy(G(a), &f, 4); }
-int g_no_natives;                       /* MINA_NO_NATIVES (main.c) */
+/* MINA_NO_NATIVES=1: the game's functions made native run recompiled;
+ * =a,b,...: only those whose names contain one of the words */
+int rt_native_off(const char *name)
+{
+    const char *v = getenv("MINA_NO_NATIVES");
+    int off = 0;
+    if (v && strcmp(v, "1") == 0)
+        off = 1;
+    else if (v) {
+        char buf[256];
+        snprintf(buf, sizeof buf, "%s", v);
+        char *save = NULL;
+        for (char *w = strtok_r(buf, ",", &save); w && !off; w = strtok_r(NULL, ",", &save))
+            off = strstr(name, w) != NULL;
+    }
+    if (off)
+        rt_log("[natives] %s runs recompiled\n", name);
+    return off;
+}
 void f_9a65c4_orig(Ctx *c);
 static void recalc_world_transform(Ctx *c)
 {
@@ -1467,4 +1485,26 @@ void nat__ZN4Game12InitFromSaveEv(Ctx *c)
         rt_st32(GP(0x1e14de8), fps);            /* (anonymous)::s_targetFPS */
         rt_log("[video] the world steps %u times a second\n", fps);
     }
+}
+
+/* ---- SpawnBase::GetPropertyEquals (MINA_PROPLOG) ---------------------------------------------
+ * x1 the property's name, x2 a table of x3 strings: the index of the one the
+ * property's value equals (x4 when none). MINA_PROPLOG=1 logs each answer. */
+void f_ac2490_orig(Ctx *c);
+void nat__ZNK9SpawnBase17GetPropertyEqualsEPKcPS1_yi(Ctx *c)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("MINA_PROPLOG") != NULL;
+    if (!on) {
+        f_ac2490_orig(c);
+        return;
+    }
+    GM_BEGIN;
+    const uint64_t key = c->x[1], tab = c->x[2], n = c->x[3], def = c->x[4];
+    f_ac2490_orig(c);
+    const int64_t r = (int64_t)(int32_t)c->x[0];
+    const char *chosen = r >= 0 && (uint64_t)r < n ? (const char *)GP(lp(tab + 8 * (uint64_t)r)) : "-";
+    rt_log("[prop] %s of %u (default %d) -> %lld %s\n", (const char *)GP(key), (unsigned)n, (int)def, (long long)r,
+           chosen);
 }

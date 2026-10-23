@@ -766,7 +766,10 @@ class Lower:
                     continue
                 if sp_adjust(nxt) or nxt.op == "hint":
                     continue
-                ok = nxt.op in ("ret", "br") or (nxt.op == "b" and not self.fn.inside(nxt.target))
+                # an exit: not a jump table's br (it stays in the function: a
+                # register reloaded right before it is live in the cases)
+                ok = nxt.op == "ret" or (nxt.op == "br" and nxt.addr not in self.fn.jtables) or \
+                    (nxt.op == "b" and not self.fn.inside(nxt.target))
                 break
             if ok:
                 elide.add(ins.addr)
@@ -1793,8 +1796,12 @@ def gen_function(prog, start, end, natives=(), timed=None, timed_calls=(), profi
                             % (cname(start), native_ident(name), cname(start)), 1)
         if name.startswith("__ZN"):
             # a game function made native: MINA_NO_NATIVES=1 runs the recompiled one
-            code += ("extern int g_no_natives;\nvoid %s(Ctx *c) { if (g_no_natives) %s_orig(c); else %s(c); }\n"
-                     % (cname(start), cname(start), native_ident(name)))
+            # (MINA_NO_NATIVES=1: all of them; =a,b: those whose names contain a or b)
+            code += ("int rt_native_off(const char *name);\n"
+                     "void %s(Ctx *c)\n{\n    static int off_ = -1;\n"
+                     "    if (off_ < 0)\n        off_ = rt_native_off(\"%s\");\n"
+                     "    if (off_)\n        %s_orig(c);\n    else\n        %s(c);\n}\n"
+                     % (cname(start), name, cname(start), native_ident(name)))
         else:
             code += "void %s(Ctx *c) { %s(c); }\n" % (cname(start), native_ident(name))
     if name in timed_calls:

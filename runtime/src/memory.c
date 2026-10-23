@@ -94,10 +94,61 @@ uint32_t rt_alloc(uint32_t size, uint32_t align)
 
 static uint64_t heap_in_use;
 
+/* MINA_HEAPCHECK on the Vita: every block gets a header and 16 canary bytes
+ * after it (checked when it is freed), and a freed block stays painted in a
+ * quarantine for a while (checked when it leaves it): an overrun or a write
+ * after free is logged with the guest's call stack. */
+#define HC_MAGIC 0x4B434831u
+#define HC_FREED 0x4B434830u
+#define HC_CANARY 0xFDu
+#define HC_PAINT 0xDDu
+#define HC_Q 2048
+typedef struct { uint32_t magic, size, pad[2]; } HcHdr;
+static int hc = -1;
+static HcHdr *hc_q[HC_Q];
+static uint32_t hc_qi;
+static pthread_mutex_t hc_lock = PTHREAD_MUTEX_INITIALIZER;
+static int heapcheck_on(void)
+{
+    if (hc < 0)
+        hc = getenv("MINA_HEAPCHECK") != NULL;
+    return hc;
+}
+static HcHdr *hc_hdr(uint32_t a)
+{
+    HcHdr *h = (HcHdr *)G(a - 16);
+    return h->magic == HC_MAGIC || h->magic == HC_FREED ? h : NULL;
+}
+static void hc_report(const char *what, uint32_t a, uint32_t size, uint32_t at, uint8_t b)
+{
+    char bt[512];
+    guest_backtrace(bt, sizeof bt, 8);
+    rt_log("[heapcheck] %s: block %#x of %u bytes, byte +%u is %#x [%s]\n", what, a, size, at, b, bt);
+}
+static void hc_leave(HcHdr *h)
+{
+    const uint8_t *u = (const uint8_t *)(h + 1);
+    for (uint32_t i = 0; i < h->size; i++)
+        if (u[i] != HC_PAINT) {
+            hc_report("written after its free", guest_addr((void *)u), h->size, i, u[i]);
+            break;
+        }
+    free(h);
+}
+
 uint32_t gmalloc(uint64_t size)
 {
     if (size > 0x20000000ull)
         return 0;
+    if (heapcheck_on()) {
+        HcHdr *h = memalign(16, (size_t)size + 32);
+        if (!h)
+            return 0;
+        h->magic = HC_MAGIC;
+        h->size = (uint32_t)size;
+        memset((uint8_t *)(h + 1) + size, HC_CANARY, 16);
+        return guest_addr(h + 1);
+    }
     void *p = memalign(16, size ? (size_t)size : 1);
     if (!p) {
         rt_log("guest heap: %llu bytes not available\n", (unsigned long long)size);
@@ -132,10 +183,41 @@ void gfree(uint32_t a)
 {
     if (!a || not_heap(a, "free"))
         return;
+    HcHdr *h = heapcheck_on() ? hc_hdr(a) : NULL;
+    if (h) {
+        if (h->magic == HC_FREED) {
+            hc_report("freed twice", a, h->size, 0, 0);
+            return;
+        }
+        uint8_t *u = (uint8_t *)(h + 1);
+        for (uint32_t i = 0; i < 16; i++)
+            if (u[h->size + i] != HC_CANARY) {
+                hc_report("written past its end", a, h->size, h->size + i, u[h->size + i]);
+                break;
+            }
+        h->magic = HC_FREED;
+        if (h->size > (64u << 10)) {        /* big blocks leave at once */
+            free(h);
+            return;
+        }
+        memset(u, HC_PAINT, h->size);
+        pthread_mutex_lock(&hc_lock);
+        HcHdr *out = hc_q[hc_qi];
+        hc_q[hc_qi] = h;
+        hc_qi = (hc_qi + 1) % HC_Q;
+        pthread_mutex_unlock(&hc_lock);
+        if (out)
+            hc_leave(out);
+        return;
+    }
     heap_in_use -= malloc_usable_size(G(a));
     free(G(a));
 }
-uint64_t gmalloc_usable(uint32_t a) { return malloc_usable_size(G(a)); }
+uint64_t gmalloc_usable(uint32_t a)
+{
+    HcHdr *h = heapcheck_on() ? hc_hdr(a) : NULL;
+    return h ? h->size : malloc_usable_size(G(a));
+}
 int gmalloc_was_fresh(void) { return 0; }     /* newlib memory is never known to be zero */
 uint32_t gcalloc(uint64_t n, uint64_t size)
 {
@@ -155,7 +237,7 @@ uint32_t grealloc(uint32_t a, uint64_t size)
     }
     if (not_heap(a, "realloc"))
         rt_fatal("realloc of a non-heap pointer %#x", a);
-    size_t old = malloc_usable_size(G(a));
+    size_t old = (size_t)gmalloc_usable(a);
     uint32_t b = gmalloc(size);
     if (!b)
         return 0;
