@@ -28,7 +28,7 @@
 #define PB_MAX 40
 #define PB_MAX_D 2      /* properties with floating-point values (clearColor, lodMinClamp...) */
 
-/* Keys are permanent strings (interned or literals), never freed. */
+/* Keys are interned strings: a bag compares them by address. */
 typedef struct PropBag {
     int n, nd;                  /* first: a new bag zeroes only these (Class.host_zero) */
     uint64_t held;              /* properties holding an object it retained (bit per slot) */
@@ -37,11 +37,19 @@ typedef struct PropBag {
     double d[PB_MAX_D][4];
 } PropBag;
 
-uint64_t pb_get(uint64_t obj, const char *key, uint64_t def);
-double pb_getd(uint64_t obj, const char *key, int i, double def);
-void pb_set(uint64_t obj, const char *key, uint64_t v);
+const char *pb_key(const char *s);    /* the interned copy of s */
+uint64_t pb_get_k(uint64_t obj, const char *key, uint64_t def);
+double pb_getd_k(uint64_t obj, const char *key, int i, double def);
+void pb_set_k(uint64_t obj, const char *key, uint64_t v);
+uint64_t pb_child_at(uint64_t obj, const char *at_key, Class *cls);
+/* by a literal key, interned once per call site (the draw path asks a lot) */
+#define PB_K(s) ({ static const char *pbk_; const char *t_ = __atomic_load_n(&pbk_, __ATOMIC_ACQUIRE); \
+                   if (!t_) { t_ = pb_key("" s ""); __atomic_store_n(&pbk_, t_, __ATOMIC_RELEASE); } t_; })
+#define pb_get(o, k, d) pb_get_k(o, PB_K(k), d)
+#define pb_getd(o, k, i, d) pb_getd_k(o, PB_K(k), i, d)
+#define pb_set(o, k, v) pb_set_k(o, PB_K(k), v)
 /* child object (created on first access) */
-uint64_t pb_child(uint64_t obj, const char *key, Class *cls);
+#define pb_child(o, k, cls) pb_child_at(o, PB_K("@" k), cls)
 
 /* ---- resources --------------------------------------------------------------------- */
 

@@ -47,8 +47,8 @@ typedef struct Binding {
     MBuffer *buf;            /* or NULL with inline bytes */
     uint64_t obj;
     uint32_t offset;
-    uint8_t *bytes;
-    uint32_t nbytes;
+    uint8_t *bytes;          /* inline bytes when nbytes (the buffer kept for the next ones) */
+    uint32_t nbytes, cap;
 } Binding;
 
 typedef struct REnc {
@@ -661,22 +661,33 @@ static void set_binding(Binding *b, uint64_t buf, uint32_t offset)
 {
     if (b->obj != buf) {
         objc_retain_obj(buf);
-        bind_release(b);
+        if (b->obj)
+            objc_release_obj(b->obj);
         b->obj = buf;
         b->buf = buf ? objc_host(buf) : NULL;
     }
+    b->nbytes = 0;
     b->offset = offset;
 }
+/* every draw sets some: the copy goes to a buffer kept for the next */
 static void set_bytes(Binding *b, uint64_t src, uint32_t n)
 {
-    bind_release(b);
-    b->bytes = malloc(n);
+    if (b->obj)
+        objc_release_obj(b->obj);
+    b->obj = 0;
+    b->buf = NULL;
+    b->offset = 0;
+    if (n > b->cap) {
+        free(b->bytes);
+        b->cap = n < 4096 ? 4096 : n;
+        b->bytes = malloc(b->cap);
+    }
     memcpy(b->bytes, G(src), n);
     b->nbytes = n;
 }
 static const uint8_t *binding_data(const Binding *b, uint32_t *avail)
 {
-    if (b->bytes) {
+    if (b->nbytes) {
         *avail = b->nbytes;
         return b->bytes;
     }
@@ -1249,14 +1260,19 @@ static MPipeline *draw_setup(REnc *e)
                 g_show_tex = objc_host(to);
         }
     }
+    static int drawlog = -1, display_log;  /* looked up once: getenv walks the environment */
+    if (drawlog < 0) {
+        display_log = getenv("MINA_DISPLAY_LOG") != NULL;
+        drawlog = getenv("MINA_DRAWLOG") != NULL;
+    }
 #if defined(__vita__)
-    if (getenv("MINA_DRAWLOG")) {
+    if (drawlog) {
         static uint8_t seen[256][256];
         if (p->vs >= 0 && p->vs < 256 && p->fs >= 0 && p->fs < 256 && !seen[p->vs][p->fs]++)
             rt_log("[draw] first draw with vs %d fs %d (%d textures) prog %u\n", p->vs, p->fs, p->ntex, p->prog);
     }
 #endif
-    if (e->to_display && getenv("MINA_DISPLAY_LOG")) {
+    if (e->to_display && display_log) {
         static int n;
         if (n++ < 6)
             rt_log("[display] fs %d cull %u winding %u vp_set %d vp %g %g %g %g sc_set %d sc %d %d %d %d yflip_loc %d\n",
@@ -1267,7 +1283,7 @@ static MPipeline *draw_setup(REnc *e)
     if (p->yflip_loc >= 0)
         glUniform1f(p->yflip_loc, e->to_display ? 1.0f : -1.0f);
 #if defined(__vita__)
-    if (getenv("MINA_DRAWLOG")) {
+    if (drawlog) {
         GLint cur = -1;
         glGetIntegerv(GL_CURRENT_PROGRAM, &cur);
         static int n;

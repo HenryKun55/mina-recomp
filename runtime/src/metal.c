@@ -117,8 +117,22 @@ static const char *intern_n(const char *s, size_t n)
 }
 static const char *intern(const char *s) { return intern_n(s, strlen(s)); }
 
-/* "@<n>" and "<n>" without printf */
+const char *pb_key(const char *s) { return intern(s); }
+
+/* "@<n>" and "<n>" without printf; "@0".."@63" kept */
+static const char *index_key_slow(const char *prefix, uint64_t n);
 static const char *index_key(const char *prefix, uint64_t n)
+{
+    static const char *at[64];
+    if (prefix[0] == '@' && !prefix[1] && n < 64) {
+        const char *k = __atomic_load_n(&at[n], __ATOMIC_ACQUIRE);
+        if (!k)
+            __atomic_store_n(&at[n], k = index_key_slow(prefix, n), __ATOMIC_RELEASE);
+        return k;
+    }
+    return index_key_slow(prefix, n);
+}
+static const char *index_key_slow(const char *prefix, uint64_t n)
 {
     char k[32], *q = k + sizeof k;
     *--q = 0;
@@ -133,10 +147,7 @@ static const char *index_key(const char *prefix, uint64_t n)
 static int pb_find(PropBag *b, const char *key)
 {
     for (int i = 0; i < b->n; i++)
-        if (b->p[i].key == key)
-            return i;
-    for (int i = 0; i < b->n; i++)
-        if (b->p[i].key[0] == key[0] && strcmp(b->p[i].key, key) == 0)
+        if (b->p[i].key == key)      /* interned */
             return i;
     return -1;
 }
@@ -162,22 +173,22 @@ static double *pb_dslot(PropBag *b, int i)
     }
     return b->d[b->di[i]];
 }
-uint64_t pb_get(uint64_t obj, const char *key, uint64_t def)
+uint64_t pb_get_k(uint64_t obj, const char *key, uint64_t def)
 {
     PropBag *b = obj ? bag(obj) : NULL;
     int i = b ? pb_find(b, key) : -1;
     return i < 0 ? def : b->p[i].v;
 }
-double pb_getd(uint64_t obj, const char *key, int k, double def)
+double pb_getd_k(uint64_t obj, const char *key, int k, double def)
 {
     PropBag *b = obj ? bag(obj) : NULL;
     int i = b ? pb_find(b, key) : -1;
     return i < 0 ? def : b->di[i] < 0 ? 0.0 : b->d[b->di[i]][k];
 }
-void pb_set(uint64_t obj, const char *key, uint64_t v)
+void pb_set_k(uint64_t obj, const char *key, uint64_t v)
 {
     PropBag *b = bag(obj);
-    b->p[pb_slot(b, intern(key))].v = v;
+    b->p[pb_slot(b, key)].v = v;
 }
 
 static void bag_dealloc(void *h)
@@ -192,16 +203,19 @@ static void bag_dealloc(void *h)
  * table keyed by the selector's address, readers without a lock). */
 enum { SEL_GET, SEL_SET, SEL_SET_F64, SEL_SET_F32, SEL_OTHER };
 #define SELMAP_CAP 2048
-static struct { uint32_t sel; uint8_t kind; const char *key; } selmap[SELMAP_CAP];
+static struct { uint32_t sel; uint8_t kind; int8_t child; const char *key; } selmap[SELMAP_CAP];
 static pthread_mutex_t selmap_lock = PTHREAD_MUTEX_INITIALIZER;
 static const char *const fp_props[] = { "clearColor", "clearDepth", "lodMinClamp", "lodMaxClamp", NULL };
 
-static int sel_info(uint64_t sel_addr, const char **key)
+static int child_of_key(const char *key);
+static int sel_info_at(uint64_t sel_addr, const char **key, int *child)
 {
     uint32_t a = (uint32_t)sel_addr, i = (a * 0x9E3779B1u >> 21) & (SELMAP_CAP - 1);
     for (uint32_t e; (e = __atomic_load_n(&selmap[i].sel, __ATOMIC_ACQUIRE)); i = (i + 1) & (SELMAP_CAP - 1))
         if (e == a) {
             *key = selmap[i].key;
+            if (child)
+                *child = selmap[i].child;
             return selmap[i].kind;
         }
     /* setFoo: / isFoo / foo */
@@ -238,15 +252,20 @@ static int sel_info(uint64_t sel_addr, const char **key)
     pthread_mutex_lock(&selmap_lock);
     for (uint32_t e; (e = selmap[i].sel) && e != a; i = (i + 1) & (SELMAP_CAP - 1))
         ;
+    const int ch = kind == SEL_GET ? child_of_key(k) : -1;
     if (!selmap[i].sel) {
         selmap[i].kind = (uint8_t)kind;
+        selmap[i].child = (int8_t)ch;
         selmap[i].key = k;
         __atomic_store_n(&selmap[i].sel, a, __ATOMIC_RELEASE);
     }
     pthread_mutex_unlock(&selmap_lock);
     *key = k;
+    if (child)
+        *child = ch;
     return kind;
 }
+static int sel_info(uint64_t sel_addr, const char **key) { return sel_info_at(sel_addr, key, NULL); }
 
 static int seq_left = -1;              /* MINA_SEQLOG: messages logged after a stencil REPLACE */
 static void seq_log(Ctx *c, const char *where)
@@ -262,7 +281,10 @@ static void seq_log(Ctx *c, const char *where)
     rt_log("[seq] %s %s %#llx %s %#llx\n", where, k ? k->name : "?", (unsigned long long)SELF, gstr(c->x[1]),
            (unsigned long long)MARG(0));
 }
-static void bag_fallback(Ctx *c)
+static int bag_debug = -1;            /* MINA_SEQLOG or MINA_BAGLOG */
+static void bag_message(Ctx *c, int kind, const char *key);
+/* the debug logs of a message to a bag */
+static void bag_fallback_debug(Ctx *c)
 {
     if (seq_left == 0 && strcmp(gstr(c->x[1]), "setDepthStencilPassOperation:") == 0 &&
         MARG(0) == 2) {
@@ -294,6 +316,12 @@ static void bag_fallback(Ctx *c)
             }
         }
     }
+    (void)kind;
+    (void)b;
+}
+static void bag_message(Ctx *c, int kind, const char *key)
+{
+    PropBag *b = bag(SELF);
     switch (kind) {
     case SEL_SET: {
         /* as a Metal descriptor does, an object set is retained until it
@@ -340,7 +368,7 @@ typedef struct ChildDef {
 static ChildDef children[32];
 static int nchildren;
 
-static uint64_t pb_child_at(uint64_t obj, const char *at_key, Class *cls)
+uint64_t pb_child_at(uint64_t obj, const char *at_key, Class *cls)
 {
     PropBag *b = bag(obj);
     int i = pb_find(b, at_key);
@@ -361,29 +389,42 @@ static const char *at_key(const char *key)
     k[n + 1] = 0;
     return intern(k);
 }
-uint64_t pb_child(uint64_t obj, const char *key, Class *cls) { return pb_child_at(obj, at_key(key), cls); }
 
+static int child_of_key(const char *key)
+{
+    for (int i = 0; i < nchildren; i++)
+        if (children[i].key == key)
+            return i;
+    return -1;
+}
 static void bag_child_getter(Ctx *c)
 {
-    seq_log(c, "get");
+    if (bag_debug < 0)
+        bag_debug = getenv("MINA_SEQLOG") || getenv("MINA_BAGLOG");
+    if (bag_debug)
+        seq_log(c, "get");
     const char *key;
-    if (sel_info(c->x[1], &key) == SEL_GET) {
+    int first;
+    const int kind = sel_info_at(c->x[1], &key, &first);
+    if (kind == SEL_GET && first >= 0) {     /* a sub-descriptor getter */
         Obj *self_o = objc_obj_tagged(SELF);
         Class *k = self_o ? self_o->cls : objc_class_of(SELF);
-        for (int i = 0; i < nchildren; i++) {
+        for (int i = first; i < nchildren; i++) {
             if (children[i].key != key)
                 continue;
             for (Class *o = k; o; o = o->super)
                 if (children[i].owner == o) {
                     uint64_t ch = pb_child_at(SELF, children[i].at_key, children[i].child);
-                    if (children[i].elem)
+                    if (children[i].elem && !bag(ch)->n)    /* a new array */
                         pb_set(ch, "__elem", (uint64_t)(uintptr_t)children[i].elem);
                     RET(ch);
                     return;
                 }
         }
     }
-    bag_fallback(c);
+    if (bag_debug)
+        bag_fallback_debug(c);
+    bag_message(c, kind, key);
 }
 
 static void array_object_at(Ctx *c)
@@ -402,8 +443,8 @@ static void array_set_object(Ctx *c)
 }
 
 /* element of a descriptor array if it exists (no creation) */
-static uint64_t pb_elem(uint64_t arr, int i) { return arr ? pb_get(arr, index_key("@", (uint64_t)i), 0) : 0; }
-static uint64_t pb_existing_child(uint64_t obj, const char *key) { return obj ? pb_get(obj, at_key(key), 0) : 0; }
+static uint64_t pb_elem(uint64_t arr, int i) { return arr ? pb_get_k(arr, index_key("@", (uint64_t)i), 0) : 0; }
+#define pb_existing_child(obj, key) ((obj) ? pb_get_k(obj, PB_K("@" key), 0) : 0)
 
 /* -hash and -isEqual: by content, as Metal's descriptors have them: the game
  * keeps one depth/stencil descriptor, changes it per draw and makes a new
