@@ -8,6 +8,7 @@
 #include "metal_gl.h"
 #if defined(__vita__)
 #include <psp2/kernel/processmgr.h>
+#include <psp2/kernel/threadmgr.h>
 #endif
 
 #include <SDL.h>
@@ -998,48 +999,41 @@ static char *patch_vertex_outputs(const char *vs, const char *fs)
  * wrote over the heap (objects freed early, pointers like 0xd00000000). It
  * runs here, on one thread with a stack of its own, while the caller waits
  * (holding the GPU lock as before). */
-#define BIG_STACK (4u << 20)
-static pthread_mutex_t big_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t big_cv = PTHREAD_COND_INITIALIZER;
+#define BIG_STACK (2u << 20)
+/* a Vita thread with Vita semaphores: a pthread for it never ran on the device
+ * (the game stopped at its first shader) */
+static SceUID big_work = -1, big_done = -1;
 static void (*big_fn)(void *);
 static void *big_arg;
-static int big_state;            /* 0 idle, 1 work given, 2 done */
-static void *big_worker(void *u)
+static int big_worker(SceSize args, void *argp)
 {
-    (void)u;
-    pthread_mutex_lock(&big_lock);
+    (void)args;
+    (void)argp;
     for (;;) {
-        while (big_state != 1)
-            pthread_cond_wait(&big_cv, &big_lock);
-        pthread_mutex_unlock(&big_lock);
+        sceKernelWaitSema(big_work, 1, NULL);
         big_fn(big_arg);
-        pthread_mutex_lock(&big_lock);
-        big_state = 2;
-        pthread_cond_broadcast(&big_cv);
+        sceKernelSignalSema(big_done, 1);
     }
-    return NULL;
+    return 0;
 }
 static void run_on_big_stack(void (*fn)(void *), void *arg)
 {
-    static int started;
-    pthread_mutex_lock(&big_lock);
-    if (!started) {
-        pthread_attr_t a;
-        pthread_attr_init(&a);
-        pthread_attr_setstacksize(&a, BIG_STACK);
-        pthread_t t;
-        if (pthread_create(&t, &a, big_worker, NULL) != 0)
-            rt_fatal("metal: no thread for the shader compiler");
-        started = 1;
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&lock);
+    if (big_work < 0) {
+        big_work = sceKernelCreateSema("mina_shc_work", 0, 0, 1, NULL);
+        big_done = sceKernelCreateSema("mina_shc_done", 0, 0, 1, NULL);
+        SceUID t = sceKernelCreateThread("mina_shader_compiler", big_worker, 0x10000100, BIG_STACK, 0,
+                                         SCE_KERNEL_CPU_MASK_USER_ALL, NULL);
+        if (big_work < 0 || big_done < 0 || t < 0 || sceKernelStartThread(t, 0, NULL) < 0)
+            rt_fatal("metal: no thread for the shader compiler (%#x %#x %#x)", big_work, big_done, t);
+        rt_log("[shader] compiler thread with a %u KiB stack\n", BIG_STACK >> 10);
     }
     big_fn = fn;
     big_arg = arg;
-    big_state = 1;
-    pthread_cond_broadcast(&big_cv);
-    while (big_state != 2)
-        pthread_cond_wait(&big_cv, &big_lock);
-    big_state = 0;
-    pthread_mutex_unlock(&big_lock);
+    sceKernelSignalSema(big_work, 1);
+    sceKernelWaitSema(big_done, 1, NULL);
+    pthread_mutex_unlock(&lock);
 }
 #endif
 
