@@ -319,25 +319,28 @@ static void bag_fallback_debug(Ctx *c)
     (void)kind;
     (void)b;
 }
+/* as a Metal descriptor does, an object set is retained until it is
+ * replaced or the bag goes (a function the game released after setting it
+ * was still read from the descriptor) */
+static void bag_set_value(PropBag *b, const char *key, uint64_t v)
+{
+    const int i = pb_slot(b, key);
+    const uint64_t old = b->p[i].v, bit = 1ull << i;
+    const int had = (b->held & bit) != 0, obj = v && objc_obj(v) != NULL;
+    if (obj)
+        objc_retain_obj(v);
+    b->p[i].v = v;
+    b->held = obj ? b->held | bit : b->held & ~bit;
+    if (had)
+        objc_release_obj(old);
+}
 static void bag_message(Ctx *c, int kind, const char *key)
 {
     PropBag *b = bag(SELF);
     switch (kind) {
-    case SEL_SET: {
-        /* as a Metal descriptor does, an object set is retained until it
-         * is replaced or the bag goes (a function the game released after
-         * setting it was still read from the descriptor) */
-        const int i = pb_slot(b, key);
-        const uint64_t v = MARG(0), old = b->p[i].v, bit = 1ull << i;
-        const int had = (b->held & bit) != 0, obj = v && objc_obj(v) != NULL;
-        if (obj)
-            objc_retain_obj(v);
-        b->p[i].v = v;
-        b->held = obj ? b->held | bit : b->held & ~bit;
-        if (had)
-            objc_release_obj(old);
+    case SEL_SET:
+        bag_set_value(b, key, MARG(0));
         return;
-    }
     case SEL_SET_F64:
     case SEL_SET_F32: {
         double *d = pb_dslot(b, pb_slot(b, key));
@@ -397,6 +400,51 @@ static int child_of_key(const char *key)
             return i;
     return -1;
 }
+/* the sub-descriptor key names on obj's class, made on first use */
+static int bag_child(uint64_t obj, const char *key, int first, uint64_t *out)
+{
+    Obj *self_o = objc_obj_tagged(obj);
+    Class *k = self_o ? self_o->cls : objc_class_of(obj);
+    for (int i = first; i < nchildren; i++) {
+        if (children[i].key != key)
+            continue;
+        for (Class *o = k; o; o = o->super)
+            if (children[i].owner == o) {
+                uint64_t ch = pb_child_at(obj, children[i].at_key, children[i].child);
+                if (children[i].elem && !bag(ch)->n)    /* a new array */
+                    pb_set(ch, "__elem", (uint64_t)(uintptr_t)children[i].elem);
+                *out = ch;
+                return 1;
+            }
+    }
+    return 0;
+}
+
+/* For natives that read and write descriptors as the game's messages would
+ * (metal_natives.c); keys are interned (PB_K) */
+uint64_t md_get(uint64_t obj, const char *key) { return obj ? pb_get_k(obj, key, 0) : 0; }
+void md_set(uint64_t obj, const char *key, uint64_t v)
+{
+    if (obj)
+        bag_set_value(bag(obj), key, v);
+}
+uint64_t md_child(uint64_t obj, const char *key)
+{
+    uint64_t ch;
+    if (!obj)
+        return 0;
+    return bag_child(obj, key, child_of_key(key), &ch) ? ch : pb_get_k(obj, key, 0);
+}
+uint64_t md_elem(uint64_t arr, uint64_t i)
+{
+    if (!arr)
+        return 0;
+    Class *elem = (Class *)(uintptr_t)pb_get(arr, "__elem", 0);
+    return pb_child_at(arr, index_key("@", i), elem);
+}
+static uint64_t bag_hash_of(uint64_t obj, int depth);
+uint64_t md_hash(uint64_t obj) { return obj ? bag_hash_of(obj, 0) : 0; }
+
 static void bag_child_getter(Ctx *c)
 {
     if (bag_debug < 0)
@@ -406,21 +454,10 @@ static void bag_child_getter(Ctx *c)
     const char *key;
     int first;
     const int kind = sel_info_at(c->x[1], &key, &first);
-    if (kind == SEL_GET && first >= 0) {     /* a sub-descriptor getter */
-        Obj *self_o = objc_obj_tagged(SELF);
-        Class *k = self_o ? self_o->cls : objc_class_of(SELF);
-        for (int i = first; i < nchildren; i++) {
-            if (children[i].key != key)
-                continue;
-            for (Class *o = k; o; o = o->super)
-                if (children[i].owner == o) {
-                    uint64_t ch = pb_child_at(SELF, children[i].at_key, children[i].child);
-                    if (children[i].elem && !bag(ch)->n)    /* a new array */
-                        pb_set(ch, "__elem", (uint64_t)(uintptr_t)children[i].elem);
-                    RET(ch);
-                    return;
-                }
-        }
+    uint64_t ch;
+    if (kind == SEL_GET && first >= 0 && bag_child(SELF, key, first, &ch)) {     /* a sub-descriptor getter */
+        RET(ch);
+        return;
     }
     if (bag_debug)
         bag_fallback_debug(c);
@@ -1356,6 +1393,9 @@ typedef struct MArg {
 } MArg;
 typedef struct MRefl {
     uint64_t vargs, fargs;          /* NSArray of MTLArgument */
+    /* the same as masks (md_refl_masks): buffers and textures by stage, a buffer over 4 KiB */
+    uint64_t vbuf, vtex, fbuf, ftex;
+    int big;
 } MRefl;
 static Class cls_Refl, cls_Arg;
 
@@ -1399,18 +1439,48 @@ static uint64_t make_reflection(const MPipeline *p)
     m->vargs = ns_array_new();
     m->fargs = ns_array_new();
     for (int i = 0; i < MAX_VBUF; i++) {
-        if (p->vcb[i] >= 0)
+        if (p->vcb[i] >= 0) {
             add_arg(m->vargs, 0, (uint32_t)i, (uint32_t)p->vcb_size[i] * 16);
-        if (p->fcb[i] >= 0)
+            m->vbuf |= 1ull << (i & 63);
+            m->big |= p->vcb_size[i] * 16 > 0x1000;
+        }
+        if (p->fcb[i] >= 0) {
             add_arg(m->fargs, 0, (uint32_t)i, (uint32_t)p->fcb_size[i] * 16);
+            m->fbuf |= 1ull << (i & 63);
+            m->big |= p->fcb_size[i] * 16 > 0x1000;
+        }
     }
     for (int k = 0; k < p->ntex; k++) {
         uint64_t arr = p->texb[k].stage ? m->fargs : m->vargs;
         add_arg(arr, 2, (uint32_t)p->texb[k].tex, 0);
+        if (p->texb[k].stage)
+            m->ftex |= 1ull << (p->texb[k].tex & 63);
+        else
+            m->vtex |= 1ull << (p->texb[k].tex & 63);
         if (p->texb[k].samp >= 0)
             add_arg(arr, 3, (uint32_t)p->texb[k].samp, 0);
     }
     return objc_autorelease_obj(r);
+}
+
+/* what the game reads from a reflection: the buffers (type 0) and textures
+ * (type 2) each stage uses, and whether a buffer is over 4 KiB */
+int md_refl_masks(uint64_t refl, uint64_t *vbuf, uint64_t *vtex, uint64_t *fbuf, uint64_t *ftex)
+{
+    Obj *o = objc_obj(refl);
+    if (!o || o->cls != &cls_Refl)
+        return -1;
+    const MRefl *m = o->host;
+    *vbuf = m->vbuf;
+    *vtex = m->vtex;
+    *fbuf = m->fbuf;
+    *ftex = m->ftex;
+    return m->big;
+}
+uint64_t md_new(const char *cls_name)
+{   /* [MTL...Descriptor new] for the descriptor classes */
+    Class *k = objc_class_named(cls_name);
+    return k ? objc_new_object(k) : 0;
 }
 
 uint32_t g_pipelines_made;          /* MINA_FPS */

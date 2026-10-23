@@ -27,7 +27,7 @@ finish() {
     pkill -f "MacOS/Vita3K -r MINA00001$" 2>/dev/null
     sleep 1
     cp "$DATA/mina.log" "$OUT/mina.log" 2>/dev/null
-    cp "$ROOT/build-vita/vita3k.log" "$OUT/vita3k.log" 2>/dev/null
+    cp "${BUILD:-$ROOT/build-vita}/vita3k.log" "$OUT/vita3k.log" 2>/dev/null
     printf '\n' > "$DATA/env.txt"
     L="$OUT/mina.log"
     E="$OUT/vita3k.log"

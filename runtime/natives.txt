@@ -84,3 +84,6 @@ __ZN16ShipIntroBossArm11ApplySplineEv
 __ZN8GameAnim13GetFrameBoundEb
 __ZN4Game12InitFromSaveEv
 __ZNK9SpawnBase17GetPropertyEqualsEPKcPS1_yi
+
+# the renderer, in C (runtime/src/metal_natives.c)
+__ZN14ycRenderDevice8DrawCallEPv
