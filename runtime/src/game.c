@@ -900,7 +900,8 @@ static void render_pass_update(Ctx *c)
     if (stats < 0)
         stats = getenv("MINA_RPU_STATS") != NULL;
     uint64_t t_scan = stats ? now_us() : 0;
-    rpu.calls++;
+    if (stats)
+        rpu.calls++;
     const uint64_t RP = c->x[0];
     if (!*(uint8_t *)GP(RP + 0x258))
         return;
@@ -939,27 +940,27 @@ static void render_pass_update(Ctx *c)
         make_plane(&P[4], M[0][3] - M[0][1], M[1][3] - M[1][1], M[2][3] - M[2][1], M[3][3] - M[3][1]);
         make_plane(&P[5], M[0][3] + M[0][1], M[1][3] + M[1][1], M[2][3] + M[2][1], M[3][3] + M[3][1]);
         /* bounds of all objects: empty */
-        float *ab = GP(RP + 0xb0 + 0x18 * v);         /* center 3, extent 3 */
+        float *abm = GP(RP + 0xb0 + 0x18 * v);        /* center 3, extent 3 */
         const float neg_max = hexf(0xfe7fffff);
-        ab[0] = ab[1] = ab[2] = 0.0f;
-        ab[3] = ab[4] = ab[5] = neg_max;
+        float ab[6] = { 0.0f, 0.0f, 0.0f, neg_max, neg_max, neg_max };   /* (in registers; stored at the end) */
         float vc[3] = { 0, 0, 0 }, ve[3] = { neg_max, neg_max, neg_max };
         const uint32_t skip_flag = ((1u << v) & mask) ? 8 : 0;
         uint32_t n = 0;
-        const uint64_t npages = lp(RP + 0x138);
-        for (uint64_t pg = 0; pg < npages; pg++) {
-            const uint64_t pages = lp(RP + 0x130);
+        const uint32_t npages = (uint32_t)lp(RP + 0x138);
+        for (uint32_t pg = 0; pg < npages; pg++) {
+            const uint32_t pages = (uint32_t)lp(RP + 0x130);
             uint32_t left = *(uint16_t *)GP(pages + 0x6660 + 2 * pg);
             if (!left)
                 continue;
-            const uint64_t page = lp(pages + 8 * pg);
-            for (uint64_t j = 0; left; j++) {
+            const uint32_t page = (uint32_t)lp(pages + 8 * pg);
+            for (uint32_t j = 0; left; j++) {
                 const uint64_t obj = lp(page + 8 * j);
                 if (!obj)
                     continue;
                 left--;
-                rpu.objs++;
-                const uint64_t boxa = page + 0x4800 + 0x18 * j;
+                if (stats)
+                    rpu.objs++;
+                const uint32_t boxa = page + 0x4800 + 0x18 * j;
                 const float *box = GP(boxa);
                 grow_bounds(ab, ab + 3, box);
                 const uint8_t layer = *(uint8_t *)GP(page + 8 * j + 0x6001);
@@ -974,7 +975,8 @@ static void render_pass_update(Ctx *c)
                     for (int k = 0; k < 6 && !culled; k++)
                         culled = plane_culls(&P[k], box);
                     if (culled) {
-                        rpu.culled++;
+                        if (stats)
+                            rpu.culled++;
                         continue;
                     }
                 }
@@ -995,7 +997,8 @@ static void render_pass_update(Ctx *c)
                     static const GuestFunc *ic;
                     RT_CALL_IC(c, lp(RP + 0x128), ic);
                     key = (uint32_t)c->x[0];
-                    rpu.keyed++;
+                    if (stats)
+                        rpu.keyed++;
                 }
                 rt_st32(GP(lp(RP + 0x1f0 + 8 * v) + 4 * (uint64_t)n), key);
                 const uint64_t o64 = obj;
@@ -1004,13 +1007,14 @@ static void render_pass_update(Ctx *c)
                 grow_bounds_vis(vc, ve, box);
             }
         }
+        memcpy(abm, ab, sizeof ab);
         {   /* MINA_POISON_ALLBOUNDS: is the bounds of all objects read at all? */
             static int poison = -1;
             if (poison < 0)
                 poison = getenv("MINA_POISON_ALLBOUNDS") != NULL;
             if (poison)
                 for (int k = 0; k < 6; k++)
-                    ab[k] = __builtin_nanf("");
+                    abm[k] = __builtin_nanf("");
         }
         float *vb = GP(RP + 0x150 + 0x18 * v);
         vb[0] = vc[0]; vb[1] = vc[1]; vb[2] = vc[2];
