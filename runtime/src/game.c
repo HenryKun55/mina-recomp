@@ -1704,13 +1704,17 @@ static void cutter_render(Ctx *c)
         memcpy(d + 0x58, &cb, 8);
         memcpy(d + 0x60, GP(0x1d4e160), 8);
     }
-    c->x[0] = fr;
-    c->x[1] = lp(O + 8);
-    c->x[2] = lp(CTX + 8);
-    c->x[3] = ob[0xe0];
-    f_1b6a48(c);
+    uint64_t mtx = lp(O + 8);
+    if (ob[0xe0]) {           /* a billboard (mode 0 returns the matrix itself) */
+        c->x[0] = fr;
+        c->x[1] = mtx;
+        c->x[2] = lp(CTX + 8);
+        c->x[3] = ob[0xe0];
+        f_1b6a48(c);
+        mtx = c->x[0];
+    }
     float *k = GP(cb);
-    memcpy(k, GP(c->x[0]), 64);
+    memcpy(k, GP(mtx), 64);
     {   /* the offset snapped to whole pixels */
         const float s1 = ldfp(0x6039f5c), s0 = ldfp(0x6039f58);
         float v2[2];
@@ -2061,4 +2065,46 @@ void nat__ZN15ShadowComponent10SetVisibleEb(Ctx *c)
     *(uint8_t *)GP(lp(x8 + 0x50) + 0x155) = w9;
     *(uint8_t *)GP(lp(x8 + 0x58) + 0x155) = w9;
     *(uint8_t *)GP(lp(lp(x8 + 0x60) + 0x120) + 0x155) = w9;
+}
+
+/* ---- ycPaletteTexture::SetOnDrawCall -----------------------------------------------------------
+ * A palette's textures on a draw call (units at +0x108 and +0x118: the palette
+ * and, for a palette group entry (P+0x30 >= 0, ycMaterials' table at
+ * 0x60210c0), the group's), and 1/width of each into the constants. */
+static uint64_t pal_group_tex(uint8_t *gm_, uint64_t tab, uint32_t idx)
+{
+    const uint64_t ent = tab + (uint64_t)idx * 64, t = lp(ent);
+    if (t && *(uint8_t *)GP(ent + 0x3e))
+        return lp((rt_ld32(GP(ent + 0x30)) & 0x80000000u) ? t + 0x18 : t + 0x20);
+    return lp(ent + 8);
+}
+void nat__ZNK16ycPaletteTexture13SetOnDrawCallEP16ycRenderDrawCallPf(Ctx *c)
+{
+    GM_BEGIN;
+    const uint64_t P = c->x[0], D = c->x[1], out = c->x[2];
+    uint64_t t = lp(P);
+    if (t && *(uint8_t *)GP(P + 0x3e)) {
+        const uint32_t w = rt_ld32(GP(P + 0x30));
+        t = lp(!(w & 0x80000000u) && lp(0x60210c0) ? t + 0x20 : t + 0x18);
+    } else {
+        t = lp(P + 8);
+    }
+    if (!t)
+        return;
+    rt_st32(GP(D + 0x108), 0x200);
+    memcpy(GP(D + 0x110), &t, 8);
+    rt_st32(GP(D + 0x1bc), 0x80000100u);
+    uint32_t w = rt_ld32(GP(P + 0x30));
+    const uint64_t tab = lp(0x60210c0);
+    if (!(w & 0x80000000u) && tab) {
+        const uint64_t g = pal_group_tex(gm_, tab, w);
+        rt_st32(GP(D + 0x118), 0x200);
+        memcpy(GP(D + 0x120), &g, 8);
+        rt_st32(GP(D + 0x1c0), 0x80000100u);
+        w = rt_ld32(GP(P + 0x30));
+    }
+    stfp(out, 1.0f / (float)rt_ld32(GP(t + 8)));
+    if ((w & 0x80000000u) || !tab)
+        return;
+    stfp(out + 4, 1.0f / (float)rt_ld32(GP(pal_group_tex(gm_, tab, w) + 8)));
 }
