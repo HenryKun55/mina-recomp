@@ -162,6 +162,25 @@ static void composite(Ctx *c)
 }
 
 /* o may be a: b is copied into o first, a is read after (as the game does) */
+/* exactly (+0, +0, +0, 1): the product of two of them is one again, bit for
+ * bit, and normalizing one changes nothing (n = 1, 1/sqrt(1) = 1) */
+static inline int q_identity(const float *q)
+{
+    uint32_t b[4];
+    memcpy(b, q, 16);
+    return (b[0] | b[1] | b[2]) == 0 && b[3] == 0x3f800000u;
+}
+/* rotated by the identity, t gains 2 (±0) per component: no change unless a
+ * component is -0 (-0 + +0 is +0) or not finite (0 * inf is NaN) */
+static inline int t_plain(const float *t)
+{
+    uint32_t b[3];
+    memcpy(b, t, 12);
+    for (int i = 0; i < 3; i++)
+        if (b[i] == 0x80000000u || (b[i] & 0x7f800000u) == 0x7f800000u)
+            return 0;
+    return 1;
+}
 static void compose(XForm *o, const XForm *a, const XForm *bp, uint64_t f)
 {
     const XForm b = *bp;     /* a struct copy: no library call */
@@ -181,8 +200,9 @@ static void compose(XForm *o, const XForm *a, const XForm *bp, uint64_t f)
         o->t[1] = a->s[1] * o->t[1];
         o->t[2] = a->s[2] * o->t[2];
     }
+    const int a_id = q_identity(a->q);
     if (!(f & 0x20)) {
-        if (!(f & 0x200)) {
+        if (!(f & 0x200) && !(a_id && q_identity(o->q))) {
             const float ox = o->q[0], oy = o->q[1], oz = o->q[2], ow = o->q[3];
             const float ax = a->q[0], ay = a->q[1], az = a->q[2], aw = a->q[3];
             const float w = ow * aw - ((ox * ax + oy * ay) + oz * az);
@@ -192,7 +212,7 @@ static void compose(XForm *o, const XForm *a, const XForm *bp, uint64_t f)
             o->q[2] = (oy * ax - ox * ay) + zz;
             o->q[3] = w;
         }
-        if (!(f & 0x108)) {
+        if (!(f & 0x108) && !(a_id && t_plain(o->t))) {
             /* t rotated by a.q: t + 2 (w (u x t) + u x (u x t)) */
             const float ax = a->q[0], ay = a->q[1], az = a->q[2], aw = a->q[3];
             const float tx = o->t[0], ty = o->t[1], tz = o->t[2];
@@ -213,6 +233,8 @@ static void compose(XForm *o, const XForm *a, const XForm *bp, uint64_t f)
         o->t[1] = a->t[1] + o->t[1];
         o->t[2] = a->t[2] + o->t[2];
     }
+    if (q_identity(o->q))
+        return;
     float sq0 = o->q[0] * o->q[0], sq1 = o->q[1] * o->q[1], sq2 = o->q[2] * o->q[2], sq3 = o->q[3] * o->q[3];
     float n = ((sq0 + sq1) + sq2) + sq3;
     if (n != 0.0f) {
