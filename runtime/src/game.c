@@ -1801,6 +1801,63 @@ static void cutter_render(Ctx *c)
     f_1df70c(c);
     c->sp = saved_sp;
 }
+/* ycRenderCmdList::DrawCall: 0x228 bytes of the list's current block (a new
+ * block, or the next one already made, when it is full): a header, then the
+ * draw call as is */
+static void cmdlist_draw_call(Ctx *c)
+{
+    GM_BEGIN;
+    const uint64_t L = c->x[0], dc = c->x[1];
+    uint64_t e, left = lp(L + 0x28);
+    if (left >= 0x228) {
+        e = lp(L + 0x20);
+        const uint64_t nx = e + 0x228;
+        memcpy(GP(L + 0x20), &nx, 8);
+    } else {
+        uint64_t cur = lp(L + 0x18), bsize = lp(L + 0x30), next = 0;
+        if (cur)
+            next = lp(cur + bsize - 8);
+        if (cur && next) {
+            e = next;
+        } else {
+            const uint64_t alloc = lp(L + 8);
+            const uint64_t x0 = c->x[0], x1 = c->x[1];
+            c->x[0] = alloc;
+            c->x[1] = bsize;
+            c->x[2] = 0x40;
+            c->x[3] = 0;
+            c->x[4] = 0;
+            c->x[5] = 0;
+            static const GuestFunc *ic;
+            RT_CALL_IC(c, lp(lp(alloc)), ic);
+            e = c->x[0];
+            c->x[0] = x0;
+            c->x[1] = x1;
+            bsize = lp(L + 0x30);
+            memset(GP(e + bsize - 8), 0, 8);
+            cur = lp(L + 0x18);
+        }
+        if (!e || !cur) {
+            if (!cur)
+                memcpy(GP(L + 0x10), &e, 8);
+        }
+        if (cur) {
+            const uint64_t at = lp(L + 0x20), z = 0;
+            memcpy(GP(at), &z, 8);
+            memcpy(GP(at + 8), &e, 8);
+            memcpy(GP(cur + bsize - 8), &e, 8);
+        }
+        const uint64_t nx = e + 0x228;
+        memcpy(GP(L + 0x18), &e, 8);
+        memcpy(GP(L + 0x20), &nx, 8);
+        left = lp(L + 0x38);
+    }
+    left -= 0x228;
+    memcpy(GP(L + 0x28), &left, 8);
+    memcpy(GP(e), GP(0x1d4e3b8), 8);
+    memcpy(GP(e + 8), GP(dc), 0x220);
+}
+
 /* MINA_VERIFY_CUTTER: each sprite's draw call made by both, captured at
  * ycRenderCmdList::DrawCall (not drawn), compared (the struct but its constant
  * pointers, and the 0x100 bytes of constants), then the native's is drawn */
@@ -1819,7 +1876,7 @@ void nat__ZN15ycRenderCmdList8DrawCallEPK16ycRenderDrawCall(Ctx *c)
         cutter_list[k] = c->x[0];
         return;
     }
-    f_1df70c_orig(c);
+    cmdlist_draw_call(c);
 }
 void nat__ZN24ycCutterAnimRenderObject6RenderERKN14ycRenderObject9RenderCtxE(Ctx *c)
 {
@@ -1871,4 +1928,137 @@ void nat__ZN24ycCutterAnimRenderObject6RenderERKN14ycRenderObject9RenderCtxE(Ctx
         f_1df70c_orig(c);
         c->sp = sp;
     }
+}
+
+/* ---- CombatCore::UpdateCoreAttackData / UpdateCoreDefenseData ----------------------------------
+ * A combat core's attack (C+0xd0) / defense (C+0xd8) shape data from the core
+ * and its chain of parents (C+0x40, followed while a flag of C+0x210 says the
+ * value comes from the parent), then the same for its children (C+0x58 list). */
+static uint64_t core_root(uint8_t *gm_, uint64_t c, uint32_t bit)
+{
+    for (;;) {
+        if (!(*(uint8_t *)GP(c + 0x210) & bit))
+            return c;
+        const uint64_t p = lp(c + 0x40);
+        if (!p)
+            return c;
+        c = p;
+    }
+}
+static void core_copy_floats(uint8_t *gm_, uint64_t C, uint32_t off, uint64_t sd, uint64_t d)
+{
+    stfp(d + 0x8, ldfp(sd + 0x14));
+    sd = lp(C + off);
+    stfp(lp(sd + 8) + 0xc, ldfp(sd + 0x18));
+    sd = lp(C + off);
+    stfp(lp(sd + 8), ldfp(sd + 0x20));
+    sd = lp(C + off);
+    stfp(lp(sd + 8) + 4, ldfp(sd + 0x24));
+}
+static void core_attack(uint8_t *gm_, uint64_t C)
+{
+    const uint64_t sd = lp(C + 0xd0);
+    if (sd) {
+        const uint64_t d = lp(sd + 8);
+        memcpy(GP(d + 0x10), &sd, 8);
+        memset(GP(d + 0x20), 0, 8);
+        int on = 0;
+        const uint64_t P = lp(C + 0x40);
+        if ((*(uint8_t *)GP(C + 0x210) & 4) && P) {
+            if (*(uint8_t *)GP(core_root(gm_, P, 4) + 0x255)) {
+                uint8_t v;
+                if (!(*(uint8_t *)GP(P + 0x210) & 4) || !lp(P + 0x40))
+                    v = *(uint8_t *)GP(P + 0x256);
+                else
+                    v = *(uint8_t *)GP(core_root(gm_, lp(P + 0x40), 4) + 0x255);
+                on = v != 0;
+            }
+        } else {
+            on = *(uint8_t *)GP(C + 0x256) && *(uint8_t *)GP(C + 0x255);
+        }
+        if (on) {
+            const uint64_t one = 1;
+            memcpy(GP(d + 0x20), &one, 8);
+        }
+        const uint64_t team = rt_ld32(GP(core_root(gm_, C, 1) + 0x20c));
+        memcpy(GP(d + 0x18), &team, 8);
+        core_copy_floats(gm_, C, 0xd0, sd, d);
+    }
+    for (uint64_t n = lp(C + 0x58); n; n = lp(n + 0x18))
+        core_attack(gm_, lp(n + 8));
+}
+static void core_defense(uint8_t *gm_, uint64_t C)
+{
+    const uint64_t sd = lp(C + 0xd8);
+    if (sd) {
+        const uint64_t d = lp(sd + 8);
+        memcpy(GP(d + 0x10), &sd, 8);
+        memset(GP(d + 0x20), 0, 8);
+        if (*(uint8_t *)GP(core_root(gm_, C, 8) + 0x257)) {
+            const uint64_t two = 2;
+            memcpy(GP(d + 0x20), &two, 8);
+        }
+        const uint64_t team = rt_ld32(GP(core_root(gm_, C, 2) + 0x208));
+        memcpy(GP(d + 0x18), &team, 8);
+        core_copy_floats(gm_, C, 0xd8, sd, d);
+    }
+    for (uint64_t n = lp(C + 0x58); n; n = lp(n + 0x18))
+        core_defense(gm_, lp(n + 8));
+}
+void nat__ZN10CombatCore20UpdateCoreAttackDataEv(Ctx *c)
+{
+    GM_BEGIN;
+    core_attack(gm_, c->x[0]);
+}
+void nat__ZN10CombatCore21UpdateCoreDefenseDataEv(Ctx *c)
+{
+    GM_BEGIN;
+    core_defense(gm_, c->x[0]);
+}
+
+/* ---- ShadowComponent::SetVisible ---------------------------------------------------------------
+ * The shadow's render objects (+0x155: drawn) follow its visibility, the
+ * blob (+0xdd), and the owner's sprite (S+0x80). */
+void nat__ZN15ShadowComponent10SetVisibleEb(Ctx *c)
+{
+    GM_BEGIN;
+    const uint64_t S = c->x[0];
+    const uint32_t vis = (uint32_t)c->x[1];
+    uint8_t *s = GP(S);
+    s[0xdc] = (uint8_t)vis;
+    uint64_t x8 = lp(S + 0x68);
+    if (x8)
+        *(uint8_t *)GP(x8 + 0x155) = vis && !s[0xdd] ? *(uint8_t *)GP(lp(S + 0x80) + 0x155) != 0 : 0;
+    x8 = lp(S + 0x70);
+    int lit = 0;                      /* the light (S+0x88) follows the sprite */
+    if (!vis) {
+        *(uint8_t *)GP(x8 + 0x155) = 0;
+        x8 = lp(S + 0x78);
+        if (x8)
+            *(uint8_t *)GP(x8 + 0x155) = 0;
+        x8 = lp(S + 0x88);
+        if (!x8)
+            return;
+    } else {
+        const uint8_t blob = s[0xdd];
+        *(uint8_t *)GP(x8 + 0x155) = blob;
+        x8 = lp(S + 0x78);
+        if (x8)
+            *(uint8_t *)GP(x8 + 0x155) = blob != 0;
+        x8 = lp(S + 0x88);
+        if (!x8)
+            return;
+        lit = s[0xe5] != 0;
+    }
+    uint8_t w9 = 0;
+    if (lit) {
+        w9 = *(uint8_t *)GP(lp(S + 0x80) + 0x155);
+        *(uint8_t *)GP(x8 + 0x90) = w9;
+        w9 = w9 && *(uint8_t *)GP(x8 + 0x91) ? 1 : 0;
+    } else {
+        *(uint8_t *)GP(x8 + 0x90) = 0;
+    }
+    *(uint8_t *)GP(lp(x8 + 0x50) + 0x155) = w9;
+    *(uint8_t *)GP(lp(x8 + 0x58) + 0x155) = w9;
+    *(uint8_t *)GP(lp(lp(x8 + 0x60) + 0x120) + 0x155) = w9;
 }
