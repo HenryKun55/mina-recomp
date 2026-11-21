@@ -2334,3 +2334,178 @@ void nat__ZNK16ycPaletteTexture13SetOnDrawCallEP16ycRenderDrawCallPf(Ctx *c)
         return;
     stfp(out + 4, 1.0f / (float)rt_ld32(GP(pal_group_tex(gm_, tab, w) + 8)));
 }
+
+/* ---- AnimTile::UpdateLayerProps ----------------------------------------------------------------
+ * An animated tile follows its layer (T+0x180 level, T+0x1ac layer, 0x1d8 bytes
+ * each): its entity's position (the layer's offset snapped to whole pixels),
+ * the layer's render pass, its visibility and visible rect, its palette. The
+ * game's operations, in order. */
+void f_56701c_orig(Ctx *c);
+void f_1e10f4(Ctx *c);     /* ycRenderPass::Unregister */
+void f_1e0f7c(Ctx *c);     /* ycRenderPass::Register */
+void f_9a7b98(Ctx *c);     /* GameAnim::Update(float) */
+void f_1b49d0(Ctx *c);     /* ycPaletteTexture::~ycPaletteTexture */
+void nat__ZN8ycEntity21RefreshWorldTransformEb(Ctx *c);
+static void anim_tile_layer_props(Ctx *c)
+{
+    GM_BEGIN;
+    const uint64_t T = c->x[0];
+    uint32_t li = rt_ld32(GP(T + 0x1ac));
+    const uint64_t L = lp(lp(T + 0x180) + 0x40) + (uint64_t)li * 0x1d8;
+    const float k0 = ldfp(0x6039f5c), k1 = ldfp(0x6039f58);
+    float px[2];
+    for (int i = 0; i < 2; i++) {
+        float v = ldfp(L + 0x13c + 4 * i) * k0;
+        v = v + 0.5f;
+        v = floorf(v);
+        v = v * k1;
+        px[i] = ldfp(T + 0x1a0 + 4 * i) + v;
+    }
+    const float base = ldfp(T + 0x1a8);
+    const float s4 = base + 0.0f;
+    float z = base + ldfp(L + 0x144);
+    z = z + hexf(0xbba3d70a);
+    z = *(uint8_t *)GP(T + 0x1b7) ? s4 : z;
+    z = *(uint8_t *)GP(T + 0x1bd) ? z : 0.0f;
+    const uint64_t E = lp(T + 0x10);
+    if (!(ldfp(E + 0xdc) == px[0]) || !(ldfp(E + 0xe0) == px[1]) || !(ldfp(E + 0xe4) == z)) {
+        stfp(E + 0x9c, px[0]);
+        stfp(E + 0xa0, px[1]);
+        stfp(E + 0xa4, z);
+        const uint64_t x1 = c->x[1];
+        c->x[0] = E;
+        nat__ZN8ycEntity21RefreshWorldTransformEb(c);
+        c->x[1] = x1;
+        li = rt_ld32(GP(T + 0x1ac));
+    }
+    /* the layer's render pass */
+    if (!((int32_t)li < 0) && *(uint8_t *)GP(T + 0x1b9)) {
+        const uint64_t pass = lp(lp(lp(T + 0x180) + 0x40) + (uint64_t)li * 0x1d8 + 0x68);
+        const uint64_t ro = lp(T + 0x120), cur = lp(ro + 0xc0);
+        if (pass != cur) {
+            if (cur) {
+                c->x[0] = cur;
+                c->x[1] = ro + 0x58;
+                f_1e10f4(c);
+            }
+            c->x[0] = pass;
+            c->x[1] = ro + 0x58;
+            f_1e0f7c(c);
+            li = rt_ld32(GP(T + 0x1ac));
+        }
+    }
+    uint64_t ro = lp(T + 0x120);
+    {
+        const uint64_t mask = lp(T + 0x198);
+        const uint64_t lv = lp(lp(T + 0x180) + 0x40);
+        const uint8_t layer_on = *(uint8_t *)GP(lv + (uint64_t)li * 0x1d8 + 0xb4);
+        uint32_t w9;
+        int hidden = 0;
+        if (mask) {
+            if (!layer_on || !*(uint8_t *)GP(T + 0x1b4))
+                hidden = 1;
+            else
+                w9 = *(uint16_t *)GP(mask);
+        } else {
+            if (!layer_on)
+                hidden = 1;
+            else
+                w9 = *(uint8_t *)GP(T + 0x1b4);
+        }
+        if (hidden) {
+            *(uint8_t *)GP(ro + 0x155) = 0;
+        } else {
+            uint8_t vis = w9 != 0;
+            *(uint8_t *)GP(ro + 0x155) = vis;
+            if (*(uint8_t *)GP(T + 0x1b8) && vis) {
+                const uint64_t le = lv + (uint64_t)li * 0x1d8;
+                float s11 = ldfp(le + 0xc0), s10 = ldfp(le + 0xc4), s8 = ldfp(le + 0xc8), s9 = ldfp(le + 0xcc);
+                if (!*(uint8_t *)GP(T + 0x1be)) {
+                    float r[4];
+                    memcpy(r, GP(le + 0x198), 16);
+                    const uint64_t saved_sp = c->sp, fr = saved_sp - 0x80;
+                    c->sp = fr;
+                    c->x[0] = ro;
+                    c->x[1] = 0;
+                    c->x[8] = fr + 0x18;
+                    static const GuestFunc *ic;
+                    RT_CALL_IC(c, lp(lp(ro) + 0x90), ic);
+                    c->sp = saved_sp;
+                    vis = 0;
+                    ro = lp(T + 0x120);
+                    const float b0 = ldfp(fr + 0x18), b1 = ldfp(fr + 0x1c), b3 = ldfp(fr + 0x24), b4 = ldfp(fr + 0x28);
+                    float d = r[0] - b0;
+                    d = d > 0.0f ? d : -d;
+                    const float e0 = r[2] + b3;
+                    if (!(d > e0)) {
+                        float d1 = r[1] - b1;
+                        d1 = d1 > 0.0f ? d1 : -d1;
+                        const float e1 = r[3] + b4;
+                        vis = d1 <= e1;
+                    }
+                    *(uint8_t *)GP(ro + 0x155) = vis;
+                    const float lo0 = r[0] - r[2];
+                    s11 = s11 > lo0 ? s11 : lo0;
+                    const float hi0 = r[2] + r[0];
+                    s10 = s10 < hi0 ? s10 : hi0;
+                    const float lo1 = r[1] - r[3];
+                    s8 = s8 > lo1 ? s8 : lo1;
+                    const float hi1 = r[3] + r[1];
+                    s9 = s9 < hi1 ? s9 : hi1;
+                }
+                if (vis) {
+                    const int both = ldfp(ro + 0xf8) > ldfp(ro + 0xfc) && s11 > s10;
+                    const float a = both ? hexf(0xff7fffff) : s11, b = both ? hexf(0x7f7fffff) : s10;
+                    stfp(ro + 0xf0, a);
+                    stfp(ro + 0xf4, b);
+                    stfp(ro + 0xf8, s8);
+                    stfp(ro + 0xfc, s9);
+                    if (a > b) {
+                        if (s8 > s9)
+                            memcpy(GP(ro + 0xf8), GP(0x1d4ec00), 8);
+                        memcpy(GP(ro + 0xf0), GP(0x1d4ec00), 8);
+                    }
+                    c->x[0] = ro;
+                    c->v[0] = vset_f32(0.0f);
+                    f_9a7b98(c);
+                    ro = lp(T + 0x120);
+                    c->x[0] = ro;
+                    static const GuestFunc *ic2;
+                    RT_CALL_IC(c, lp(lp(ro) + 0x78), ic2);
+                }
+            }
+        }
+    }
+    /* the layer's palette */
+    if (!*(uint8_t *)GP(T + 0x1b6))
+        return;
+    uint64_t r8 = lp(T + 0x120), lv = lp(lp(T + 0x180) + 0x40);
+    li = rt_ld32(GP(T + 0x1ac));
+    const uint64_t pal = lp(lv + (uint64_t)li * 0x1d8 + 0x98);
+    const uint64_t old = lp(r8 + 0x128);
+    const uint8_t owned = *(uint8_t *)GP(r8 + 0x1c8);
+    *(uint8_t *)GP(r8 + 0x1c8) = 0;
+    memcpy(GP(r8 + 0x128), &pal, 8);
+    if (owned && old) {
+        const uint32_t refs = rt_ld32(GP(old + 0x34)) - 1;
+        rt_st32(GP(old + 0x34), refs);
+        if (!refs) {
+            const uint64_t alloc = lp(0x6053520);
+            c->x[0] = old;
+            f_1b49d0(c);
+            c->x[0] = alloc;
+            c->x[1] = old;
+            c->x[2] = 0;
+            static const GuestFunc *ic3;
+            RT_CALL_IC(c, lp(lp(alloc) + 8), ic3);
+            r8 = lp(T + 0x120);
+            lv = lp(lp(T + 0x180) + 0x40);
+            li = rt_ld32(GP(T + 0x1ac));
+        }
+    }
+    rt_st32(GP(r8 + 0x134), rt_ld32(GP(lv + (uint64_t)li * 0x1d8 + 0xb0)));
+}
+void nat__ZN8AnimTile16UpdateLayerPropsEv(Ctx *c)
+{
+    anim_tile_layer_props(c);
+}
