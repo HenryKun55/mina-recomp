@@ -502,13 +502,13 @@ static int vita_button(const char *n)
 static void levels_dump(void)
 {
     static int done;
-    if (done || !getenv("MINA_LEVELS") || SDL_GetTicks() < 15000)
+    if (done || !getenv("MINA_LEVELS") || SDL_GetTicks() < 45000)
         return;
     done = 1;
     const uint32_t tab = GUEST_IMAGE_BASE + 0x05044f68u;   /* Mach-O 0x105044f68: entries (72 bytes), then the count */
     const uint32_t base = (uint32_t)rt_ld64(G(tab));
     const int count = (int)(int32_t)rt_ld64(G(tab + 8));
-    rt_log("[levels] %d\n", count);
+    rt_log("[levels] %d (start level index %d)\n", count, (int)(int32_t)rt_ld32(G(GUEST_IMAGE_BASE + 0x00e48120u)));
     for (int i = 0; i < count && i < 400; i++) {
         const uint32_t name = (uint32_t)rt_ld64(G(base + 72u * (uint32_t)i + 0x30));
         rt_log("[levels] %d %s\n", i, name ? (const char *)G(name) : "-");

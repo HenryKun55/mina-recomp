@@ -1237,7 +1237,7 @@ static void pipe_dealloc(void *h)
 {
     MPipeline *p = h;
     gpu_lock();
-    if (p->prog) glDeleteProgram(p->prog);
+    if (p->prog && !p->shared_prog) glDeleteProgram(p->prog);
     if (p->vao) glDeleteVertexArrays(1, &p->vao);
     gpu_unlock();
 }
@@ -1598,7 +1598,41 @@ static void d_newRenderPipelineState(Ctx *c)
     p->stencil_format = (uint32_t)pb_get(d, "stencilAttachmentPixelFormat", 0);
     p->samples = (uint32_t)pb_get(d, "rasterSampleCount", pb_get(d, "sampleCount", 1));
     gpu_lock();
-    link_program(p);
+    {   /* A pipeline's GL program depends on its two shaders only (the state is set
+         * per draw): one is linked per pair and kept. The game keeps 31 pipelines
+         * per shader by hash % 31, and two of its variants on one slot made it
+         * make them again every frame: a shader compile each time on the Vita. */
+        static struct { int vs, fs; MPipeline t; } progs[1024];
+        static int nprogs;
+        int i = 0;
+        while (i < nprogs && !(progs[i].vs == p->vs && progs[i].fs == p->fs))
+            i++;
+        if (i < nprogs) {
+            const MPipeline *t = &progs[i].t;
+            p->prog = t->prog;
+            memcpy(p->vcb, t->vcb, sizeof p->vcb);
+            memcpy(p->fcb, t->fcb, sizeof p->fcb);
+            memcpy(p->vcb_size, t->vcb_size, sizeof p->vcb_size);
+            memcpy(p->fcb_size, t->fcb_size, sizeof p->fcb_size);
+            memcpy(p->texb, t->texb, sizeof p->texb);
+            p->ntex = t->ntex;
+            glGenVertexArrays(1, &p->vao);
+            p->yflip_loc = t->yflip_loc;
+            p->depth_cmp_loc = t->depth_cmp_loc;
+            p->dst_xform_loc = t->dst_xform_loc;
+            p->dst_depth_unit = t->dst_depth_unit;
+            p->shared_prog = 1;
+        } else {
+            link_program(p);
+            if (nprogs < (int)(sizeof progs / sizeof progs[0])) {
+                progs[nprogs].vs = p->vs;
+                progs[nprogs].fs = p->fs;
+                progs[nprogs].t = *p;
+                nprogs++;
+                p->shared_prog = 1;
+            }
+        }
+    }
     gpu_unlock();
     if (reflection_out)
         rt_st64(G(reflection_out), make_reflection(p));

@@ -171,6 +171,7 @@ typedef struct MPipeline {
      * texture on unit dst_depth_unit, mina_dst_xform window position -> its coordinates */
     GLint depth_cmp_loc, dst_xform_loc;
     int dst_depth_unit;
+    int shared_prog;         /* prog belongs to the program cache (one per shader pair, kept) */
 } MPipeline;
 
 /* GLSL translated from the game's metallibs (generated: build/gen/shaders.c) */
