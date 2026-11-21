@@ -9,7 +9,7 @@ set -u
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 MAX=${1:-600}
 [ $# -gt 0 ] && shift
-DATA="$HOME/Library/Application Support/Vita3K/Vita3K/fs/ux0/data/mina"
+DATA="${MINA_VITA3K:-$HOME/Documents/workspace/games/vita3k-mina}/fs/ux0/data/mina"
 # you play; KEYS=1 presses Return until gameplay instead
 {
     echo "MINA_FPS=1"
@@ -24,7 +24,7 @@ mkdir -p "$OUT"
 printf '%s\n' "$@" > "$OUT/env.txt"
 
 finish() {
-    pkill -f "MacOS/Vita3K -r MINA00001$" 2>/dev/null
+    pkill -f "MacOS/Vita3K -c .* -r MINA00001$" 2>/dev/null
     sleep 1
     cp "$DATA/mina.log" "$OUT/mina.log" 2>/dev/null
     cp "${BUILD:-$ROOT/build-vita}/vita3k.log" "$OUT/vita3k.log" 2>/dev/null
@@ -53,7 +53,7 @@ rm -f "$DATA/mina.log"
 "$ROOT/tools/run_vita3k.sh" "$MAX" > /dev/null 2>&1 &
 sleep 5
 t=5
-while pgrep -f "MacOS/Vita3K -r MINA00001$" > /dev/null && [ "$t" -lt "$MAX" ]; do
+while pgrep -f "MacOS/Vita3K -c .* -r MINA00001$" > /dev/null && [ "$t" -lt "$MAX" ]; do
     sleep 2
     t=$((t + 2))
 done

@@ -110,6 +110,8 @@ if(VITA)
   # exists; the SDK's skips error handling and crashes on this game's draws
   if(EXISTS "${CMAKE_SOURCE_DIR}/deps/vitaGL/libvitaGL.a")
     set(MINA_VITAGL_DEFAULT "${CMAKE_SOURCE_DIR}/deps/vitaGL/libvitaGL.a")
+    # its own header (our patches add to it; the SDK may have none)
+    target_include_directories(mina BEFORE PRIVATE "${CMAKE_SOURCE_DIR}/deps/vitaGL/source")
   else()
     set(MINA_VITAGL_DEFAULT "vitaGL")
     message(WARNING "deps/vitaGL/libvitaGL.a not found: linking the SDK's vitaGL (run tools/build_vitagl.sh)")

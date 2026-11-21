@@ -10,7 +10,7 @@ set -eu
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 SECS=${1:-75}
 [ $# -gt 0 ] && shift
-DATA="$HOME/Library/Application Support/Vita3K/Vita3K/fs/ux0/data/mina"
+DATA="${MINA_VITA3K:-$HOME/Documents/workspace/games/vita3k-mina}/fs/ux0/data/mina"
 { echo "MINA_FPS=1"; echo "MINA_INPUT=14:Return 16:Return 18:Return 20:Return 22:Return"; for kv in "$@"; do echo "$kv"; done; } > "$DATA/env.txt"
 while pgrep -f "run_vita3k.sh" > /dev/null; do sleep 2; done
 "$ROOT/tools/run_vita3k.sh" "$SECS" > /dev/null 2>&1

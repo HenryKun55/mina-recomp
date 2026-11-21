@@ -18,8 +18,10 @@ set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 SECS=${1:-120}
 BUILD=${BUILD:-$ROOT/build-vita}
-VITA3K=${VITA3K:-$HOME/Documents/workspace/games/Vita3K/build/macos-ninja/bin/Release/Vita3K.app/Contents/MacOS/Vita3K}
-UX0="$HOME/Library/Application Support/Vita3K/Vita3K/fs/ux0"
+# MINA_VITA3K: this port's own Vita3K tree (Vita3K.app, config.yml, fs/ with the firmware)
+V3=${MINA_VITA3K:-$HOME/Documents/workspace/games/vita3k-mina}
+VITA3K=${VITA3K:-$V3/Vita3K.app/Contents/MacOS/Vita3K}
+UX0="$V3/fs/ux0"
 APP="$UX0/app/MINA00001"
 DATA="$UX0/data/mina"
 
@@ -34,22 +36,22 @@ if [ ! -e "$DATA/Contents" ]; then
 fi
 rm -f "$DATA/mina.log"
 
-pkill -9 -f "Vita3K -r MINA00001" 2>/dev/null
+pkill -9 -f "Vita3K -c .* -r MINA00001" 2>/dev/null
 rm -f "${PROFILE:-$BUILD/vita3k-profile.txt}"
 # this run's Vita FS, whatever Vita3K's config.yml points at (other ports share the emulator)
 (VITA3K_PREF_PATH="$(dirname "$UX0")/" VITA3K_CPU_MHZ=${MHZ:-444} VITA3K_GPU_SCALE=${GPU_SCALE:-37} VITA3K_GPU_LOG=${GPU_LOG:-1} VITA3K_GPU_MEDIAN=${GPU_MEDIAN:-31} \
- VITA3K_PROFILE="${PROFILE:-$BUILD/vita3k-profile.txt}" "$VITA3K" -r MINA00001 > "$BUILD/vita3k.log" 2>&1 &)
+ VITA3K_PROFILE="${PROFILE:-$BUILD/vita3k-profile.txt}" "$VITA3K" -c "$V3/config.yml" -r MINA00001 > "$BUILD/vita3k.log" 2>&1 &)
 echo "Vita3K started (log: $BUILD/vita3k.log, game log: ux0:data/mina/mina.log)"
 
 waited=0
 while [ $waited -lt "$SECS" ]; do
     sleep 5
     waited=$((waited + 5))
-    if ! pgrep -f "Vita3K -r MINA00001" > /dev/null; then
+    if ! pgrep -f "Vita3K -c .* -r MINA00001" > /dev/null; then
         echo "Vita3K exited after ${waited}s"
         break
     fi
 done
-pkill -9 -f "Vita3K -r MINA00001" 2>/dev/null
+pkill -9 -f "Vita3K -c .* -r MINA00001" 2>/dev/null
 echo "---- mina.log (tail) ----"
 tail -40 "$DATA/mina.log" 2>/dev/null

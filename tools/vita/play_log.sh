@@ -8,7 +8,7 @@ set -eu
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 PLAY=${1:-20}
 [ $# -gt 0 ] && shift
-DATA="$HOME/Library/Application Support/Vita3K/Vita3K/fs/ux0/data/mina"
+DATA="${MINA_VITA3K:-$HOME/Documents/workspace/games/vita3k-mina}/fs/ux0/data/mina"
 KEYS=$(python3 -c "print(' '.join('%d:Return' % t for t in range(14, 200, 3)))")
 { echo "MINA_FPS=1"; echo "MINA_INPUT_UNTIL_PLAY=1"; echo "MINA_INPUT=$KEYS"; for kv in "$@"; do echo "$kv"; done; } > "$DATA/env.txt"
 rm -f "$DATA/mina.log"
@@ -20,7 +20,7 @@ until grep -aq '^\[play\]' "$DATA/mina.log" 2>/dev/null; do
     [ $waited -lt 300 ] || { echo "no gameplay after 300 s" >&2; break; }
 done
 sleep "$PLAY"
-pkill -f "Vita3K -r MINA00001" || true
+pkill -f "Vita3K -c .* -r MINA00001" || true
 sleep 2
 printf '\n' > "$DATA/env.txt"
 sed -n '/^\[play\]/,$p' "$DATA/mina.log" | grep -a '^\[fps\]' | tail -40
