@@ -689,6 +689,36 @@ static void buf_track(MBuffer *b, int add)
     pthread_mutex_unlock(&bufs_lock);
 }
 
+/* MINA_MEMSTAT (any build): the live buffers' guest memory by kind */
+void metal_buffers_summary(void)
+{
+    pthread_mutex_lock(&bufs_lock);
+    uint64_t shared = 0, kept = 0, given = 0, saved = 0;
+    int nshared = 0, nbig = 0, ngiven = 0, nprivate = 0;
+    for (int i = 0; i < nlive_bufs; i++) {
+        const MBuffer *b = live_bufs[i];
+        if (b->gpu_only) {
+            nprivate++;
+            continue;
+        }
+        if (b->contents) {
+            shared += b->length;
+            nshared++;
+            if (b->length >= (512u << 10))
+                nbig++;
+            if (b->keep_contents)
+                kept += b->length;
+        } else if (b->given_back) {
+            ngiven++;
+            saved += b->saved_len;
+        }
+    }
+    rt_log("[mtl] %d buffers: %d with guest memory %.1f MiB (%d of 512 KiB+, %.1f MiB kept), %d given back (%.1f MiB "
+           "saved), %d private\n", nlive_bufs, nshared, shared / 1048576.0, nbig, kept / 1048576.0, ngiven,
+           saved / 1048576.0, nprivate);
+    pthread_mutex_unlock(&bufs_lock);
+}
+
 #if !defined(__vita__)
 #include <sys/mman.h>
 void metal_buffers_report(void)
@@ -743,6 +773,7 @@ static void buf_dealloc(void *h)
     if (!b->fresh && !b->gpu_only)
         gfree(b->contents);
 }
+#define TILE_STAGING_LEN 0x13ffb0u   /* ycGpuBuffer of a tile level (WorldRegion::StartRunning) */
 static void d_newBufferWithLength(Ctx *c)
 {
     uint64_t o = objc_new_object(&cls_Buffer);
@@ -771,6 +802,24 @@ static void d_newBufferWithLength(Ctx *c)
         buf_track(b, 1);
         RET(o);
         return;
+    }
+    /* A tile level's staging buffer (only that size: texture staging buffers
+     * are written again through the pointer the game keeps): the ones this thread
+     * made before are written by now (made, filled, queued for upload, the
+     * next one made), so their memory goes, their bytes kept for the upload:
+     * a region's layers would take 1.25 MiB each at once. */
+    b->maker = thread_ctx();
+    if (b->length == TILE_STAGING_LEN) {
+        static int keep = -1;
+        if (keep < 0)
+            keep = getenv("MINA_KEEP_STAGING") != NULL;
+        pthread_mutex_lock(&bufs_lock);
+        for (int i = 0; i < nlive_bufs && !keep; i++) {
+            MBuffer *x = live_bufs[i];
+            if (x->length == TILE_STAGING_LEN && x->maker == b->maker && x->contents && x->contents_asked == 1)
+                metal_buf_give_back(x);
+        }
+        pthread_mutex_unlock(&bufs_lock);
     }
 #if !defined(__vita__)
     uint32_t gmalloc_fresh(uint64_t size);
@@ -1146,6 +1195,9 @@ static void lib_newFunctionWithName(Ctx *c)
     int vertex = name && strstr(name, "vertex") != NULL;
     int idx = vertex ? l->vs : l->fs;
     if (idx < 0) {
+        static int told;
+        if (told++ < 8)
+            rt_log("metal: function %s of a library without a translated shader: nil\n", name ? name : "?");
         RET(0);
         return;
     }
@@ -1500,8 +1552,17 @@ static void d_newRenderPipelineState(Ctx *c)
     uint64_t vf = pb_get(d, "vertexFunction", 0), ff = pb_get(d, "fragmentFunction", 0);
     p->vs = vf ? ((MFunc *)objc_host(vf))->shader : -1;
     p->fs = ff ? ((MFunc *)objc_host(ff))->shader : -1;
-    if (p->vs < 0)
-        rt_fatal("metal: pipeline without a vertex function");
+    if (p->vs < 0) {
+        /* Metal fails it (nil, an error): its draws are not drawn */
+        static int told;
+        if (told++ < 8)
+            rt_log("metal: a pipeline without a vertex function (fs %d): nil\n", p->fs);
+        objc_release_obj(o);
+        if (reflection_out)
+            rt_st64(G(reflection_out), 0);
+        RET(0);
+        return;
+    }
     uint64_t vd = pb_existing_child(d, "vertexDescriptor");
     uint64_t attrs = pb_existing_child(vd, "attributes"), layouts = pb_existing_child(vd, "layouts");
     for (int i = 0; i < MAX_ATTRS; i++) {
@@ -1563,6 +1624,35 @@ uint32_t metal_buf_mem(MBuffer *b)
     return b->contents;
 }
 
+void metal_buf_give_back(MBuffer *b)
+{
+    if (!b->contents || b->gpu_only || b->fresh || b->keep_contents)
+        return;
+    const uint8_t *m = G(b->contents);
+    uint32_t len = b->length;
+    while (len >= 8 && rt_ld64((const void *)(m + len - 8)) == 0)
+        len -= 8;
+    while (len && m[len - 1] == 0)
+        len--;
+    if (getenv("MINA_STAGINGLOG")) {
+        uint32_t first = 0;
+        while (first < len && m[first] == 0)
+            first++;
+        rt_log("[staging] %u bytes: data %u..%u\n", b->length, first, len);
+    }
+    uint8_t *keepb = len ? malloc(len) : NULL;
+    if (len && !keepb)
+        return;
+    if (len)
+        memcpy(keepb, m, len);
+    free(b->saved);
+    b->saved = keepb;
+    b->saved_len = len;
+    b->given_back = 1;
+    gfree(b->contents);
+    b->contents = 0;
+}
+
 static void b_contents(Ctx *c)
 {
     MBuffer *b = objc_host(SELF);
@@ -1570,8 +1660,12 @@ static void b_contents(Ctx *c)
     if (!b->contents && !b->gpu_only) {
         /* the game writes through this pointer whenever: never given back again */
         static int told;
-        if (told++ < 8)
-            rt_log("metal: a %u-byte buffer's memory is asked for after its upload: it stays\n", b->length);
+        if (told++ < 8) {
+            char bt[512];
+            guest_backtrace(bt, sizeof bt, 6);
+            rt_log("metal: a %u-byte buffer's memory is asked for after its upload (%u bytes kept): it stays: %s\n",
+                   b->length, b->saved_len, bt);
+        }
         b->keep_contents = 1;
     }
     RET(metal_buf_mem(b));
@@ -1640,6 +1734,13 @@ static void tex_upload(MTexture *t, uint32_t x, uint32_t y, uint32_t w, uint32_t
         src = packed;
     }
     glTexSubImage2D(tt, (GLint)level, (GLint)x, (GLint)y, (GLsizei)w, (GLsizei)h, f.format, f.type, src);
+    {
+        GLenum err = glGetError();
+        static int told;
+        if (err && told++ < 16)
+            rt_log("metal: upload to a %ux%u texture (format %u, %u mips, gl %u) at %u,%u %ux%u level %u: GL error 0x%x\n",
+                   t->width, t->height, t->format, t->mips, t->gl, x, y, w, h, level, err);
+    }
     free(packed);
 #else
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);

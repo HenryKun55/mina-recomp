@@ -31,13 +31,14 @@ if [ ! -d "$DEST" ]; then
 fi
 
 cd "$DEST"
-# our changes (tools/vitagl/*.patch), each applied once
-for p in "$ROOT"/tools/vitagl/*.patch; do
-    if git apply --reverse --check "$p" > /dev/null 2>&1; then
-        continue
-    fi
-    git apply "$p" || { echo "cannot apply $p" >&2; exit 1; }
-done
+# our changes (tools/vitagl/*.patch, in order), applied once: when the last
+# one is in, all are (a later patch can change an earlier one's context)
+last=$(ls "$ROOT"/tools/vitagl/*.patch | tail -1)
+if ! git apply --reverse --check "$last" > /dev/null 2>&1; then
+    for p in "$ROOT"/tools/vitagl/*.patch; do
+        git apply "$p" || { echo "cannot apply $p" >&2; exit 1; }
+    done
+fi
 make clean > /dev/null 2>&1 || true
 PATH="$VITASDK/bin:$PATH" VITASDK="$VITASDK" make -j"$(sysctl -n hw.ncpu 2>/dev/null || echo 4)" \
     STORE_DEPTH_STENCIL=1 LOG_ERRORS=1 HAVE_SHARK_LOG=1 NO_SPLASHSCREEN=1 ${VITAGL_FLAGS:-} > build-mina.log 2>&1 \

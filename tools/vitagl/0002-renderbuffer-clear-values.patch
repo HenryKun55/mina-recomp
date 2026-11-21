@@ -1,0 +1,33 @@
+diff --git a/source/framebuffers.c b/source/framebuffers.c
+index 633b239..099c956 100644
+--- a/source/framebuffers.c
++++ b/source/framebuffers.c
+@@ -1005,6 +1005,16 @@ void vglRenderbufferForceLoad(GLuint rb, GLboolean load) {
+ 		sceGxmDepthStencilSurfaceSetForceLoadMode(&r->depthbuffer, load ? SCE_GXM_DEPTH_STENCIL_FORCE_LOAD_ENABLED : SCE_GXM_DEPTH_STENCIL_FORCE_LOAD_DISABLED);
+ }
+ 
++// The depth/stencil a renderbuffer starts a scene with when it is not loaded
++// (its clear values: the GXM's own clear, kept across scene restarts).
++void vglRenderbufferClearValues(GLuint rb, GLfloat depth, GLuint stencil) {
++	renderbuffer *r = (renderbuffer *)rb;
++	if (r && r->has_surface) {
++		sceGxmDepthStencilSurfaceSetBackgroundDepth(&r->depthbuffer, depth);
++		sceGxmDepthStencilSurfaceSetBackgroundStencil(&r->depthbuffer, (uint8_t)stencil);
++	}
++}
++
+ // Ends the scene at the next draw and begins another on the same framebuffer
+ // (depth/stencil stored, then loaded): its draws can sample them.
+ void vglRestartScene(void) {
+diff --git a/source/vitaGL.h b/source/vitaGL.h
+index 51251ce..6dabfff 100644
+--- a/source/vitaGL.h
++++ b/source/vitaGL.h
+@@ -1303,6 +1303,7 @@ GLboolean vglSwapResolution(int width, int height);
+ void vglTexImageDepthBuffer(GLenum target);
+ void vglTexImageRenderbufferDepth(GLuint rb, GLsizei width, GLsizei height); // Binds a renderbuffer's depth to the bound 2D texture
+ void vglRenderbufferForceLoad(GLuint rb, GLboolean load); // Loads a renderbuffer's depth/stencil at scene start (or not)
++void vglRenderbufferClearValues(GLuint rb, GLfloat depth, GLuint stencil); // Depth/stencil a renderbuffer starts a scene with when not loaded
+ 
+ // Makes vitaGL use cached memory instead of uncached memory for its internal memory pools. Must be called before vglInit*.
+ void vglUseCachedMem(GLboolean use);

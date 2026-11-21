@@ -283,6 +283,8 @@ void mem_report(void)
     mem_free_report();
     void threads_stack_report(void);
     threads_stack_report();
+    void metal_buffers_summary(void);
+    metal_buffers_summary();
 }
 
 #else

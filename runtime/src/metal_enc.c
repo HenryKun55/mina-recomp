@@ -81,6 +81,7 @@ typedef struct REnc {
     int folded;                          /* Vita: its copy was folded (fold_pass), nothing drawn yet */
     int depth_stale;                     /* Vita: the depth in memory is not the pass's (depth_by_shader) */
     int depth_lost;                      /* Vita: a depth_by_shader draw would have written depth (fs) */
+    int depth_aliased;                   /* Vita: the depth its first draw copies is the pass's (depth_alias) */
     struct MTexture *ftex_folded;        /* the copy's source */
     double vp[6];
     int sc[4];
@@ -139,10 +140,12 @@ static void framelog_pass(REnc *e, uint64_t *color, uint64_t depth, uint64_t ste
                       pb_getd(color[0], "clearColor", 1, 0.0), pb_getd(color[0], "clearColor", 2, 0.0),
                       pb_getd(color[0], "clearColor", 3, 1.0));
     if (depth && pb_get(depth, "texture", 0))
-        n += snprintf(buf + n, sizeof buf - n, " depth load %u#%04x", (uint32_t)pb_get(depth, "loadAction", 0),
-                      (unsigned)(((uintptr_t)objc_host(pb_get(depth, "texture", 0)) >> 4) & 0xffff));
+        n += snprintf(buf + n, sizeof buf - n, " depth load %u#%04x (clear %g)", (uint32_t)pb_get(depth, "loadAction", 0),
+                      (unsigned)(((uintptr_t)objc_host(pb_get(depth, "texture", 0)) >> 4) & 0xffff),
+                      pb_getd(depth, "clearDepth", 0, 1.0));
     if (stencil && pb_get(stencil, "texture", 0))
-        n += snprintf(buf + n, sizeof buf - n, " stencil load %u", (uint32_t)pb_get(stencil, "loadAction", 0));
+        n += snprintf(buf + n, sizeof buf - n, " stencil load %u (clear %u)", (uint32_t)pb_get(stencil, "loadAction", 0),
+                      (uint32_t)pb_get(stencil, "clearStencil", 0));
     rt_log("%s\n", buf);
 }
 
@@ -458,6 +461,17 @@ static void pass_begin(REnc *e)
         if (ds && ds->is_rb) {
             void vglRenderbufferForceLoad(GLuint rb, GLboolean load);   /* deps/vitaGL patch */
             vglRenderbufferForceLoad(ds->gl, !(e->clear_depth || !e->dtex) || !(e->clear_stencil || !e->stex));
+            if (e->clear_depth || e->clear_stencil) {
+                /* the pass's clear is the GXM's own: the values a scene starts with
+                 * when the buffer is not loaded (vitaGL's clear quad sits at clip
+                 * z = 2 * value - 1, which the GXM clips below 0: the game clears
+                 * to 0 and tests GREATER, and its world drew nothing) */
+                void vglRenderbufferClearValues(GLuint rb, GLfloat depth, GLuint stencil);   /* deps/vitaGL patch */
+                void vglRestartScene(void);
+                vglRenderbufferClearValues(ds->gl, e->clear_depth ? e->depth_value : 1.0f,
+                                           e->clear_stencil ? (GLuint)e->stencil_value : 0);
+                vglRestartScene();
+            }
         }
     }
 #endif
@@ -1136,6 +1150,13 @@ static void apply_vertices(REnc *e, MPipeline *p, uint32_t max_vertex, uint32_t 
                 /* private buffer: read in place */
                 vbo[bi] = bd->buf->gl;
                 base[bi] = bd->offset;
+                if (bd->buf->gl_size < bd->buf->length && max_vertex != UINT32_MAX &&
+                    bd->offset + (uint64_t)lay->stride * (max_vertex + 1) > bd->buf->gl_size) {
+                    static int told;
+                    if (told++ < 4)
+                        rt_log("metal: a draw reads %u vertices of %u bytes at %u of a private buffer held at %u bytes\n",
+                               max_vertex + 1, lay->stride, bd->offset, bd->buf->gl_size);
+                }
             } else {
                 uint32_t avail;
                 const uint8_t *d = binding_data(bd, &avail);
@@ -1289,6 +1310,40 @@ static void depth_by_shader(REnc *e, MPipeline *p)
 }
 #endif
 
+#if defined(__vita__)
+/* A pass whose first draw copies a depth buffer into its own (a fragment
+ * shader writing the depth it samples: the world's layers composited, then the
+ * sprites tested against them): the Vita's shaders cannot write depth, so the
+ * pass uses that depth buffer itself, loaded (its stencil still cleared as the
+ * pass asks), and the copy writes none. Without it the sprites were tested
+ * against a cleared depth: Mina drawn over the bridge she walks under. */
+static void depth_alias(REnc *e, MPipeline *p)
+{
+    static int off = -1;     /* MINA_DEPTH_ALIAS=1: on (Vita3K ran at 0.7 fps with it: being looked at) */
+    if (off < 0)
+        off = getenv("MINA_DEPTH_ALIAS") == NULL;
+    if (off || p->fs < 0 || !g_shaders[p->fs].writes_depth || !e->dtex || !e->dtex->is_rb || !e->clear_depth)
+        return;
+    MDepthStencil *ds = e->ds ? objc_host(e->ds) : NULL;
+    if (!ds || ds->compare != 7 || !ds->write)
+        return;
+    for (int k = 0; k < p->ntex; k++) {
+        if (!p->texb[k].stage)
+            continue;
+        const uint64_t to = e->ftex[p->texb[k].tex & 15];
+        MTexture *src = to ? objc_host(to) : NULL;
+        if (!src || !src->is_rb || src == e->dtex || src->width != e->dtex->width || src->height != e->dtex->height)
+            continue;
+        if (e->stex == e->dtex)
+            e->stex = src;
+        e->dtex = src;
+        e->clear_depth = 0;
+        e->depth_aliased = 1;
+        return;
+    }
+}
+#endif
+
 static MPipeline *draw_setup(REnc *e)
 {
     if (!e->pipeline)
@@ -1314,6 +1369,10 @@ static MPipeline *draw_setup(REnc *e)
         if (e->sc_set)
             glScissor(e->sc[0], screen_y(e, e->sc[1], e->sc[3]), e->sc[2], e->sc[3]);
     }
+#endif
+#if defined(__vita__)
+    if (!e->begun)
+        depth_alias(e, p);
 #endif
     if (!e->begun)
         pass_begin(e);
@@ -1380,6 +1439,13 @@ static MPipeline *draw_setup(REnc *e)
     }
 #endif
     apply_state(e, p);
+#if defined(__vita__)
+    if (e->depth_aliased && p->fs >= 0 && g_shaders[p->fs].writes_depth) {      /* the copy of the depth the pass already has */
+        glDisable(GL_DEPTH_TEST);
+        glDepthMask(GL_FALSE);
+        GL_DIRTY();
+    }
+#endif
     apply_uniforms(e, p);
     apply_textures(e, p);
 #if defined(__vita__)
@@ -1706,12 +1772,73 @@ static void be_copyTexture(Ctx *c)
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 /* copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size: */
+/* bytes of p[0..n) up to the last nonzero one */
+static uint32_t data_extent(const uint8_t *p, uint32_t n)
+{
+    while (n >= 8) {
+        uint64_t w;
+        memcpy(&w, p + n - 8, 8);
+        if (w)
+            break;
+        n -= 8;
+    }
+    while (n && p[n - 1] == 0)
+        n--;
+    return n;
+}
+
+#define BIG_PRIVATE (512u << 10)
 static void gpu_buffer_write(MBuffer *d, uint32_t off, const void *src, uint32_t n)
 {
-    if (!d->gl) {
-        glGenBuffers(1, &d->gl);
+    /* A big private buffer written whole from 0 (a tile level's 1.25 MiB, ~200 KiB
+     * of it vertices, the rest zero): its GL buffer holds only up to the last
+     * nonzero byte, with room to spare (the Vita's GPU memory: ~100 of them). */
+    if (d->length >= BIG_PRIVATE && off == 0 && n == d->length && !d->shadow) {
+        static int whole = -1;
+        if (whole < 0)
+            whole = getenv("MINA_WHOLE_PRIVATE") != NULL;
+        if (!whole) {
+            const uint32_t used = data_extent(src, n);
+            uint32_t need = (used + (used >> 1) + (64u << 10) + 0xffffu) & ~0xffffu;
+            if (need > d->length)
+                need = d->length;
+            if (!d->gl || d->gl_size < used) {
+                if (!d->gl)
+                    glGenBuffers(1, &d->gl);
+                glBindBuffer(GL_ARRAY_BUFFER, d->gl);
+                glBufferData(GL_ARRAY_BUFFER, need, NULL, GL_STATIC_DRAW);
+                d->gl_size = need;
+                d->gl_used = 0;
+            }
+            glBindBuffer(GL_ARRAY_BUFFER, d->gl);
+            /* zeros where the last data went further */
+            const uint32_t clear_to = d->gl_used < d->gl_size ? d->gl_used : d->gl_size;
+            if (used)
+                glBufferSubData(GL_ARRAY_BUFFER, 0, used, src);
+            if (clear_to > used) {
+                void *z = calloc(1, clear_to - used);
+                if (z) {
+                    glBufferSubData(GL_ARRAY_BUFFER, used, clear_to - used, z);
+                    free(z);
+                }
+            }
+            d->gl_used = used;
+            return;
+        }
+    }
+    if (!d->gl || (d->gl_size && d->gl_size < d->length)) {
+        if (!d->gl)
+            glGenBuffers(1, &d->gl);
         glBindBuffer(GL_ARRAY_BUFFER, d->gl);
-        glBufferData(GL_ARRAY_BUFFER, d->length, NULL, GL_STATIC_DRAW);
+        if (d->gl_size) {
+            static int told;
+            if (told++ < 4)
+                rt_log("metal: a partial write (%u bytes at %u) to a %u-byte private buffer held small: made whole, "
+                       "its old data lost\n", n, off, d->length);
+        }
+        glBufferData(GL_ARRAY_BUFFER, d->length, NULL, GL_STATIC_DRAW);   /* (a partial write: all of it) */
+        d->gl_size = d->length;
+        d->gl_used = d->length;
     }
     glBindBuffer(GL_ARRAY_BUFFER, d->gl);
     glBufferSubData(GL_ARRAY_BUFFER, off, n, src);
@@ -1751,25 +1878,8 @@ static void be_copyBuffer(Ctx *c)
         static int keep = -1;
         if (keep < 0)
             keep = getenv("MINA_KEEP_STAGING") != NULL;
-        if (!keep && so == 0 && n == s->length && !s->fresh && !s->keep_contents) {
-            const uint8_t *m = G(s->contents);
-            uint32_t len = s->length;
-            while (len >= 8 && rt_ld64((const void *)(m + len - 8)) == 0)
-                len -= 8;
-            while (len && m[len - 1] == 0)
-                len--;
-            uint8_t *keepb = len ? malloc(len) : NULL;
-            if (!len || keepb) {
-                if (len)
-                    memcpy(keepb, m, len);
-                free(s->saved);
-                s->saved = keepb;
-                s->saved_len = len;
-                s->given_back = 1;
-                gfree(s->contents);
-                s->contents = 0;
-            }
-        }
+        if (!keep && so == 0 && n == s->length && !s->fresh && !s->keep_contents)
+            metal_buf_give_back(s);
     } else
         memmove(G(metal_buf_mem(d) + dof), G(metal_buf_mem(s) + so), n);
 }

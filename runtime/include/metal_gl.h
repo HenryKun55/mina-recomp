@@ -67,10 +67,15 @@ typedef struct MBuffer {
     uint8_t *saved;          /* given back: its bytes up to the last nonzero one (the rest are zero) */
     uint32_t saved_len;
     int given_back;          /* its memory went after an upload (saved holds its bytes) */
+    const void *maker;       /* the thread (Ctx) that made it */
+    uint32_t gl_size;        /* private: bytes of its GL buffer (big ones hold their data, not all their length) */
+    uint32_t gl_used;        /* private: bytes up to the last nonzero one written whole */
 } MBuffer;
 
 /* guest memory of a shared buffer (given back after a whole-buffer upload: made again on use) */
 uint32_t metal_buf_mem(MBuffer *b);
+/* a staging buffer's guest memory goes, its bytes up to the last nonzero one kept */
+void metal_buf_give_back(MBuffer *b);
 
 typedef struct MTexture {
     uint32_t type, format, width, height, depth, mips, samples, usage, storage;
