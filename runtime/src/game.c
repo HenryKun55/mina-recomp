@@ -890,9 +890,17 @@ static int plane_culls(const Plane *p, const float *box)
     return d + r < p->w;
 }
 
+/* MINA_RPU_STATS: per 60 calls of ycRenderPass::Update, objects seen, culled,
+ * keyed (by a call) and sorted, and the time in the scan and the sort */
+static struct { uint64_t calls, objs, culled, keyed, sorted, scan_us, sort_us; } rpu;
 static void render_pass_update(Ctx *c)
 {
     GM_BEGIN;
+    static int stats = -1;
+    if (stats < 0)
+        stats = getenv("MINA_RPU_STATS") != NULL;
+    uint64_t t_scan = stats ? now_us() : 0;
+    rpu.calls++;
     const uint64_t RP = c->x[0];
     if (!*(uint8_t *)GP(RP + 0x258))
         return;
@@ -950,6 +958,7 @@ static void render_pass_update(Ctx *c)
                 if (!obj)
                     continue;
                 left--;
+                rpu.objs++;
                 const uint64_t boxa = page + 0x4800 + 0x18 * j;
                 const float *box = GP(boxa);
                 grow_bounds(ab, ab + 3, box);
@@ -964,8 +973,10 @@ static void render_pass_update(Ctx *c)
                     int culled = 0;
                     for (int k = 0; k < 6 && !culled; k++)
                         culled = plane_culls(&P[k], box);
-                    if (culled)
+                    if (culled) {
+                        rpu.culled++;
                         continue;
+                    }
                 }
                 if (n == lp(RP + 0x148)) {
                     c->x[0] = RP;
@@ -984,6 +995,7 @@ static void render_pass_update(Ctx *c)
                     static const GuestFunc *ic;
                     RT_CALL_IC(c, lp(RP + 0x128), ic);
                     key = (uint32_t)c->x[0];
+                    rpu.keyed++;
                 }
                 rt_st32(GP(lp(RP + 0x1f0 + 8 * v) + 4 * (uint64_t)n), key);
                 const uint64_t o64 = obj;
@@ -1003,6 +1015,11 @@ static void render_pass_update(Ctx *c)
         float *vb = GP(RP + 0x150 + 0x18 * v);
         vb[0] = vc[0]; vb[1] = vc[1]; vb[2] = vc[2];
         vb[3] = ve[0]; vb[4] = ve[1]; vb[5] = ve[2];
+        uint64_t t_sort = stats ? now_us() : 0;
+        if (stats) {
+            rpu.scan_us += t_sort - t_scan;
+            rpu.sorted += n;
+        }
         if (lp(RP + 0x128) != 0x11e0ae4 && n >= 2) {
             /* bottom-up merge sort by key (ties: the right run first), two buffers */
             const uint64_t o0 = lp(RP + 0x218 + 8 * v), k0 = lp(RP + 0x1f0 + 8 * v);
@@ -1047,8 +1064,18 @@ static void render_pass_update(Ctx *c)
             }
         }
         memcpy(GP(RP + 0x1c8 + 8 * v), &(uint64_t){ n }, 8);
+        if (stats) {
+            t_scan = now_us();
+            rpu.sort_us += t_scan - t_sort;
+        }
     }
     c->sp = saved_sp;
+    if (stats && rpu.calls % 600 == 0) {
+        rt_log("[rpu] per call: %.0f objects, %.0f culled, %.0f keyed, %.0f sorted; %.1f us scan, %.1f us sort\n",
+               rpu.objs / 600.0, rpu.culled / 600.0, rpu.keyed / 600.0, rpu.sorted / 600.0, rpu.scan_us / 600.0,
+               rpu.sort_us / 600.0);
+        memset(&rpu, 0, sizeof rpu);
+    }
 }
 void nat__ZN12ycRenderPass6UpdateEv(Ctx *c)
 {
@@ -1555,4 +1582,293 @@ void nat__ZN7ycAudio7Decoder10ThreadMainEPv(Ctx *c)
 {
     pin_to_core(2, "audio decoder");
     f_cb1ac_orig(c);
+}
+
+/* ---- ycCutterAnimRenderObject::Render ----------------------------------------------------------
+ * A sprite's draw call, every frame: the pass's draw call template (RenderCtx
+ * +0xb0, 0x220 bytes) with the sprite's material (a hash of its flags looked up
+ * in ycMaterials' shader table), its constants (billboard matrix, snapped
+ * offset, two colours, palette, the UV rect) in 0x100 bytes of the command
+ * list's memory, its stencil state, then ycRenderCmdList::DrawCall. The same
+ * operations as the game's code (MINA_NO_NATIVES=ycCutterAnimRenderObject runs it). */
+void f_d589c_orig(Ctx *c);
+void f_1b6a48(Ctx *c);     /* ycRenderUtils::CalcBillboardMtx */
+void f_1b5b10(Ctx *c);     /* ycPaletteTexture::SetOnDrawCall */
+void f_1df70c(Ctx *c);     /* ycRenderCmdList::DrawCall */
+static inline uint32_t rotr32_(uint32_t v, int n) { return v >> n | v << (32 - n); }
+static void cutter_render(Ctx *c)
+{
+    GM_BEGIN;
+    const uint64_t O = c->x[0], CTX = c->x[1];
+    const uint8_t *ob = GP(O);
+    if (!ob[0xfd])
+        return;
+    uint32_t w9 = ob[0xdf];
+    if (!w9 || !rt_ld32(GP(O + 0xcc)))
+        return;
+    const uint64_t tex = lp(O + 0xb8);
+    if (!tex)
+        return;
+    const uint64_t saved_sp = c->sp, fr = saved_sp - 0x2b0, D = fr + 0x40;
+    c->sp = fr;
+    uint8_t *d = GP(D);
+    memcpy(d, GP(CTX + 0xb0), 0x220);
+    const uint64_t cmdlist = lp(CTX + 0x10);
+    if (ob[0xfe])
+        rt_st32(d + 0x208, 0x01010101u);
+    /* white and opaque, no added colour: 0 (the code reuses the register for
+     * those bytes); else 1 */
+    if (ob[0xdc] == 0xff && ob[0xdd] == 0xff && ob[0xde] == 0xff && w9 == 0xff && !ob[0xd8] && !ob[0xd9] &&
+        !ob[0xda] && !ob[0xdb])
+        w9 = 0;
+    else
+        w9 = 1;
+    const uint64_t pal = lp(O + 0xd0);
+    if (pal) {
+        const int32_t w10 = (int32_t)rt_ld32(GP(pal + 0x30));
+        const int lt = lp(0x60210c0) != 0 ? w10 < 0 : 1;
+        w9 |= lt ? 8u : 24u;
+    }
+    {
+        const float a = ldfp(O + 0x98), b = ldfp(O + 0x9c);
+        if (a < b) {
+            const float e = ldfp(O + 0xa0), f = ldfp(O + 0xa4);
+            w9 |= e <= f ? 2u : 4u;
+        }
+    }
+    /* the material: the flags hashed into the 256-slot table */
+    uint32_t w10 = 0xdeadc42cu, w11 = 0x8ef4c855u, w12 = w9 + w10, w13, w14;
+    w12 ^= w11;
+    w12 += 0x59bd5389u;
+    w10 = w12 ^ 0xdeadc42cu;
+    w13 = w10 - rotr32_(w12, 7);
+    w11 = w13 ^ w11;
+    w14 = rotr32_(w13, 16);
+    const uint64_t table = lp(0x60204b0);
+    w11 -= w14;
+    w12 = w11 ^ w12;
+    w12 -= rotr32_(w11, 28);
+    w13 = w12 ^ w13;
+    w12 = w13 - rotr32_(w12, 18);
+    w11 = w12 ^ w11;
+    w11 -= w12 >> 8;
+    uint32_t slot;
+    for (;; w11++) {
+        slot = w11 & 0xff;
+        if (rt_ld32(GP(table + 8 * (uint64_t)slot)) == w9)
+            break;
+    }
+    const uint32_t mat = rt_ld32(GP(table + 8 * (uint64_t)slot + 4));
+    memcpy(d, GP(0x5ea1670 + 8 * (uint64_t)mat), 8);
+    rt_st32(d + 0xf8, 0x200);
+    memcpy(d + 0x100, &tex, 8);
+    d[0x1b8] = ob[0xff] ^ 1;
+    d[0x1b9] = 1;
+    d[0x1ba] = 0;
+    d[0x1bb] = 0x80;
+    /* 0x100 bytes of the command list's memory for the constants */
+    uint64_t cl = lp(0x6039f88), blk = lp(cl + 0x50), cb = 0;
+    int have = 0;
+    if (blk) {
+        cb = lp(blk + 8);
+        have = blk - cb + 0x80000 > 0xff;
+    }
+    if (!have) {
+        const uint64_t alloc = lp(0x6039f60);
+        c->x[0] = alloc;
+        c->x[1] = 0x80000;
+        c->x[2] = 0x100;
+        c->x[3] = 0;
+        c->x[4] = 0;
+        c->x[5] = 0;
+        static const GuestFunc *ic;
+        RT_CALL_IC(c, lp(lp(alloc)), ic);
+        blk = c->x[0];
+        memset(GP(blk), 0, 8);
+        const uint64_t top = blk + 0x100;
+        memcpy(GP(blk + 8), &top, 8);
+        memset(GP(blk + 0x10), 0, 8);
+        uint64_t link = lp(cl + 0x50);
+        if (!link)
+            link = cl + 0x48;
+        memcpy(GP(link), &blk, 8);
+        memcpy(GP(cl + 0x50), &blk, 8);
+        cb = lp(blk + 8);
+        cl = lp(0x6039f88);
+    }
+    {
+        const uint64_t top = cb + 0x100;
+        memcpy(GP(blk + 8), &top, 8);
+        const uint64_t cur = lp(cl + 0x50);
+        memcpy(d + 0x50, &cur, 8);
+        memcpy(d + 0x58, &cb, 8);
+        memcpy(d + 0x60, GP(0x1d4e160), 8);
+    }
+    c->x[0] = fr;
+    c->x[1] = lp(O + 8);
+    c->x[2] = lp(CTX + 8);
+    c->x[3] = ob[0xe0];
+    f_1b6a48(c);
+    float *k = GP(cb);
+    memcpy(k, GP(c->x[0]), 64);
+    {   /* the offset snapped to whole pixels */
+        const float s1 = ldfp(0x6039f5c), s0 = ldfp(0x6039f58);
+        float v2[2];
+        const float ox = ldfp(O + 0xac), oy = ldfp(O + 0xb0);
+        if (ox != 0.0f || oy != 0.0f || ox != ox || oy != oy) {
+            const float o[2] = { ox, oy };
+            for (int i = 0; i < 2; i++) {
+                float t = o[i] * s1;
+                t = t + 0.5f;
+                t = floorf(t);
+                t = t * s0;
+                t = t - o[i];
+                v2[i] = t + k[12 + i];
+            }
+        } else {
+            v2[0] = k[12];
+            v2[1] = k[13];
+        }
+        for (int i = 0; i < 2; i++) {
+            float t = v2[i] * s1;
+            t = t + 0.5f;
+            t = floorf(t);
+            k[12 + i] = t * s0;
+        }
+    }
+    for (int i = 0; i < 4; i++) {
+        k[16 + i] = (float)ob[0xdc + i] / 255.0f;
+        k[20 + i] = (float)ob[0xd8 + i] / 255.0f;
+    }
+    if (pal) {
+        c->x[0] = pal;
+        c->x[1] = D;
+        c->x[2] = cb + 0x60;
+        f_1b5b10(c);
+        d = GP(D);
+        k = GP(cb);
+    }
+    const uint64_t pal2 = lp(O + 0xe8);
+    if (pal2) {
+        rt_st32(d + 0x128, 0x202);
+        memcpy(d + 0x130, &pal2, 8);
+        k[28] = ldfp(O + 0xf0);
+        k[29] = ldfp(O + 0xf0);
+    }
+    {
+        const float a = ldfp(O + 0x98), b = ldfp(O + 0x9c);
+        if (a < b) {
+            k[28] = a;
+            k[29] = ldfp(O + 0x9c);
+            const float e = ldfp(O + 0xa0), f = ldfp(O + 0xa4);
+            k[30] = e < f ? e : f;
+            k[31] = e > f ? e : f;
+        }
+    }
+    d[0x1e9] = 0;
+    {
+        const uint64_t z = 0, a = lp(0x603a548), b = lp(O + 0xc0), e = lp(0x604dc38);
+        memcpy(d + 0x18, &z, 8);
+        memcpy(d + 0x20, &a, 8);
+        memcpy(d + 0x8, &b, 8);
+        memcpy(d + 0x10, &z, 8);
+        memcpy(d + 0x28, &e, 8);
+    }
+    rt_st32(d + 0x210, rt_ld32(GP(O + 0xc8)) * 6u >> 2);
+    rt_st32(d + 0x214, rt_ld32(GP(O + 0xcc)) * 6u >> 2);
+    rt_st32(d + 0x218, 1);
+    rt_st32(d + 0x21c, rt_ld32(d + 0x21c) | 1);
+    const uint8_t sa8 = ob[0xa8];
+    if (sa8) {
+        d[0x206] = 1;
+        rt_st16(d + 0x1fe, 2);
+        rt_st16(d + 0x202, 2);
+        d[0x1f9] = ob[0xaa];
+        d[0x1fa] = ob[0xaa];
+        d[0x1fb] = sa8;
+    }
+    const uint8_t sa9 = ob[0xa9];
+    if (sa9 != 0xff) {
+        d[0x206] = 1;
+        d[0x1ff] = 3;
+        d[0x203] = 3;
+        d[0x1f9] = ob[0xaa];
+        d[0x1fa] = ob[0xaa];
+        d[0x1fb] = sa9;
+    }
+    c->x[0] = cmdlist;
+    c->x[1] = D;
+    f_1df70c(c);
+    c->sp = saved_sp;
+}
+/* MINA_VERIFY_CUTTER: each sprite's draw call made by both, captured at
+ * ycRenderCmdList::DrawCall (not drawn), compared (the struct but its constant
+ * pointers, and the 0x100 bytes of constants), then the native's is drawn */
+void f_1df70c_orig(Ctx *c);
+static int cutter_capture;           /* 1, 2: the call that DrawCall records */
+static uint8_t cutter_dc[2][0x220], cutter_k[2][0x100];
+static uint64_t cutter_list[2];
+void nat__ZN15ycRenderCmdList8DrawCallEPK16ycRenderDrawCall(Ctx *c)
+{
+    if (cutter_capture) {
+        const int k = cutter_capture - 1;
+        memcpy(cutter_dc[k], G(c->x[1]), 0x220);
+        uint64_t kp;
+        memcpy(&kp, cutter_dc[k] + 0x58, 8);
+        memcpy(cutter_k[k], G(kp), 0x100);
+        cutter_list[k] = c->x[0];
+        return;
+    }
+    f_1df70c_orig(c);
+}
+void nat__ZN24ycCutterAnimRenderObject6RenderERKN14ycRenderObject9RenderCtxE(Ctx *c)
+{
+    static int verify = -1;
+    if (verify < 0)
+        verify = getenv("MINA_VERIFY_CUTTER") != NULL;
+    if (!verify) {
+        cutter_render(c);
+        return;
+    }
+    static uint32_t checked, bad;
+    Ctx save = *c;
+    memset(cutter_dc, 0, sizeof cutter_dc);
+    cutter_capture = 1;
+    cutter_render(c);
+    *c = save;
+    cutter_capture = 2;
+    f_d589c_orig(c);
+    cutter_capture = 0;
+    checked++;
+    uint8_t a[0x220], b[0x220];
+    memcpy(a, cutter_dc[0], sizeof a);
+    memcpy(b, cutter_dc[1], sizeof b);
+    memset(a + 0x50, 0, 16);         /* the constants' block and address */
+    memset(b + 0x50, 0, 16);
+    memset(cutter_k[0] + 0x68, 0, 8);   /* written by neither (SetOnDrawCall writes 0x60..0x67) */
+    memset(cutter_k[1] + 0x68, 0, 8);
+    memset(cutter_k[0] + 0x80, 0, 0x80);
+    memset(cutter_k[1] + 0x80, 0, 0x80);
+    if ((memcmp(a, b, sizeof a) || memcmp(cutter_k[0], cutter_k[1], 0x100) || cutter_list[0] != cutter_list[1]) &&
+        bad++ < 10) {
+        int i = 0;
+        while (i < 0x220 && a[i] == b[i])
+            i++;
+        int j = 0;
+        while (j < 0x100 && cutter_k[0][j] == cutter_k[1][j])
+            j++;
+        rt_log("[verify] cutter render differs: draw call byte %#x (%#x/%#x), constants byte %#x\n", i,
+               i < 0x220 ? a[i] : 0, i < 0x220 ? b[i] : 0, j);
+    }
+    if ((checked & 0x3ff) == 0)
+        rt_log("[verify] cutter render: %u checked, %u differ\n", checked, bad);
+    if (cutter_dc[0][0] || cutter_list[0]) {     /* the native's draw call, drawn */
+        memcpy(G(save.sp - 0x2b0 + 0x40), cutter_dc[0], 0x220);
+        c->x[0] = cutter_list[0];
+        c->x[1] = save.sp - 0x2b0 + 0x40;
+        const uint64_t sp = c->sp;
+        c->sp = save.sp - 0x2b0;
+        f_1df70c_orig(c);
+        c->sp = sp;
+    }
 }
