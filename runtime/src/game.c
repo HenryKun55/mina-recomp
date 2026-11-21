@@ -1657,6 +1657,8 @@ void f_1b6a48(Ctx *c);     /* ycRenderUtils::CalcBillboardMtx */
 void f_1b5b10(Ctx *c);     /* ycPaletteTexture::SetOnDrawCall */
 void f_1df70c(Ctx *c);     /* ycRenderCmdList::DrawCall */
 static inline uint32_t rotr32_(uint32_t v, int n) { return v >> n | v << (32 - n); }
+static uint64_t cmdlist_alloc(Ctx *c, uint64_t L);
+static int cutter_direct = 1;     /* the draw call made in the command list's entry (0: on the stack, then copied) */
 static void cutter_render(Ctx *c)
 {
     GM_BEGIN;
@@ -1670,11 +1672,16 @@ static void cutter_render(Ctx *c)
     const uint64_t tex = lp(O + 0xb8);
     if (!tex)
         return;
-    const uint64_t saved_sp = c->sp, fr = saved_sp - 0x2b0, D = fr + 0x40;
+    const uint64_t saved_sp = c->sp, fr = saved_sp - 0x2b0;
     c->sp = fr;
+    const uint64_t cmdlist = lp(CTX + 0x10);
+    uint64_t entry = 0, D = fr + 0x40;
+    if (cutter_direct) {
+        entry = cmdlist_alloc(c, cmdlist);
+        D = entry + 8;
+    }
     uint8_t *d = GP(D);
     memcpy(d, GP(CTX + 0xb0), 0x220);
-    const uint64_t cmdlist = lp(CTX + 0x10);
     if (ob[0xfe])
         rt_st32(d + 0x208, 0x01010101u);
     /* white and opaque, no added colour: 0 (the code reuses the register for
@@ -1861,18 +1868,21 @@ static void cutter_render(Ctx *c)
         d[0x1fa] = ob[0xaa];
         d[0x1fb] = sa9;
     }
-    c->x[0] = cmdlist;
-    c->x[1] = D;
-    f_1df70c(c);
+    if (entry) {
+        memcpy(GP(entry), GP(0x1d4e3b8), 8);
+    } else {
+        c->x[0] = cmdlist;
+        c->x[1] = D;
+        f_1df70c(c);
+    }
     c->sp = saved_sp;
 }
 /* ycRenderCmdList::DrawCall: 0x228 bytes of the list's current block (a new
  * block, or the next one already made, when it is full): a header, then the
  * draw call as is */
-static void cmdlist_draw_call(Ctx *c)
+static uint64_t cmdlist_alloc(Ctx *c, uint64_t L)
 {
     GM_BEGIN;
-    const uint64_t L = c->x[0], dc = c->x[1];
     uint64_t e, left = lp(L + 0x28);
     if (left >= 0x228) {
         e = lp(L + 0x20);
@@ -1919,6 +1929,13 @@ static void cmdlist_draw_call(Ctx *c)
     }
     left -= 0x228;
     memcpy(GP(L + 0x28), &left, 8);
+    return e;
+}
+static void cmdlist_draw_call(Ctx *c)
+{
+    GM_BEGIN;
+    const uint64_t L = c->x[0], dc = c->x[1];
+    const uint64_t e = cmdlist_alloc(c, L);
     memcpy(GP(e), GP(0x1d4e3b8), 8);
     memcpy(GP(e + 8), GP(dc), 0x220);
 }
@@ -1953,6 +1970,7 @@ void nat__ZN24ycCutterAnimRenderObject6RenderERKN14ycRenderObject9RenderCtxE(Ctx
         return;
     }
     static uint32_t checked, bad;
+    cutter_direct = 0;
     Ctx save = *c;
     memset(cutter_dc, 0, sizeof cutter_dc);
     cutter_capture = 1;
