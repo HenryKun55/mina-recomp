@@ -2239,6 +2239,13 @@ void metal_present(uint64_t drawable)
                        g_depth_restarts / (double)frames);
                 g_composites = g_bounds = 0;
                 g_depth_fs_draws = g_depth_restarts = 0;
+                {
+                    extern uint32_t g_recalcs, g_recalc_same;
+                    if (g_recalcs)
+                        rt_log("[fps]   %u world transform recalculations a frame, %u unchanged\n", g_recalcs / frames,
+                               g_recalc_same / frames);
+                    g_recalcs = g_recalc_same = 0;
+                }
                 extern uint64_t g_draw_ns, g_endenc_ns, g_present_sem_ns;
                 extern uint32_t g_draw_calls;
                 rt_log("[fps]   render: %u draws %.1f ms, pass ends %.1f ms; presenting thread blocked %.1f ms; "

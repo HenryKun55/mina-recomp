@@ -14,10 +14,14 @@ V3=${MINA_VITA3K:-$HOME/Documents/workspace/games/vita3k-mina}
 DATA="$V3/fs/ux0/data/mina"
 { echo "MINA_FPS=1"; for kv in "$@"; do echo "$kv"; done; } > "$DATA/env.txt"
 pkill -9 -f "Vita3K -c .* -r MINA00001" 2>/dev/null
+# a new game every time (the save moves on as it is played)
+rm -f "$V3/fs/ux0/data/Yacht Club Games/Mina the Hollower (recomp)/saveData.yc"
 (MHZ=${MHZ:-240} GPU_SCALE=${GPU_SCALE:-0} "$ROOT/tools/run_vita3k.sh" 3000 > /dev/null 2>&1 &)
 sleep 5
 "$ROOT/tools/vita/drive.py" 900 | tail -1 || exit 1
 sleep 3
+# KEYS="left:1 x ...": played first (tools/vita/vkey.sh), e.g. to start the fire on the deck
+[ -n "${KEYS:-}" ] && "$ROOT/tools/vita/vkey.sh" "" $KEYS
 cp "$ROOT/build-vita/vita3k-profile.txt" "$ROOT/build-vita/deck-base.txt"
 n0=$(/usr/bin/grep -ac "" "$DATA/mina.log")
 sleep "$SECS"

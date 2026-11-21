@@ -52,6 +52,7 @@ static inline void put_box(void *dst, const float *b)
 uint32_t g_fixed_updates, g_updates;
 uint64_t g_fixed_us, g_update_us;
 uint32_t g_composites, g_bounds;        /* calls (MINA_FPS) */
+uint32_t g_recalcs, g_recalc_same;      /* RecalcWorldTransform runs, and those whose matrix came out unchanged (MINA_RECALC_STATS) */
 /* gameplay (as opposed to menus and cut-scenes): fixed updates moving
  * thousands of transforms for a second; MINA_INPUT_UNTIL_PLAY stops the
  * scripted keys there */
@@ -513,6 +514,16 @@ static void recalc_world_transform(Ctx *c)
     const float sx = L->s[0], sy = L->s[1], sz = L->s[2];
     const float m[16] = { m00 * sx, m01 * sx, m02 * sx, 0.0f * sx, m10 * sy, m11 * sy, m12 * sy, 0.0f * sy,
                           m20 * sz, m21 * sz, m22 * sz, 0.0f * sz, L->t[0], L->t[1], L->t[2], 1.0f };
+    {
+        static int st = -1;
+        if (st < 0)
+            st = getenv("MINA_RECALC_STATS") != NULL;
+        if (st) {
+            g_recalcs++;
+            if (!memcmp(GP(lp(O + 0x60)), m, 64))
+                g_recalc_same++;
+        }
+    }
     stfp(lp(O + 0xa0) + 4, hook);
     for (int k = 1; k < 4; k++) {
         uint64_t p = lp(O + 0xa0 + 8 * k);
@@ -636,9 +647,19 @@ static void caller_count(CallerHist *h, const void *ra)
     memset(h->count, 0, sizeof h->count);
 }
 
+void nat__ZN8GameAnim20RecalcWorldTransformERK11ycTransformS2_(Ctx *c);
+static int native_off_rwt;        /* MINA_NO_NATIVES covers GameAnim::RecalcWorldTransform: through its entry */
 static void refresh_world_transform(Ctx *c)
 {
     GM_BEGIN;
+    {
+        static int init;
+        if (!init) {
+            init = 1;
+            int rt_native_off(const char *name);
+            native_off_rwt = rt_native_off("__ZN8GameAnim20RecalcWorldTransformERK11ycTransformS2_");
+        }
+    }
     const uint64_t E = c->x[0];
     const uint64_t saved_sp = c->sp, sp = saved_sp - 0xb0;
     c->sp = sp;
@@ -705,10 +726,16 @@ static void refresh_world_transform(Ctx *c)
                     caller_count(&h, (const void *)cpu_lookup((uint32_t)lp(lp(comp) + 0x48)));
                 }
             }
+            const uint64_t fn = lp(lp(comp) + 0x48);
+            if (fn == 0x109eb48)              /* ycComponent::RecalcWorldTransform: an empty function */
+                continue;
             c->x[0] = comp;
             c->x[1] = E + 0xc0;
             c->x[2] = sp + 0x50;
-            RT_CALL_IC(c, lp(lp(comp) + 0x48), ic);
+            if (fn == 0x19a65c4 && !native_off_rwt)   /* GameAnim::RecalcWorldTransform: the native, directly */
+                nat__ZN8GameAnim20RecalcWorldTransformERK11ycTransformS2_(c);
+            else
+                RT_CALL_IC(c, fn, ic);
         }
     }
     c->sp = saved_sp;
@@ -1432,23 +1459,26 @@ static struct { uint32_t comp; uint8_t k; } arm_hash[64];
 static inline uint32_t arm_slot(uint32_t comp) { return (comp >> 4) * 2654435761u >> 26; }
 static struct { uint64_t a1, a2; uint32_t seq; } arm_pend[32];
 static uint32_t arm_seq;
+static int arm_npending;          /* segments with a pending recalculation */
+static int arm_find(uint32_t comp)
+{
+    for (uint32_t h = arm_slot(comp);; h = (h + 1) & 63) {
+        if (!arm_hash[h].k)
+            return -1;
+        if (arm_hash[h].comp == comp)
+            return arm_hash[h].k - 1;
+    }
+}
 
 static int arm_defer(Ctx *c)
 {
     if (!arm_active)
         return 0;
-    const uint32_t comp = (uint32_t)c->x[0];
-    int k = -1;
-    for (uint32_t h = arm_slot(comp);; h = (h + 1) & 63) {
-        if (!arm_hash[h].k)
-            break;
-        if (arm_hash[h].comp == comp) {
-            k = arm_hash[h].k - 1;
-            break;
-        }
-    }
+    const int k = arm_find((uint32_t)c->x[0]);
     if (k < 0)
         return 0;
+    if (!arm_pend[k].seq)
+        arm_npending++;
     arm_pend[k].a1 = c->x[1];
     arm_pend[k].a2 = c->x[2];
     arm_pend[k].seq = ++arm_seq;
@@ -1459,6 +1489,8 @@ static int arm_defer(Ctx *c)
 }
 static void arm_flush(Ctx *c)
 {
+    if (!arm_npending)
+        return;
     int order[32], n = 0;
     for (int k = 0; k < 32; k++) {   /* pending ones by their last call */
         if (!arm_pend[k].seq)
@@ -1475,6 +1507,7 @@ static void arm_flush(Ctx *c)
     const uint64_t x0 = c->x[0], x1 = c->x[1], x2 = c->x[2];
     const uint64_t active = arm_active;
     arm_active = 0;                  /* these run */
+    arm_npending = 0;
     for (int i = 0; i < n; i++) {
         const int k = order[i];
         arm_pend[k].seq = 0;
@@ -1503,9 +1536,37 @@ static void arm_flush(Ctx *c)
     c->x[1] = x1;
     c->x[2] = x2;
 }
+/* one segment's bounds: its own pending recalculation runs (the others wait:
+ * each is a function of its own inputs); any other object's: all of them */
+static void arm_flush_one(Ctx *c, int k)
+{
+    if (!arm_pend[k].seq || verify_xform()) {
+        if (verify_xform())
+            arm_flush(c);
+        return;
+    }
+    const uint64_t x0 = c->x[0], x1 = c->x[1], x2 = c->x[2];
+    const uint64_t active = arm_active;
+    arm_active = 0;
+    arm_pend[k].seq = 0;
+    arm_npending--;
+    c->x[0] = arm_seg[k];
+    c->x[1] = arm_pend[k].a1;
+    c->x[2] = arm_pend[k].a2;
+    recalc_world_transform(c);
+    arm_ran++;
+    arm_active = active;
+    c->x[0] = x0;
+    c->x[1] = x1;
+    c->x[2] = x2;
+}
 void nat__ZN8GameAnim13GetFrameBoundEb(Ctx *c)
 {
-    arm_flush(c);
+    const int k = arm_active ? arm_find((uint32_t)c->x[0]) : -1;
+    if (k >= 0)
+        arm_flush_one(c, k);
+    else
+        arm_flush(c);
     f_9a6dc4_orig(c);
 }
 void nat__ZN16ShipIntroBossArm11ApplySplineEv(Ctx *c)
