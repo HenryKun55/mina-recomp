@@ -1421,6 +1421,9 @@ static uint32_t arm_skipped, arm_ran, arm_calls;
 /* the segments' components (read when the arm starts), and per segment its
  * pending recalculation: arguments and the order of its last call (0: none) */
 static uint64_t arm_seg[32];
+/* component -> segment + 1, open addressing (64 slots), made when the arm starts */
+static struct { uint32_t comp; uint8_t k; } arm_hash[64];
+static inline uint32_t arm_slot(uint32_t comp) { return (comp >> 4) * 2654435761u >> 26; }
 static struct { uint64_t a1, a2; uint32_t seq; } arm_pend[32];
 static uint32_t arm_seq;
 
@@ -1428,11 +1431,17 @@ static int arm_defer(Ctx *c)
 {
     if (!arm_active)
         return 0;
-    const uint64_t comp = c->x[0];
-    int k = 0;
-    while (k < 32 && arm_seg[k] != comp)
-        k++;
-    if (k == 32)
+    const uint32_t comp = (uint32_t)c->x[0];
+    int k = -1;
+    for (uint32_t h = arm_slot(comp);; h = (h + 1) & 63) {
+        if (!arm_hash[h].k)
+            break;
+        if (arm_hash[h].comp == comp) {
+            k = arm_hash[h].k - 1;
+            break;
+        }
+    }
+    if (k < 0)
         return 0;
     arm_pend[k].a1 = c->x[1];
     arm_pend[k].a2 = c->x[2];
@@ -1504,8 +1513,19 @@ void nat__ZN16ShipIntroBossArm11ApplySplineEv(Ctx *c)
     }
     {
         GM_BEGIN;
-        for (int k = 0; k < 32; k++)
+        memset(arm_hash, 0, sizeof arm_hash);
+        for (int k = 0; k < 32; k++) {
             arm_seg[k] = lp(c->x[0] + 0x510 + 0x28 * k);
+            if (!arm_seg[k])
+                continue;
+            uint32_t h = arm_slot((uint32_t)arm_seg[k]);
+            while (arm_hash[h].k && arm_hash[h].comp != (uint32_t)arm_seg[k])
+                h = (h + 1) & 63;
+            if (!arm_hash[h].k) {          /* (a component twice: its first segment, as the scan found) */
+                arm_hash[h].comp = (uint32_t)arm_seg[k];
+                arm_hash[h].k = (uint8_t)(k + 1);
+            }
+        }
     }
     arm_active = c->x[0];
     f_66e660_orig(c);
