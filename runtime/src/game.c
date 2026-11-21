@@ -811,6 +811,7 @@ void f_1e0ca0(Ctx *c);           /* ycRenderPass::SetMaxVisibleObjects */
 void f_1e13ac_orig(Ctx *c);
 
 typedef struct { float x, y, z, w; } Plane;
+typedef struct { float x, y, z, w, ax, ay, az; } PlaneA;
 static inline float fabs_sel(float v) { return v > 0.0f ? v : -v; }
 static void make_plane(Plane *p, float x, float y, float z, float w)
 {
@@ -876,19 +877,6 @@ static void grow_bounds_vis(float *bc, float *be, const float *box)
     be[2] = dz * 0.5f;
     bc[2] = lo_z + be[2];
 }
-static int plane_culls(const Plane *p, const float *box)
-{
-    if (__builtin_fabsf(p->w) == __builtin_inff())
-        return 0;
-    const float ax = fabs_sel(p->x), ay = fabs_sel(p->y), az = fabs_sel(p->z);
-    float d = p->x * box[0];
-    d = d + box[1] * p->y;
-    d = d + box[2] * p->z;
-    float r = ax * box[3];
-    r = r + ay * box[4];
-    r = r + az * box[5];
-    return d + r < p->w;
-}
 
 /* MINA_RPU_STATS: per 60 calls of ycRenderPass::Update, objects seen, culled,
  * keyed (by a call) and sorted, and the time in the scan and the sort */
@@ -939,6 +927,16 @@ static void render_pass_update(Ctx *c)
         make_plane(&P[3], M[0][3] - M[0][0], M[1][3] - M[1][0], M[2][3] - M[2][0], M[3][3] - M[3][0]);
         make_plane(&P[4], M[0][3] - M[0][1], M[1][3] - M[1][1], M[2][3] - M[2][1], M[3][3] - M[3][1]);
         make_plane(&P[5], M[0][3] + M[0][1], M[1][3] + M[1][1], M[2][3] + M[2][1], M[3][3] + M[3][1]);
+        /* the planes that can cull (not at infinity), with their absolute normals:
+         * plane_culls's operations, what does not depend on the box done once */
+        PlaneA act[6];
+        int nact = 0;
+        for (int k = 0; k < 6; k++) {
+            if (__builtin_fabsf(P[k].w) == __builtin_inff())
+                continue;
+            act[nact] = (PlaneA){ P[k].x, P[k].y, P[k].z, P[k].w, fabs_sel(P[k].x), fabs_sel(P[k].y), fabs_sel(P[k].z) };
+            nact++;
+        }
         /* bounds of all objects: empty */
         float *abm = GP(RP + 0xb0 + 0x18 * v);        /* center 3, extent 3 */
         const float neg_max = hexf(0xfe7fffff);
@@ -973,8 +971,16 @@ static void render_pass_update(Ctx *c)
                     continue;
                 if (f & 1) {
                     int culled = 0;
-                    for (int k = 0; k < 6 && !culled; k++)
-                        culled = plane_culls(&P[k], box);
+                    for (int k = 0; k < nact && !culled; k++) {
+                        const PlaneA *q = &act[k];
+                        float dd = q->x * box[0];
+                        dd = dd + box[1] * q->y;
+                        dd = dd + box[2] * q->z;
+                        float r = q->ax * box[3];
+                        r = r + q->ay * box[4];
+                        r = r + q->az * box[5];
+                        culled = dd + r < q->w;
+                    }
                     if (culled) {
                         if (stats)
                             rpu.culled++;
