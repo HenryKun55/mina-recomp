@@ -40,6 +40,17 @@ static inline void put_mat(void *dst, const float *m)
     vst1q_f32(d + 8, c);
     vst1q_f32(d + 12, e);
 }
+/* a draw call (0x220 bytes) with NEON: memcpy goes to sceClibMemcpy */
+static inline void copy_dc(void *dst, const void *src)
+{
+    uint8_t *d = dst;
+    const uint8_t *q = src;
+    for (int i = 0; i < 0x220; i += 32) {
+        const uint8x16_t a = vld1q_u8(q + i), b = vld1q_u8(q + i + 16);
+        vst1q_u8(d + i, a);
+        vst1q_u8(d + i + 16, b);
+    }
+}
 static inline void put_box(void *dst, const float *b)
 {
     float *d = dst;
@@ -951,8 +962,13 @@ static void rpu_sort(uint8_t *gm_, uint64_t RP, uint32_t v, uint32_t n)
         }
         return;
     }
-    memcpy(ka, keys, 4 * (size_t)n);
-    memcpy(oa, GP(o0), 8 * (size_t)n);
+    {
+        const uint8_t *ob8 = GP(o0);
+        for (uint32_t j = 0; j < n; j++) {
+            ka[j] = keys[j];
+            memcpy(&oa[j], ob8 + 8 * j, 8);
+        }
+    }
     uint32_t *sk = ka, *dk = kb;
     uint64_t *so = oa, *dob = ob;
     for (uint32_t w = 1;; w *= 2) {
@@ -982,8 +998,14 @@ static void rpu_sort(uint8_t *gm_, uint64_t RP, uint32_t v, uint32_t n)
         if (2 * w >= n)
             break;
     }
-    memcpy(GP(k0), sk, 4 * (size_t)n);
-    memcpy(GP(o0), so, 8 * (size_t)n);
+    {
+        uint32_t *kd = GP(k0);
+        uint8_t *od = GP(o0);
+        for (uint32_t j = 0; j < n; j++) {
+            kd[j] = sk[j];
+            memcpy(od + 8 * j, &so[j], 8);
+        }
+    }
 }
 static void render_pass_update(Ctx *c)
 {
@@ -1784,7 +1806,7 @@ static void cutter_render(Ctx *c)
         D = entry + 8;
     }
     uint8_t *d = GP(D);
-    memcpy(d, GP(CTX + 0xb0), 0x220);
+    copy_dc(d, GP(CTX + 0xb0));
     if (ob[0xfe])
         rt_st32(d + 0x208, 0x01010101u);
     /* white and opaque, no added colour: 0 (the code reuses the register for
@@ -1885,7 +1907,7 @@ static void cutter_render(Ctx *c)
         mtx = c->x[0];
     }
     float *k = GP(cb);
-    memcpy(k, GP(mtx), 64);
+    put_mat(k, GP(mtx));
     {   /* the offset snapped to whole pixels */
         const float s1 = ldfp(0x6039f5c), s0 = ldfp(0x6039f58);
         float v2[2];
@@ -2040,7 +2062,7 @@ static void cmdlist_draw_call(Ctx *c)
     const uint64_t L = c->x[0], dc = c->x[1];
     const uint64_t e = cmdlist_alloc(c, L);
     memcpy(GP(e), GP(0x1d4e3b8), 8);
-    memcpy(GP(e + 8), GP(dc), 0x220);
+    copy_dc(GP(e + 8), GP(dc));
 }
 
 /* MINA_VERIFY_CUTTER: each sprite's draw call made by both, captured at
