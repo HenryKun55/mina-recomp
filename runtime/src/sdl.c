@@ -463,31 +463,111 @@ static void test_resize(void)
     window_resize(sdl_main_window(), w, h);
     rt_log("[win] test resize to %dx%d\n", w, h);
 }
+/* "vita:<button>" in MINA_INPUT: held buttons of the Vita's own pad, read by
+ * SDL through sceCtrlPeekBufferPositive2 (wrapped at link time): the game gets
+ * them exactly as the real pad's */
+static uint32_t script_buttons;
+static int script_ly, script_lx;      /* left stick offset from the centre */
+#if defined(__vita__)
+#include <psp2/ctrl.h>
+int __real_sceCtrlPeekBufferPositive2(int port, SceCtrlData *pad, int count);
+int __wrap_sceCtrlPeekBufferPositive2(int port, SceCtrlData *pad, int count)
+{
+    const int r = __real_sceCtrlPeekBufferPositive2(port, pad, count);
+    if (r > 0 && pad && port <= 1) {
+        pad->buttons |= script_buttons;
+        if (script_ly)
+            pad->ly = (uint8_t)(128 + script_ly);
+        if (script_lx)
+            pad->lx = (uint8_t)(128 + script_lx);
+    }
+    return r;
+}
+#endif
+static int vita_button(const char *n)
+{
+    static const struct { const char *name; uint32_t bit; } b[] = {
+        { "select", 0x1 }, { "start", 0x8 }, { "up", 0x10 }, { "right", 0x20 }, { "down", 0x40 }, { "left", 0x80 },
+        { "l", 0x100 }, { "r", 0x200 }, { "triangle", 0x1000 }, { "circle", 0x2000 }, { "cross", 0x4000 },
+        { "square", 0x8000 },
+        { "lup", 0x10000001 }, { "ldown", 0x10000002 }, { "lleft", 0x10000003 }, { "lright", 0x10000004 },
+    };
+    for (size_t i = 0; i < sizeof b / sizeof b[0]; i++)
+        if (!strcmp(n, b[i].name))
+            return (int)b[i].bit;
+    return 0;
+}
+
+/* MINA_LEVELS: the level table Game::Init fills (names for -loadlevel), once */
+static void levels_dump(void)
+{
+    static int done;
+    if (done || !getenv("MINA_LEVELS") || SDL_GetTicks() < 15000)
+        return;
+    done = 1;
+    const uint32_t tab = GUEST_IMAGE_BASE + 0x05044f68u;   /* Mach-O 0x105044f68: entries (72 bytes), then the count */
+    const uint32_t base = (uint32_t)rt_ld64(G(tab));
+    const int count = (int)(int32_t)rt_ld64(G(tab + 8));
+    rt_log("[levels] %d\n", count);
+    for (int i = 0; i < count && i < 400; i++) {
+        const uint32_t name = (uint32_t)rt_ld64(G(base + 72u * (uint32_t)i + 0x30));
+        rt_log("[levels] %d %s\n", i, name ? (const char *)G(name) : "-");
+    }
+}
 static void scripted_input(void)
 {
     test_resize();
+    levels_dump();
     static Uint32 last_mem;
     if (getenv("MINA_MEMSTAT") && SDL_GetTicks() - last_mem > 5000) {
         last_mem = SDL_GetTicks();
         mem_report();
     }
     static int parsed, n, next;
-    static struct { Uint32 at; SDL_Scancode sc; int up; } ev[256];
+    /* "pad:<button>" (SDL game controller names: a, b, x, y, start, dpdown...):
+     * the first controller's button, as its events (what the Vita's pad sends) */
+    static struct { Uint32 at; SDL_Scancode sc; int up; int pad; Uint32 hold; } ev[512];
     if (!parsed) {
         parsed = 1;
         const char *s = getenv("MINA_INPUT");
-        while (s && *s && n < 254) {
+        while (s && *s && n < 510) {
             double t;
             char name[64];
             int len;
             if (sscanf(s, " %lf:%63[^ ]%n", &t, name, &len) != 2)
                 break;
-            SDL_Scancode sc = SDL_GetScancodeFromName(name);
+            /* "<name>/<seconds>": held that long (default 0.12) */
+            Uint32 hold = 120;
+            char *slash = strchr(name, '/');
+            if (slash) {
+                hold = (Uint32)(atof(slash + 1) * 1000);
+                *slash = 0;
+            }
+            int pad = -1;
+            SDL_Scancode sc = SDL_SCANCODE_UNKNOWN;
+            if (!strncmp(name, "pad:", 4))
+                pad = SDL_GameControllerGetButtonFromString(name + 4);
+            else if (!strncmp(name, "vita:", 5))
+                pad = 3000 + n / 2, ev[n].sc = (SDL_Scancode)vita_button(name + 5);
+            else if (!strncmp(name, "joy:", 4))
+                pad = 2000 + atoi(name + 4);     /* "joy:<n>": the joystick's button n */
+            else if (!strncmp(name, "axis:", 5) && strlen(name) > 6) {
+                /* "axis:lefty+" / "axis:leftx-": the stick pushed all the way */
+                const size_t l = strlen(name);
+                const int neg = name[l - 1] == '-';
+                name[l - 1] = 0;
+                pad = 1000 + SDL_GameControllerGetAxisFromString(name + 5) * 2 + neg;
+            } else
+                sc = SDL_GetScancodeFromName(name);
+            if (pad >= 3000)
+                sc = ev[n].sc;           /* the button's bit */
             ev[n].at = (Uint32)(t * 1000);
             ev[n].sc = sc;
+            ev[n].pad = pad;
             ev[n++].up = 0;
-            ev[n].at = (Uint32)(t * 1000) + 120;
+            ev[n].at = (Uint32)(t * 1000) + hold;
             ev[n].sc = sc;
+            ev[n].pad = pad;
             ev[n++].up = 1;
             s += len;
         }
@@ -505,6 +585,58 @@ static void scripted_input(void)
     while (next < n && SDL_GetTicks() >= ev[next].at) {
         SDL_Event e;
         memset(&e, 0, sizeof e);
+        if (ev[next].pad >= 3000) {
+            const uint32_t bit = (uint32_t)ev[next].sc;
+            const int up = ev[next].up;
+            if (bit >> 28) {
+                const int k = (int)(bit & 0xf), v = up ? 0 : 127;
+                if (k == 1) script_ly = -v;
+                if (k == 2) script_ly = v;
+                if (k == 3) script_lx = -v;
+                if (k == 4) script_lx = v;
+            } else if (up)
+                script_buttons &= ~bit;
+            else
+                script_buttons |= bit;
+            rt_log("[input] %s vita 0x%x\n", up ? "up" : "down", bit);
+            next++;
+            continue;
+        }
+        if (ev[next].pad >= 2000) {
+            e.type = ev[next].up ? SDL_JOYBUTTONUP : SDL_JOYBUTTONDOWN;
+            e.jbutton.which = SDL_NumJoysticks() > 0 ? SDL_JoystickGetDeviceInstanceID(0) : 0;
+            e.jbutton.button = (Uint8)(ev[next].pad - 2000);
+            e.jbutton.state = ev[next].up ? SDL_RELEASED : SDL_PRESSED;
+            e.jbutton.timestamp = SDL_GetTicks();
+            rt_log("[input] %s joy %d\n", ev[next].up ? "up" : "down", ev[next].pad - 2000);
+            SDL_PushEvent(&e);
+            next++;
+            continue;
+        }
+        if (ev[next].pad >= 1000) {
+            const int axis = (ev[next].pad - 1000) / 2, neg = (ev[next].pad - 1000) & 1;
+            e.type = SDL_CONTROLLERAXISMOTION;
+            e.caxis.which = SDL_NumJoysticks() > 0 ? SDL_JoystickGetDeviceInstanceID(0) : 0;
+            e.caxis.axis = (Uint8)axis;
+            e.caxis.value = ev[next].up ? 0 : neg ? -32768 : 32767;
+            e.caxis.timestamp = SDL_GetTicks();
+            rt_log("[input] axis %d = %d\n", axis, e.caxis.value);
+            SDL_PushEvent(&e);
+            next++;
+            continue;
+        }
+        if (ev[next].pad >= 0) {
+            e.type = ev[next].up ? SDL_CONTROLLERBUTTONUP : SDL_CONTROLLERBUTTONDOWN;
+            e.cbutton.which = SDL_NumJoysticks() > 0 ? SDL_JoystickGetDeviceInstanceID(0) : 0;
+            e.cbutton.button = (Uint8)ev[next].pad;
+            e.cbutton.state = ev[next].up ? SDL_RELEASED : SDL_PRESSED;
+            e.cbutton.timestamp = SDL_GetTicks();
+            rt_log("[input] %s pad %s\n", ev[next].up ? "up" : "down",
+                   SDL_GameControllerGetStringForButton((SDL_GameControllerButton)ev[next].pad));
+            SDL_PushEvent(&e);
+            next++;
+            continue;
+        }
         e.type = ev[next].up ? SDL_KEYUP : SDL_KEYDOWN;
         e.key.state = ev[next].up ? SDL_RELEASED : SDL_PRESSED;
         e.key.keysym.scancode = ev[next].sc;

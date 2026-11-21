@@ -103,6 +103,15 @@ int main(int argc, char **argv)
     gargs[gargc++] = (char *)exe;
     for (int k = 1; k < argc && gargc < 15; k++)
         gargs[gargc++] = argv[k];
+    {   /* MINA_ARGS="-loadlevel level_hub": more arguments (the Vita has no command line) */
+        const char *extra = getenv("MINA_ARGS");
+        static char buf[512];
+        if (extra) {
+            snprintf(buf, sizeof buf, "%s", extra);
+            for (char *tok = strtok(buf, " "); tok && gargc < 15; tok = strtok(NULL, " "))
+                gargs[gargc++] = tok;
+        }
+    }
     uint32_t gargv = guest_strv(gargc, gargs);
     char *noenv[1] = { NULL };
     uint32_t genvp = guest_strv(0, noenv);

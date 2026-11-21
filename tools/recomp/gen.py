@@ -110,6 +110,8 @@ class Program:
         self.func_end = dict(self.funcs)
 
         self.names = {}
+        self.ctx_sites = {}     # function -> [(callee or None, registers passed through)] (None: unknown)
+        self.ctx_entry = {}     # function -> registers read from the context at the entry (None: all)
         for s in m.symbols:
             if (s.type & 0x0E) == 0x0E and s.value in self.func_starts and s.name:
                 self.names.setdefault(s.value, s.name)
@@ -498,6 +500,7 @@ class Lower:
         self.test_mode = test_mode
         self.elide = set()
         self.sites = []             # store markers, by number: 'call' or 'tail'
+        self.site_callee = []       # per store marker: the recompiled function called directly, or None
         self.ins_lines = {}         # instruction -> (first, end) lines of self.out
         self.out = []
         self.xs = set()       # general registers referenced
@@ -673,22 +676,23 @@ class Lower:
 
     # -- calls and control flow -------------------------------------------------
 
-    def store_marker(self, kind):
+    def store_marker(self, kind, callee=None):
         """@STORE#k@: the stores before a call (finish() puts there the argument
         registers that may have changed since the last call; kind 'call': the
         path goes on after it, 'tail': it returns)."""
         k = len(self.sites)
         self.sites.append(kind)
+        self.site_callee.append(callee)
         return "@STORE#%d@" % k
 
-    def call_seq(self, call):
-        m = self.store_marker("call")
+    def call_seq(self, call, callee=None):
+        m = self.store_marker("call", callee)
         self.emit(m)
         self.emit(call)
         self.emit("@RELOAD#%s@" % m[7:-1])
 
-    def tail_seq(self, call):
-        self.emit(self.store_marker("tail"))
+    def tail_seq(self, call, callee=None):
+        self.emit(self.store_marker("tail", callee))
         self.emit(call)
         self.emit("return;")
 
@@ -791,7 +795,7 @@ class Lower:
             nxt = fn.end
             if nxt in self.p.func_starts:
                 self.emit("/* falls into the next function */")
-                self.tail_seq("%s(c);" % cname(nxt))
+                self.tail_seq("%s(c);" % cname(nxt), nxt)
             else:
                 self.emit("rt_bad_jump(c, 0x%xu, 0x%xull);" % (rel(last.addr), rel(nxt)))
         return self.finish()
@@ -826,6 +830,9 @@ class Lower:
         s_store, s_reload, s_ret = " ".join(store), " ".join(reload), " ".join(ret)
         site_stores = self.site_stores()
         entry_live, site_reloads = self.liveness()
+        self.p.ctx_entry[fn.start] = None if entry_live is None else frozenset(entry_live)
+        if self.sites and fn.start not in self.p.ctx_sites:
+            self.p.ctx_sites[fn.start] = None
 
         name = self.p.names.get(fn.start, "")
         lines = ["/* %s */" % name.replace("*/", "* /") if name else "/* sub_%x */" % fn.start,
@@ -937,13 +944,19 @@ class Lower:
         for b in range(nb):
             run_block(b, inn[b], True)
         res = {}
+        info = []
         for k in range(len(self.sites)):
             d = dirty_at.get(k, set())
             st = ["c->x[%d] = x%d;" % (r, r) for r in ARG_X if "x%d" % r in d and r in self.wx]
             st += ["c->v[%d] = v%d;" % (r, r) for r in ARG_V if "v%d" % r in d and r in self.wv]
             if self.wrote_sp:
                 st.append("c->sp = sp;")
-            res[k] = " ".join(st)
+            callee = self.site_callee[k] if k < len(self.site_callee) else None
+            stored = {t for t in d if (t[0] == "x" and int(t[1:]) in self.wx) or (t[0] == "v" and int(t[1:]) in self.wv)}
+            # what the callee finds in the context as it was at the entry: a pass-through
+            info.append((callee, frozenset(args - stored)))
+            res[k] = ("/*CS:%x*/ " % callee if callee is not None else "") + " ".join(st)
+        self.p.ctx_sites[fn.start] = info
         return res
 
     TOKEN = re.compile(r"(?<![\w.>])(x\d+|v\d+)(?!\w)")
@@ -1058,13 +1071,14 @@ class Lower:
         if self.fn.inside(ins.target):
             self.emit(self.goto(ins.target))
         else:
-            self.tail_seq(self.call_target(ins.target))
+            self.tail_seq(self.call_target(ins.target),
+                          ins.target if ins.target in self.p.func_starts else None)
 
     def i_bl(self, ins):
         self.xs.add(30)
         self.wx.add(30)
         self.emit("x30 = 0x%xull;" % rel(ins.addr + 4))
-        self.call_seq(self.call_target(ins.target))
+        self.call_seq(self.call_target(ins.target), ins.target if ins.target in self.p.func_starts else None)
 
     def i_bcond(self, ins):
         self.branch_if(self.cond(ins, ins.cond), ins.target)
@@ -1825,6 +1839,56 @@ def gen_function(prog, start, end, natives=(), timed=None, timed_calls=(), profi
     return code
 
 
+CS_MARK = re.compile(r"/\*CS:([0-9a-f]+)\*/ ?([^\n]*)")
+CS_STORE = re.compile(r"c->(x|v)\[(\d+)\] = [xv]\d+;\s*")
+
+
+def filter_call_stores(prog, natives, texts):
+    """At a direct call to a recompiled function, only the argument registers it
+    reads from the context are stored: those it loads at its entry, and those
+    it passes through untouched to what it calls (a fixed point over the call
+    graph; an indirect or native callee reads them all)."""
+    allr = frozenset(["x%d" % r for r in ARG_X] + ["v%d" % r for r in ARG_V])
+    ctx = {}
+    for f, e in prog.ctx_entry.items():
+        ctx[f] = allr if e is None or prog.ctx_sites.get(f, ()) is None else (e & allr)
+
+    def reads(callee):
+        if callee is None or prog.names.get(callee) in natives or callee not in ctx:
+            return allr
+        return ctx[callee]
+    changed = True
+    while changed:
+        changed = False
+        for f, sites in prog.ctx_sites.items():
+            if sites is None or f not in ctx or ctx[f] == allr:
+                continue
+            cur = ctx[f]
+            for callee, through in sites:
+                cur = cur | (through & reads(callee))
+            if cur != ctx[f]:
+                ctx[f] = cur
+                changed = True
+    kept = dropped = 0
+
+    def fix(m):
+        nonlocal kept, dropped
+        r = reads(int(m.group(1), 16))
+
+        def one(s):
+            nonlocal kept, dropped
+            reg = s.group(1) + s.group(2)
+            if reg in r:
+                kept += 1
+                return s.group(0)
+            dropped += 1
+            return ""
+        return CS_STORE.sub(one, m.group(2))
+    out = [(p, CS_MARK.sub(fix, t)) for p, t in texts]
+    print("call-site stores: %d kept, %d dropped (the callee does not read them)" % (kept, dropped))
+    return out
+
+
 def write_tables(prog, out):
     m = prog.m
     lines = ['#include "recomp.h"', '#include "funcs.h"', ""]
@@ -1970,6 +2034,7 @@ def main():
 
     errors = 0
     files = []
+    texts = []
     for k in range(0, len(funcs), FUNCS_PER_FILE):
         chunk = funcs[k:k + FUNCS_PER_FILE]
         path = os.path.join(args.out, "funcs_%03d.c" % (k // FUNCS_PER_FILE))
@@ -1984,6 +2049,9 @@ def main():
                 parts.append("void %s(Ctx *c) { rt_unimpl(c, 0x%xu, \"generator error\"); }\n" % (cname(a), rel(a)))
             parts.append("\n")
         text = "".join(parts)
+        texts.append((path, text))
+    texts = filter_call_stores(prog, natives, texts)
+    for path, text in texts:
         old = None
         if os.path.exists(path):
             with open(path) as f:

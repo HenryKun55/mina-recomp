@@ -1508,3 +1508,51 @@ void nat__ZNK9SpawnBase17GetPropertyEqualsEPKcPS1_yi(Ctx *c)
     rt_log("[prop] %s of %u (default %d) -> %lld %s\n", (const char *)GP(key), (unsigned)n, (int)def, (long long)r,
            chosen);
 }
+
+/* ---- threads on cores ------------------------------------------------------------------
+ * The Vita gives the game 3 cores and does not move threads between them by
+ * load: the game thread (the frame's bottleneck), the renderer and the audio
+ * (a mixer, two Ogg decoders) each get one, so the decoders never take the
+ * game thread's core. MINA_NO_PIN: as before (any core). */
+#if defined(__vita__)
+#include <psp2/kernel/threadmgr.h>
+#endif
+static void pin_to_core(int core, const char *what)
+{
+#if defined(__vita__)
+    static int off = -1;
+    if (off < 0)
+        off = getenv("MINA_NO_PIN") != NULL;
+    if (off)
+        return;
+    const int r = sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), SCE_KERNEL_CPU_MASK_USER_0 << core);
+    rt_log("[thread] %s on core %d (%#x)\n", what, core, r);
+#else
+    (void)core;
+    (void)what;
+#endif
+}
+void f_1ced98_orig(Ctx *c);
+void nat__ZN12ycGameThread10ThreadMainEPv(Ctx *c)
+{
+    pin_to_core(0, "game thread");
+    f_1ced98_orig(c);
+}
+void f_1dfccc_orig(Ctx *c);
+void nat__ZN10ycRenderer10ThreadMainEPv(Ctx *c)
+{
+    pin_to_core(1, "renderer");
+    f_1dfccc_orig(c);
+}
+void f_d033c_orig(Ctx *c);
+void nat__ZN7ycAudio5Mixer10ThreadMainEPv(Ctx *c)
+{
+    pin_to_core(2, "audio mixer");
+    f_d033c_orig(c);
+}
+void f_cb1ac_orig(Ctx *c);
+void nat__ZN7ycAudio7Decoder10ThreadMainEPv(Ctx *c)
+{
+    pin_to_core(2, "audio decoder");
+    f_cb1ac_orig(c);
+}

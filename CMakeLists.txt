@@ -95,6 +95,12 @@ target_include_directories(mina_gen PRIVATE runtime/include ${GEN_DIR})
 target_compile_definitions(mina_gen PRIVATE ${MINA_DEFS})
 target_compile_options(mina_gen PRIVATE ${MINA_ARCH_FLAGS} ${MINA_GEN_FLAGS} -ffp-contract=off -fno-strict-aliasing
   -Wno-unused-label -Wno-unused-variable -Wno-unused-but-set-variable)
+# MINA_LTO: the recompiled functions inlined across files at link time (a call
+# to a small one then costs no context stores and reloads)
+option(MINA_LTO "link-time optimization of the recompiled code" OFF)
+if(MINA_LTO)
+  target_compile_options(mina_gen PRIVATE -flto=auto)
+endif()
 
 # ---- runtime ----------------------------------------------------------------
 file(GLOB RUNTIME_SOURCES runtime/src/*.c)
@@ -124,6 +130,11 @@ if(VITA)
     SceAudio_stub SceAudioIn_stub SceDisplay_stub SceGxm_stub SceCommonDialog_stub SceSysmodule_stub
     ScePower_stub SceAppMgr_stub SceAppUtil_stub SceIme_stub SceLibKernel_stub SceProcessmgr_stub
     SceIofilemgr_stub stdc++ pthread m c)
+  # scripted pad input (MINA_INPUT "vita:<button>") joins the real pad's (runtime/src/sdl.c)
+  target_link_options(mina PRIVATE -Wl,--wrap=sceCtrlPeekBufferPositive2)
+  if(MINA_LTO)
+    target_link_options(mina PRIVATE -flto=auto ${MINA_ARCH_FLAGS} -ffp-contract=off -fno-strict-aliasing)
+  endif()
   vita_create_self(eboot.bin mina UNSAFE)
   # bubble art (tools/vita/make_art.py, from your copy of the game) when it is there
   set(MINA_ART "${CMAKE_SOURCE_DIR}/deps/art/sce_sys")
