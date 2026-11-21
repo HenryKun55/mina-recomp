@@ -946,6 +946,7 @@ static void render_pass_update(Ctx *c)
         float vc[3] = { 0, 0, 0 }, ve[3] = { neg_max, neg_max, neg_max };
         const uint32_t skip_flag = ((1u << v) & mask) ? 8 : 0;
         uint32_t n = 0;
+        const uint32_t sortfn = (uint32_t)lp(RP + 0x128);
         const uint32_t npages = (uint32_t)lp(RP + 0x138);
         for (uint32_t pg = 0; pg < npages; pg++) {
             const uint32_t pages = (uint32_t)lp(RP + 0x130);
@@ -989,6 +990,31 @@ static void render_pass_update(Ctx *c)
                 uint32_t key;
                 if (f & 6) {
                     key = (f >> 1 & 1) - 1u;
+                } else if (sortfn == 0x11e2844u || sortfn == 0x11e2894u || sortfn == 0x11e28e0u ||
+                           sortfn == 0x11e0ae4u) {
+                    /* the game's sort keys (ycRenderPass::BackToFrontLook,
+                     * FrontToBackLook, HUDSort, NullSort), the same operations */
+                    float k;
+                    if (sortfn == 0x11e0ae4u) {
+                        key = 0;
+                        goto keyed;
+                    }
+                    if (sortfn == 0x11e28e0u) {
+                        k = box[2] + 100.0f;
+                    } else {
+                        const float *cp = GP(fr), *cd = GP(fr + 0x10);
+                        k = (box[0] - cp[0]) * cd[0];
+                        const float k1 = (box[1] - cp[1]) * cd[1], k2 = (box[2] - cp[2]) * cd[2];
+                        k = k + k1;
+                        k = k + k2;
+                        k = ldfp(fa + 4) + k;
+                    }
+                    if (sortfn == 0x11e28e0u)
+                        k = k + ldfp(fa + 4);
+                    k = k > 0.0f ? k : 0.0f;          /* fmaxnm(k, 0) */
+                    memcpy(&key, &k, 4);
+                    if (sortfn != 0x11e2894u)
+                        key = ~key;
                 } else {
                     c->x[0] = boxa;
                     c->x[1] = fr;
@@ -997,9 +1023,20 @@ static void render_pass_update(Ctx *c)
                     static const GuestFunc *ic;
                     RT_CALL_IC(c, lp(RP + 0x128), ic);
                     key = (uint32_t)c->x[0];
-                    if (stats)
+                    if (stats) {
                         rpu.keyed++;
+                        static uint32_t seen[16];
+                        const uint32_t t = (uint32_t)lp(RP + 0x128);
+                        int i = 0;
+                        while (i < 16 && seen[i] && seen[i] != t)
+                            i++;
+                        if (i < 16 && !seen[i]) {
+                            seen[i] = t;
+                            rt_log("[rpu] key function %#x\n", t);
+                        }
+                    }
                 }
+            keyed:
                 rt_st32(GP(lp(RP + 0x1f0 + 8 * v) + 4 * (uint64_t)n), key);
                 const uint64_t o64 = obj;
                 memcpy(GP(lp(RP + 0x218 + 8 * v) + 8 * (uint64_t)n), &o64, 8);
