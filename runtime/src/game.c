@@ -908,6 +908,83 @@ static void grow_bounds_vis(float *bc, float *be, const float *box)
 /* MINA_RPU_STATS: per 60 calls of ycRenderPass::Update, objects seen, culled,
  * keyed (by a call) and sorted, and the time in the scan and the sort */
 static struct { uint64_t calls, objs, culled, keyed, sorted, scan_us, sort_us; } rpu;
+/* ycRenderPass::Update's sort: bottom-up merge sort by key, ties taking the
+ * right run first, the game's two buffers (the result ends in the first) -
+ * done in local arrays (the same merges, so the same order); keys already
+ * strictly increasing are left as they are (every merge would take the left) */
+static void rpu_sort(uint8_t *gm_, uint64_t RP, uint32_t v, uint32_t n)
+{
+    const uint64_t o0 = lp(RP + 0x218 + 8 * v), k0 = lp(RP + 0x1f0 + 8 * v);
+    const uint32_t *keys = GP(k0);
+    uint32_t i;
+    for (i = 1; i < n && keys[i - 1] < keys[i]; i++)
+        ;
+    if (i == n)
+        return;
+    enum { MAXN = 4096 };
+    static uint32_t ka[MAXN], kb[MAXN];
+    static uint64_t oa[MAXN], ob[MAXN];
+    if (n > MAXN) {           /* (not seen) the game's buffers, as before */
+        const uint64_t o1 = lp(RP + 0x248), k1 = lp(RP + 0x240);
+        uint64_t so = o0, sk = k0, dob = o1, dk = k1;
+        for (uint32_t w = 1;; w *= 2) {
+            for (uint32_t s0 = 0; s0 < n;) {
+                const uint32_t mid = s0 + w < n ? s0 + w : n, end = s0 + 2 * w < n ? s0 + 2 * w : n;
+                uint32_t a = s0, b = mid, d = s0;
+                while (d < end) {
+                    const int left = a < mid && (b >= end || rt_ld32(GP(sk + 4 * (uint64_t)a)) < rt_ld32(GP(sk + 4 * (uint64_t)b)));
+                    const uint32_t from = left ? a++ : b++;
+                    memcpy(GP(dob + 8 * (uint64_t)d), GP(so + 8 * (uint64_t)from), 8);
+                    rt_st32(GP(dk + 4 * (uint64_t)d), rt_ld32(GP(sk + 4 * (uint64_t)from)));
+                    d++;
+                }
+                s0 = s0 + 2 * w;
+            }
+            uint64_t t = so; so = dob; dob = t;
+            t = sk; sk = dk; dk = t;
+            if (2 * w >= n)
+                break;
+        }
+        if (so != o0) {
+            memcpy(GP(o0), GP(o1), 8 * (size_t)n);
+            memcpy(GP(k0), GP(k1), 4 * (size_t)n);
+        }
+        return;
+    }
+    memcpy(ka, keys, 4 * (size_t)n);
+    memcpy(oa, GP(o0), 8 * (size_t)n);
+    uint32_t *sk = ka, *dk = kb;
+    uint64_t *so = oa, *dob = ob;
+    for (uint32_t w = 1;; w *= 2) {
+        for (uint32_t s0 = 0; s0 < n; s0 += 2 * w) {
+            const uint32_t mid = s0 + w < n ? s0 + w : n, end = s0 + 2 * w < n ? s0 + 2 * w : n;
+            uint32_t a = s0, b = mid, d = s0;
+            while (a < mid && b < end) {
+                if (sk[a] < sk[b]) {
+                    dk[d] = sk[a];
+                    dob[d++] = so[a++];
+                } else {
+                    dk[d] = sk[b];
+                    dob[d++] = so[b++];
+                }
+            }
+            while (a < mid) {
+                dk[d] = sk[a];
+                dob[d++] = so[a++];
+            }
+            while (b < end) {
+                dk[d] = sk[b];
+                dob[d++] = so[b++];
+            }
+        }
+        uint32_t *tk = sk; sk = dk; dk = tk;
+        uint64_t *to = so; so = dob; dob = to;
+        if (2 * w >= n)
+            break;
+    }
+    memcpy(GP(k0), sk, 4 * (size_t)n);
+    memcpy(GP(o0), so, 8 * (size_t)n);
+}
 static void render_pass_update(Ctx *c)
 {
     GM_BEGIN;
@@ -1094,49 +1171,8 @@ static void render_pass_update(Ctx *c)
             rpu.scan_us += t_sort - t_scan;
             rpu.sorted += n;
         }
-        if (lp(RP + 0x128) != 0x11e0ae4 && n >= 2) {
-            /* bottom-up merge sort by key (ties: the right run first), two buffers */
-            const uint64_t o0 = lp(RP + 0x218 + 8 * v), k0 = lp(RP + 0x1f0 + 8 * v);
-            const uint64_t o1 = lp(RP + 0x248), k1 = lp(RP + 0x240);
-            uint64_t so = o0, sk = k0, dob = o1, dk = k1;
-            for (uint32_t w = 1;; w *= 2) {
-                for (uint32_t i = 0; i < n;) {
-                    const uint32_t mid = i + w < n ? i + w : n, end = i + 2 * w < n ? i + 2 * w : n;
-                    uint32_t a = i, b = mid, d = i;
-                    while (d < end) {
-                        int take_left;
-                        uint32_t ka = 0, kb = 0;
-                        if (a < mid) {
-                            ka = rt_ld32(GP(sk + 4 * (uint64_t)a));
-                            take_left = b < end ? (kb = rt_ld32(GP(sk + 4 * (uint64_t)b)), ka < kb) : 1;
-                        } else {
-                            take_left = 0;
-                        }
-                        if (take_left) {
-                            memcpy(GP(dob + 8 * (uint64_t)d), GP(so + 8 * (uint64_t)a), 8);
-                            rt_st32(GP(dk + 4 * (uint64_t)d), ka);
-                            a++;
-                        } else {
-                            kb = rt_ld32(GP(sk + 4 * (uint64_t)b));
-                            memcpy(GP(dob + 8 * (uint64_t)d), GP(so + 8 * (uint64_t)b), 8);
-                            rt_st32(GP(dk + 4 * (uint64_t)d), kb);
-                            b++;
-                        }
-                        d++;
-                    }
-                    i = i + 2 * w;
-                }
-                uint64_t t;
-                t = so; so = dob; dob = t;
-                t = sk; sk = dk; dk = t;
-                if (2 * w >= n)
-                    break;
-            }
-            if (so != o0) {
-                memcpy(GP(o0), GP(o1), 8 * (size_t)n);
-                memcpy(GP(k0), GP(k1), 4 * (size_t)n);
-            }
-        }
+        if (lp(RP + 0x128) != 0x11e0ae4 && n >= 2)
+            rpu_sort(gm_, RP, v, n);
         memcpy(GP(RP + 0x1c8 + 8 * v), &(uint64_t){ n }, 8);
         if (stats) {
             t_scan = now_us();

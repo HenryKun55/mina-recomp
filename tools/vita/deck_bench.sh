@@ -13,7 +13,9 @@ SECS=${1:-30}
 V3=${MINA_VITA3K:-$HOME/Documents/workspace/games/vita3k-mina}
 DATA="$V3/fs/ux0/data/mina"
 { echo "MINA_FPS=1"; for kv in "$@"; do echo "$kv"; done; } > "$DATA/env.txt"
-pkill -9 -f "Vita3K -c .* -r MINA00001" 2>/dev/null
+# an older session's runner would close this one when its own Vita3K goes
+for p in $(pgrep -f "tools/run_vita3k[.]sh"); do kill "$p" 2>/dev/null; done
+"$ROOT/tools/vita/stop.sh"
 # a new game every time (the save moves on as it is played)
 rm -f "$V3/fs/ux0/data/Yacht Club Games/Mina the Hollower (recomp)/saveData.yc"
 (MHZ=${MHZ:-240} GPU_SCALE=${GPU_SCALE:-0} "$ROOT/tools/run_vita3k.sh" 3000 > /dev/null 2>&1 &)
