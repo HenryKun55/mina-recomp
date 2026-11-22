@@ -54,6 +54,8 @@ typedef struct Obj {
     int traced;                  /* debug: log its retains and releases */
     int weak;                    /* weak references to it (objc_storeWeak) */
     int held;                    /* gpu_lifetime: the reference objc_frame_end lets go of */
+    uintptr_t rel[12];           /* its last retains (bit 0 set) and releases: the host code of each (rel[nrel % 12] next) */
+    uint32_t nrel;
     struct Obj *next;            /* in its class's pool */
 } Obj;
 void objc_trace_ref(Obj *o, const char *op);

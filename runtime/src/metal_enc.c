@@ -1099,9 +1099,16 @@ static int bound_wrong(uint64_t a, const char *want, const char *what)
         const char *objc_freed_info(uint64_t a, uint32_t *frames_ago);
         uint32_t ago = 0;
         const char *was = o ? NULL : objc_freed_info(a, &ago);
-        rt_log("metal: the %s %#llx bound to a draw is %s%s%s (%u frames ago) [%d so far]: %s\n", what,
-               (unsigned long long)a, o ? o->cls->name : "not a live object", was ? ": a freed " : "", was ? was : "",
-               ago, n, bt);
+        void objc_freed_releases(uint64_t a, uintptr_t out[12]);
+        uintptr_t rel[12];
+        objc_freed_releases(a, rel);
+        char hist[400];
+        int hn = 0;
+        for (int k = 0; k < 12 && rel[k] && hn < (int)sizeof hist - 16; k++)
+            hn += snprintf(hist + hn, sizeof hist - hn, " %c%lx", (rel[k] & 1) ? '+' : '-', (unsigned long)(rel[k] & ~1ul));
+        rt_log("metal: the %s %#llx bound to a draw is %s%s%s (%u frames ago) [%d so far]; its last references (newest first, + retain - release):%s\n",
+               what, (unsigned long long)a, o ? o->cls->name : "not a live object", was ? ": a freed " : "",
+               was ? was : "", ago, n, hist);
     }
     return 1;
 }
@@ -1457,17 +1464,8 @@ static MPipeline *draw_setup_p(REnc *e, MPipeline *force)
     const char *is = NULL;
     MPipeline *p = force ? force : metal_pipeline_of(e->pipeline, &is);
     if (!p) {                            /* not a live pipeline: what it is or was, and the draw is not made */
-        static int n;
-        if (n++ < 8) {
-            const char *objc_freed_info(uint64_t a, uint32_t *frames_ago);
-            uint32_t ago = 0;
-            const char *was = objc_freed_info(e->pipeline, &ago);
-            char bt[512];
-            guest_backtrace(bt, sizeof bt, 8);
-            rt_log("metal: the pipeline %#llx bound to a draw is %s%s (freed: %s, %u frames ago): %s\n",
-                   (unsigned long long)e->pipeline, is ? "a live " : "not a live object", is ? is : "",
-                   was ? was : "no", ago, bt);
-        }
+        (void)is;
+        bound_wrong(e->pipeline, "MTLRenderPipelineState_GL", "pipeline");
         return NULL;
     }
     g_rdbg.pipe = p;

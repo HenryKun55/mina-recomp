@@ -529,10 +529,10 @@ pipeline_set:
             memset(raw + 1, 0, 11);
         if (!L8(P + 0x20c))
             raw[0] = 0;
-        uint32_t mh = 2166136261u;
-        for (int i = 0; i < 16; i++)
-            mh = (mh ^ raw[i]) * 16777619u;
-        __typeof__(&ds_memo[0]) dm = &ds_memo[mh & 63];
+        /* (a slot of the memo: it compares the bytes) */
+        const uint32_t mh = (rt_ld32(raw) * 0x9E3779B1u) ^ (rt_ld32(raw + 4) * 0x85EBCA77u) ^
+                            (rt_ld32(raw + 8) * 0xC2B2AE3Du) ^ (rt_ld32(raw + 12) * 0x27D4EB2Fu);
+        __typeof__(&ds_memo[0]) dm = &ds_memo[mh >> 26];
         if (dm->valid && !memcmp(dm->raw, raw, 16) && dm->h == L64(G_DS_HASH)) {
             if (L8(P + 0x20e) && !(re && renc_same_stencil_ref(re, L8(P + 0x203))))
                 SEND("setStencilReferenceValue:", pass, (uint64_t)L8(P + 0x203));

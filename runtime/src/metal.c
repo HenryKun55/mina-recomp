@@ -2602,16 +2602,6 @@ void metal_present(uint64_t drawable)
                     if (n)
                         rt_log("[fps]   semaphore waits per frame (ms):%s\n", b);
                     memset(g_sem_wait_ns, 0, sizeof g_sem_wait_ns);
-                    struct SemSite { uint32_t id; uint64_t lr, ns; };
-                    extern struct SemSite g_sem_sites[16];
-                    n = 0;
-                    for (int i = 0; i < 16; i++)
-                        if (g_sem_sites[i].ns / frames > 300000 && n < 200)
-                            n += snprintf(b + n, sizeof b - n, " t%u@%llx %.1f", g_sem_sites[i].id,
-                                          (unsigned long long)g_sem_sites[i].lr, g_sem_sites[i].ns / 1e6 / frames);
-                    if (n)
-                        rt_log("[fps]   semaphore waits by site:%s\n", b);
-                    memset(g_sem_sites, 0, sizeof g_sem_sites);
                 }
                 {
                     extern uint32_t g_recalcs, g_recalc_same;
@@ -2627,6 +2617,12 @@ void metal_present(uint64_t drawable)
                        g_draw_calls / frames, g_draw_ns / 1e6 / frames, g_endenc_ns / 1e6 / frames,
                        g_present_sem_ns / 1e6 / frames, g_pipelines_made / (double)frames);
                 g_pipelines_made = 0;
+                {
+                    void objc_refsites_report(void);
+                    static int every;
+                    if (++every % 10 == 0)
+                        objc_refsites_report();
+                }
 #if defined(__vita__)
                 {
                     extern uint32_t g_batched_draws, g_batches;

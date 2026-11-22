@@ -4965,3 +4965,57 @@ void nat__ZN5World18UpdateSpawnManagerEP20ycUpdateQueueContext(Ctx *c)
         rt_log("[verify] UpdateSpawnManager: %u calls checked, %u differ, %u compared up to a call with effects\n", calls,
                bad, skipped);
 }
+
+/* ---- ycTexture::AllocStagingBuf ---------------------------------------------------------
+ * A texture upload's staging record (32 bytes from the game's TLSF heap):
+ * [0] mip, [8] the buffer's contents, [16] the buffer, [24] 0. The game
+ * stores the new buffer into [16] with objc_storeStrong, releasing what the
+ * block held there: a reused block's old bytes. On macOS that is nil (the
+ * game works); here it was a live object's address, so a sampler, a texture
+ * or a depth/stencil state got one release too many and died while bound
+ * (the scene drawn without its tiles or its depth test). The same steps,
+ * with [16] empty first. */
+void f_ca5c80(Ctx *c);    /* _objc_msgSend$newBufferWithLength:options: */
+void f_ca4860(Ctx *c);    /* _objc_msgSend$contents */
+void f_1e4bcc(Ctx *c);    /* ycTexture::CalcLinearMipChainSize */
+void nat__ZN9ycTexture15AllocStagingBufEj(Ctx *c)
+{
+    GM_BEGIN;
+    const uint64_t T = c->x[0];
+    const uint32_t mip = (uint32_t)c->x[1];
+    const uint64_t heap = L64(0x6039f60);              /* the game's allocator */
+    c->x[0] = heap;
+    c->x[1] = 32;
+    c->x[2] = 8;
+    c->x[3] = 0;
+    c->x[4] = 0;
+    c->x[5] = 0;
+    rt_call(c, L64(L64(heap)));
+    const uint64_t S = c->x[0];
+    rt_st32(GP(S), mip);
+    rt_st64(GP(S + 16), 0);
+    const uint32_t fmt = L32(T + 0x18), w = L32(T + 0x8), h = L32(T + 0xc);
+    uint32_t size;
+    if (mip != 0xffffffffu) {
+        const uint64_t e = 0x1d33ab4 + (uint64_t)fmt * 12;   /* block width, height, bytes */
+        size = udiv0(w, L32(e)) * udiv0(h, L32(e + 4)) * L32(e + 8);
+    } else {
+        c->x[0] = fmt;
+        c->x[1] = w;
+        c->x[2] = h;
+        c->x[3] = L32(T + 0x14);
+        f_1e4bcc(c);
+        size = (uint32_t)c->x[0];
+    }
+    const uint32_t len = (L32(T + 0x1c) & 4) ? size * 6 : size;
+    c->x[0] = L64(0x603ad38);                           /* the device */
+    c->x[2] = len;
+    c->x[3] = 0;
+    f_ca5c80(c);
+    rt_st64(GP(S + 16), c->x[0]);                       /* (what was there: nothing) */
+    c->x[0] = L64(S + 16);
+    f_ca4860(c);
+    rt_st64(GP(S + 8), c->x[0]);
+    rt_st64(GP(S + 24), 0);
+    c->x[0] = S;
+}

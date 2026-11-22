@@ -705,6 +705,8 @@ uint32_t objc_new_object(Class *k)
             o->traced = 0;
             o->weak = 0;
             o->held = 0;
+            o->nrel = 0;
+            memset(o->rel, 0, sizeof o->rel);
             o->next = NULL;
             if (o->host) {
                 uint32_t hs = 0, hz = 0;
@@ -832,11 +834,45 @@ void objc_trace_ref(Obj *o, const char *op)
            o->held, in, bt);
 }
 
+/* MINA_REFSITES=<class>: retains and releases of that class's objects by the
+ * host code doing them (a site releasing more than it retains stands out) */
+static const char *refsites_cls = (const char *)1;
+static struct { uintptr_t ra; int plus, minus; } refsites[64];
+static Class *refsites_k;
+static void refsite(Obj *o, uintptr_t ra, int plus)
+{
+    if (o->cls != refsites_k)
+        return;
+    for (int i = 0; i < 64; i++)
+        if (refsites[i].ra == ra || !refsites[i].ra) {
+            refsites[i].ra = ra;
+            if (plus)
+                refsites[i].plus++;
+            else
+                refsites[i].minus++;
+            return;
+        }
+}
+void objc_refsites_report(void)
+{
+    if (refsites_cls == (const char *)1) {    /* (looked up here: once a second, on the presenting thread) */
+        refsites_cls = getenv("MINA_REFSITES");
+        if (refsites_cls)
+            refsites_k = objc_class_named(refsites_cls);
+    }
+    if (!refsites_k)
+        return;
+    for (int i = 0; i < 64 && refsites[i].ra; i++)
+        rt_log("[refsites] %s at %p: +%d -%d\n", refsites_cls, (void *)refsites[i].ra, refsites[i].plus, refsites[i].minus);
+}
 uint64_t objc_retain_obj(uint64_t a)
 {
     Obj *o = objc_obj(a);
     if (o) {
         __atomic_add_fetch(&o->refs, 1, __ATOMIC_SEQ_CST);
+        o->rel[o->nrel++ % 12] = (uintptr_t)__builtin_return_address(0) | 1;
+        if (refsites_k)
+            refsite(o, (uintptr_t)__builtin_return_address(0), 1);
         if (o->traced)
             objc_trace_ref(o, "retain");
     }
@@ -946,6 +982,9 @@ void objc_release_obj(uint64_t a)
     Obj *o = objc_obj(a);
     if (!o)
         return;
+    o->rel[o->nrel++ % 12] = (uintptr_t)__builtin_return_address(0) & ~(uintptr_t)1;
+    if (refsites_k)
+        refsite(o, (uintptr_t)__builtin_return_address(0), 0);
     if (o->traced)
         objc_trace_ref(o, "release");
     if (__atomic_sub_fetch(&o->refs, 1, __ATOMIC_SEQ_CST) == 0) {
@@ -960,8 +999,20 @@ void objc_release_obj(uint64_t a)
 /* NSObject -dealloc: host destructors along the chain, then the memory. */
 /* the last objects freed, for a report of one used after (objc_freed_info) */
 #define FREED_LOG 4096
-static struct { uint32_t addr, frame; const char *cls; } freed_log[FREED_LOG];
+static struct { uint32_t addr, frame; const char *cls; uintptr_t rel[12]; } freed_log[FREED_LOG];
 static uint32_t freed_n;
+/* the host code of a freed object's last releases (newest first), 0 when unknown */
+void objc_freed_releases(uint64_t a, uintptr_t out[12])
+{
+    memset(out, 0, 12 * sizeof out[0]);
+    for (uint32_t k = 0; k < FREED_LOG && k < freed_n; k++) {
+        const uint32_t i = (freed_n - 1 - k) % FREED_LOG;
+        if (freed_log[i].addr == (uint32_t)a) {
+            memcpy(out, freed_log[i].rel, 12 * sizeof out[0]);
+            return;
+        }
+    }
+}
 const char *objc_freed_info(uint64_t a, uint32_t *frames_ago)
 {
     for (uint32_t k = 0; k < FREED_LOG && k < freed_n; k++) {
@@ -984,6 +1035,8 @@ static void m_dealloc(Ctx *c)
         freed_log[i].addr = (uint32_t)a;
         freed_log[i].frame = frame_no;
         freed_log[i].cls = o->cls->name;
+        for (uint32_t k = 0; k < 12; k++)           /* the newest first */
+            freed_log[i].rel[k] = k < o->nrel ? o->rel[(o->nrel - 1 - k) % 12] : 0;
     }
     if (o->traced)
         objc_trace_ref(o, "dealloc");

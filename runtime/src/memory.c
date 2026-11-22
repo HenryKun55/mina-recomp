@@ -585,6 +585,7 @@ uint32_t gmalloc(uint64_t size)
     pthread_mutex_lock(&heap_lock);
     uint32_t a = free_list[cls];
     last_fresh = !a;
+    const int reused = a != 0;
     if (a) {
         BlockHdr *h = G(a - HDR);
         free_list[cls] = *(uint32_t *)G(a);
@@ -609,6 +610,12 @@ uint32_t gmalloc(uint64_t size)
         h->size = want;
         a = blk + HDR;
     }
+    /* A reused block comes zeroed, as macOS's malloc gives it (zero on free):
+     * the game stores into a new block's fields as if they held nil
+     * (ycTexture::AllocStagingBuf released what a reused block held there:
+     * samplers and textures died while bound) */
+    if (reused && !heapcheck)
+        memset(G(a), 0, (size_t)want);
     if (heapcheck)
         canary_set(a, want, cap);
     heap_in_use += cap;
