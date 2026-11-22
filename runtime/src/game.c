@@ -2509,3 +2509,40 @@ void nat__ZN8AnimTile16UpdateLayerPropsEv(Ctx *c)
 {
     anim_tile_layer_props(c);
 }
+
+/* ---- AnimTile::PostUpdate ---------------------------------------------------------------------
+ * dt = ctx+8 scaled by the world's time scale (entity's world +0x68): an
+ * optional virtual update, the layer props, the layer scroll speed, the
+ * sprite's animation. */
+void nat__ZN8AnimTile10PostUpdateEP20ycUpdateQueueContext(Ctx *c)
+{
+    GM_BEGIN;
+    const uint64_t T = c->x[0], Q = c->x[1];
+    if (*(uint8_t *)GP(T + 0x1bb)) {
+        const float dt = ldfp(Q + 8) * ldfp(lp(T + 0x10) + 0x68);
+        c->x[0] = T;
+        c->v[0] = vset_f32(dt);
+        static const GuestFunc *ic;
+        RT_CALL_IC(c, lp(lp(T) + 0xc0), ic);
+    }
+    const float s8 = ldfp(Q + 8), s9 = ldfp(lp(T + 0x10) + 0x68);
+    c->x[0] = T;
+    c->x[1] = Q;
+    anim_tile_layer_props(c);
+    if (*(uint8_t *)GP(T + 0x1b5)) {
+        const float s0 = s8 * s9;
+        const float now = ldfp(lp(lp(T + 0x10) + 0x50) + 0x1810), was = ldfp(T + 0x1b0);
+        stfp(T + 0x1b0, now);
+        float v = 0.0f;
+        if (s0 != 0.0f)
+            v = (now - was) / s0;
+        stfp(lp(T + 0x120) + 0x178, v);
+    }
+    if (*(uint8_t *)GP(T + 0x1bc)) {
+        const uint64_t ro = lp(T + 0x120);
+        const float dt = ldfp(Q + 8) * ldfp(lp(ro + 0x10) + 0x68);
+        c->x[0] = ro;
+        c->v[0] = vset_f32(dt);
+        f_9a7b98(c);
+    }
+}
