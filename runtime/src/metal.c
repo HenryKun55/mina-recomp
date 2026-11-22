@@ -2160,6 +2160,53 @@ void vita_copy_quad(MTexture *src, float sx, float sy, float sw, float sh, GLuin
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, uv);
     glDrawArrays(GL_TRIANGLES, 0, 6);
 }
+volatile RDbg g_rdbg;
+#if defined(__vita__)
+/* No frame for 15 s (after the first; level loads take a few): where the renderer is and what the game
+ * thread does, once per stall - for the rare hangs at level loads */
+extern volatile int g_game_stage;
+static int watchdog_entry(SceSize args, void *argp)
+{
+    (void)args;
+    (void)argp;
+    uint32_t last = 0;
+    int still = 0, told = 0;
+    for (;;) {
+        sceKernelDelayThread(1000000);
+        const uint32_t n = g_rdbg.presents;
+        if (n != last) {
+            last = n;
+            still = 0;
+            told = 0;
+            continue;
+        }
+        if (++still >= 15 && !told) {
+            told = 1;
+            rt_log("[watchdog] no frame for %d s: renderer stage %d, pipeline %p (vs %d fs %d ntex %d, k %d), %u draws, "
+                   "%u frames; game thread stage %d\n", still, g_rdbg.stage, g_rdbg.pipe, g_rdbg.vs, g_rdbg.fs,
+                   g_rdbg.ntex, g_rdbg.k, g_rdbg.draws, n, g_game_stage);
+            if (g_rdbg.pipe) {
+                const MPipeline *p = g_rdbg.pipe;
+                rt_log("[watchdog]   pipeline now: vs %d fs %d ntex %d prog %u\n", p->vs, p->fs, p->ntex, p->prog);
+            }
+        }
+    }
+    return 0;
+}
+static void watchdog_start(void)
+{
+    static int started;
+    if (started)
+        return;
+    started = 1;
+    SceUID t = sceKernelCreateThread("mina_watchdog", watchdog_entry, 191, 0x4000, 0, SCE_KERNEL_CPU_MASK_USER_ALL, NULL);
+    if (t >= 0)
+        sceKernelStartThread(t, 0, NULL);
+}
+#else
+static void watchdog_start(void) {}
+#endif
+
 #endif
 
 void metal_present(uint64_t drawable)
@@ -2215,7 +2262,10 @@ void metal_present(uint64_t drawable)
             g_present_thread = pthread_self();
             g_present_thread_set = 1;
         }
+        g_rdbg.stage = 20;
         vglSwapBuffers(GL_FALSE);
+        g_rdbg.presents++;
+        watchdog_start();
         if (on) {
             uint64_t t1 = sceKernelGetProcessTimeWide();
             swap_us += t1 - t0;

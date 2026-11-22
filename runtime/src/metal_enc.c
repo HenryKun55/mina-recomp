@@ -398,7 +398,9 @@ static int fold_draw_reads(REnc *e, MPipeline *p)
 {
     int moved = 0;
     unsigned rgb = p->fs >= 0 ? g_shaders[p->fs].rgb_only : 0;
+    g_rdbg.stage = 2;
     for (int k = 0; k < p->ntex; k++) {
+        g_rdbg.k = k;
         int t = p->texb[k].tex & 15;
         uint64_t to = p->texb[k].stage ? e->ftex[t] : e->vtex[t];
         MTexture *mt = to ? objc_host(to) : NULL;
@@ -957,6 +959,61 @@ static void apply_state(REnc *e, MPipeline *p)
         glFrontFace(front);
 }
 
+/* The values each uniform location was last given (vitaGL keeps them per
+ * program, and a location names one uniform of one program): the same bytes
+ * again are not sent - vitaGL copies them, looks the parameter's type up and
+ * marks the program's uniforms for a whole copy at the next draw. */
+typedef struct { GLint loc; uint32_t len, cap; uint8_t *data; } UniMemo;
+static UniMemo uni_memo[1024];
+static int uni_memo_same(GLint loc, const void *d, uint32_t len)
+{
+    uint32_t h = ((uint32_t)loc * 2654435761u) >> 22;
+    for (int probe = 0; probe < 8; probe++, h = (h + 1) & 1023) {
+        UniMemo *m = &uni_memo[h];
+        if (m->loc == loc || m->loc == 0) {
+            if (m->loc == loc && m->len == len && !memcmp(m->data, d, len))
+                return 1;
+            if (m->cap < len) {
+                free(m->data);
+                m->cap = len < 64 ? 64 : len;
+                m->data = malloc(m->cap);
+            }
+            memcpy(m->data, d, len);
+            m->len = len;
+            m->loc = loc;
+            return 0;
+        }
+    }
+    return 0;
+}
+static void set_uniform1f(GLint loc, GLfloat v)
+{
+    if (!uni_memo_same(loc, &v, 4))
+        glUniform1f(loc, v);
+}
+static void set_uniform4fv(GLint loc, GLsizei n, const GLfloat *d)
+{
+    const uint32_t len = (uint32_t)n * 16;
+    uint32_t h = ((uint32_t)loc * 2654435761u) >> 22;
+    for (int probe = 0; probe < 8; probe++, h = (h + 1) & 1023) {
+        UniMemo *m = &uni_memo[h];
+        if (m->loc == loc || m->loc == 0) {
+            if (m->loc == loc && m->len == len && !memcmp(m->data, d, len))
+                return;
+            if (m->cap < len) {
+                free(m->data);
+                m->cap = len < 64 ? 64 : len;
+                m->data = malloc(m->cap);
+            }
+            memcpy(m->data, d, len);
+            m->len = len;
+            m->loc = loc;
+            glUniform4fv(loc, n, d);
+            return;
+        }
+    }
+    glUniform4fv(loc, n, d);        /* (table crowded: no memo) */
+}
 static void apply_uniforms(REnc *e, MPipeline *p)
 {
     for (int i = 0; i < MAX_VBUF; i++) {
@@ -966,7 +1023,7 @@ static void apply_uniforms(REnc *e, MPipeline *p)
             if (d) {
                 GLsizei n = p->vcb_size[i];
                 if ((uint32_t)n * 16 > avail) n = (GLsizei)(avail / 16);
-                glUniform4fv(p->vcb[i], n, (const GLfloat *)d);
+                set_uniform4fv(p->vcb[i], n, (const GLfloat *)d);
             }
         }
         if (p->fcb[i] >= 0) {
@@ -974,7 +1031,7 @@ static void apply_uniforms(REnc *e, MPipeline *p)
             if (d) {
                 GLsizei n = p->fcb_size[i];
                 if ((uint32_t)n * 16 > avail) n = (GLsizei)(avail / 16);
-                glUniform4fv(p->fcb[i], n, (const GLfloat *)d);
+                set_uniform4fv(p->fcb[i], n, (const GLfloat *)d);
             }
         }
     }
@@ -1346,9 +1403,15 @@ static void depth_alias(REnc *e, MPipeline *p)
 
 static MPipeline *draw_setup(REnc *e)
 {
+    g_rdbg.stage = 1;
     if (!e->pipeline)
         return NULL;
     MPipeline *p = objc_host(e->pipeline);
+    g_rdbg.pipe = p;
+    g_rdbg.vs = p->vs;
+    g_rdbg.fs = p->fs;
+    g_rdbg.ntex = p->ntex;
+    g_rdbg.draws++;
     if (draw_is_noop(e, p))
         return NULL;
 #if defined(__vita__)
@@ -1374,8 +1437,10 @@ static MPipeline *draw_setup(REnc *e)
     if (!e->begun)
         depth_alias(e, p);
 #endif
+    g_rdbg.stage = 3;
     if (!e->begun)
         pass_begin(e);
+    g_rdbg.stage = 4;
     {   /* MINA_SKIP_FS=n,m: draws with these fragment shaders are skipped (debug) */
         static int init, skip[8], nskip;
         if (!init) {
@@ -1428,7 +1493,7 @@ static MPipeline *draw_setup(REnc *e)
     if (!gs_same(S_PROG, p->prog))
         glUseProgram(p->prog);
     if (p->yflip_loc >= 0)
-        glUniform1f(p->yflip_loc, e->to_display ? 1.0f : -1.0f);
+        set_uniform1f(p->yflip_loc, e->to_display ? 1.0f : -1.0f);
 #if defined(__vita__)
     if (drawlog) {
         GLint cur = -1;
@@ -1438,6 +1503,7 @@ static MPipeline *draw_setup(REnc *e)
             rt_log("[draw] glUseProgram(%u) left the current program at %d (vs %d fs %d)\n", p->prog, cur, p->vs, p->fs);
     }
 #endif
+    g_rdbg.stage = 5;
     apply_state(e, p);
 #if defined(__vita__)
     if (e->depth_aliased && p->fs >= 0 && g_shaders[p->fs].writes_depth) {      /* the copy of the depth the pass already has */
@@ -1446,12 +1512,16 @@ static MPipeline *draw_setup(REnc *e)
         GL_DIRTY();
     }
 #endif
+    g_rdbg.stage = 6;
     apply_uniforms(e, p);
+    g_rdbg.stage = 7;
     apply_textures(e, p);
+    g_rdbg.stage = 8;
 #if defined(__vita__)
     if (p->dst_depth_unit >= 0)
         depth_by_shader(e, p);
 #endif
+    g_rdbg.stage = 9;
     return p;
 }
 

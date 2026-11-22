@@ -187,6 +187,16 @@ typedef struct ShaderSrc {
 extern const ShaderSrc g_shaders[];
 extern const int g_shader_count;
 
+/* Where the renderer is (a watchdog reports it when no frame comes for seconds):
+ * cheap stores at the steps of a draw */
+typedef struct RDbg {
+    int stage;               /* 1 draw_setup ... 9 drawn; 20 present */
+    const void *pipe;
+    int vs, fs, ntex, k;
+    uint32_t draws, presents;
+} RDbg;
+extern volatile RDbg g_rdbg;
+
 /* ---- GPU lock: GL work happens with the context current on this thread ------------- */
 /* GL state the draws keep (metal_enc.c) is known only between draws: any
  * other code that changes GL state (passes, copies, blits, uploads) says so */
