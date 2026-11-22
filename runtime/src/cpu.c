@@ -188,6 +188,21 @@ void rt_trap(Ctx *c, uint32_t pc, uint32_t imm)
     abort();
 }
 
+void rt_promo_bad(Ctx *c, uint32_t pc, int slot)
+{
+    /* the first ones, each pc once */
+    static uint32_t seen[64];
+    static int n;
+    (void)c;
+    for (int i = 0; i < n; i++)
+        if (seen[i] == pc)
+            return;
+    if (n < 64) {
+        seen[n++] = pc;
+        rt_log("[promo] slot %d differs from the stack at %#x\n", slot, pc);
+    }
+}
+
 void rt_bad_jump(Ctx *c, uint32_t pc, uint64_t target)
 {
     rt_log("bad jump to %#llx\n", (unsigned long long)target);

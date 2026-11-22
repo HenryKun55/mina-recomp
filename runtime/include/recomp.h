@@ -177,6 +177,8 @@ extern GuestFn g_import_fns[];
 void rt_unimpl(Ctx *c, uint32_t pc, const char *what) __attribute__((noreturn));
 void rt_trap(Ctx *c, uint32_t pc, uint32_t imm) __attribute__((noreturn));
 void rt_bad_jump(Ctx *c, uint32_t pc, uint64_t target) __attribute__((noreturn));
+/* MINA_GEN_PROMOTE_CHECK builds: a spill slot's local differs from the stack */
+void rt_promo_bad(Ctx *c, uint32_t pc, int slot);
 
 /* ---- memory ------------------------------------------------------------ */
 

@@ -779,10 +779,241 @@ class Lower:
                 elide.add(ins.addr)
         return elide
 
+    def stack_promotion(self):
+        """Spill slots in C locals. A stack slot (offset from the entry sp, size)
+        that only this function's sp/x29-relative accesses reach - inside the
+        frame, below every address of the frame that escapes (add xN, sp, #k
+        and the like), every store to its bytes of exactly that offset and
+        size - is loaded from a local where all paths from the entry have
+        stored it. Stores still write guest memory (write-through): whatever
+        else reads the frame (stack arguments, escaped pointers) sees what it
+        saw. Unknown uses of sp or x29: none (the function is left as is).
+        Returns {insn addr: [per element: None | ('S', slot) | ('L', slot, local)]}."""
+        self.slot_size = {}
+        if self.test_mode or not os.environ.get("MINA_GEN_PROMOTE"):
+            return {}
+        fn = self.fn
+        if not getattr(fn, "blocks", None):
+            return {}
+        insns = fn.insns
+        nb = len(fn.blocks)
+        succ = [fn.succs(b) for b in range(nb)]
+        preds = [[] for _ in range(nb)]
+        for b in range(nb):
+            for t in succ[b]:
+                preds[t].append(b)
+        FB_REG = 29
+
+        class Bail(Exception):
+            pass
+
+        def mem_elems(ins, delta, fb):
+            """[(offset, size, load, fp, element)] of an sp/x29-based access, or None."""
+            if ins.op not in ("ldst", "ldstp") or ins.rn not in (SP, FB_REG):
+                return None
+            if ins.mode == "reg":
+                raise Bail()
+            if ins.rn == SP:
+                base = delta
+            else:
+                if fb is None or ins.mode != "off":
+                    raise Bail()
+                base = fb
+            off = base + (ins.imm if ins.mode in ("off", "pre") else 0)
+            n = 2 if ins.op == "ldstp" else 1
+            return [(off + k * ins.size, ins.size, ins.load, ins.fp, k) for k in range(n)]
+
+        try:
+            # sp relative to the entry at each instruction (forward, must agree)
+            delta_at = {}
+            fb = None
+            fb_setup = None
+            restores = set()
+            for ins in insns:
+                if ins.op == "addsub_imm" and ins.rd == FB_REG and ins.rn == SP and not ins.sub and not ins.s:
+                    if fb_setup is not None:
+                        raise Bail()
+                    fb_setup = ins.addr
+            din = [None] * nb
+            entry = fn.block_of.get(fn.start)
+            if entry is None:
+                return {}
+            din[entry] = 0
+            work = [entry]
+            while work:
+                b = work.pop()
+                d = din[b]
+                a, e = fn.blocks[b]
+                for x in range(a, e, 4):
+                    ins = insns[fn.index[x]]
+                    delta_at[x] = d
+                    if ins.addr == fb_setup:
+                        v = d + ins.imm
+                        if fb is not None and fb != v:
+                            raise Bail()
+                        fb = v
+                    if ins.op == "addsub_imm" and ins.rd == SP:
+                        if ins.rn == SP:
+                            d = d - ins.imm if ins.sub else d + ins.imm
+                        elif ins.rn == FB_REG and fb is not None:
+                            d = fb - ins.imm if ins.sub else fb + ins.imm
+                        else:
+                            raise Bail()
+                    elif ins.op in ("ldst", "ldstp") and ins.rn == SP and ins.mode in ("pre", "post"):
+                        d += ins.imm
+                    elif ins.f.get("rd") == SP:
+                        raise Bail()
+                for t in succ[b]:
+                    if din[t] is None:
+                        din[t] = d
+                        work.append(t)
+                    elif din[t] != d:
+                        raise Bail()
+            # a block the analysis does not reach must not touch the frame
+            for b in range(nb):
+                if din[b] is not None:
+                    continue
+                a, e = fn.blocks[b]
+                for x in range(a, e, 4):
+                    ins = insns[fn.index[x]]
+                    f = ins.f
+                    if SP in [f.get(k) for k in ("rn", "rm", "rd", "rt")] or \
+                            (fb_setup is not None and FB_REG in [f.get(k) for k in ("rn", "rm", "rd", "rt", "rt2")]):
+                        raise Bail()
+            # accesses, escapes, x29
+            esc = 0                 # escaped addresses are below the entry sp; 0: none
+            accesses = {}           # addr -> elems
+            for b in range(nb):
+                if din[b] is None:
+                    continue
+                a, e = fn.blocks[b]
+                restored = False
+                for x in range(a, e, 4):
+                    ins = insns[fn.index[x]]
+                    d = delta_at[x]
+                    if x in self.elide:
+                        continue
+                    if FB_REG in writes(ins) and x != fb_setup:
+                        # only the epilogue's reload of the caller's x29, in a block that leaves
+                        if not (ins.op in ("ldst", "ldstp") and ins.load and not ins.fp and ins.rn == SP) or succ[b]:
+                            raise Bail()
+                        restored = True
+                    el = mem_elems(ins, d, fb)
+                    if el is not None:
+                        if ins.rn == FB_REG and restored:
+                            raise Bail()
+                        accesses[x] = el
+                        if not ins.load and not ins.fp:
+                            regs = [ins.rt, ins.rt2] if ins.op == "ldstp" else [ins.rt]
+                            if FB_REG in regs and fb is not None and fb_setup is not None and \
+                                    fn.index[x] > fn.index[fb_setup]:
+                                esc = min(esc, fb)          # the frame pointer stored somewhere
+                        continue
+                    if x == fb_setup:
+                        continue
+                    if ins.op == "addsub_imm" and ins.rd == SP:
+                        continue
+                    f = ins.f
+                    srcs = [f.get(k) for k in ("rn", "rm", "ra", "rs", "rt", "rt2")]
+                    if SP in srcs:
+                        if ins.op == "addsub_imm" and ins.rn == SP:
+                            esc = min(esc, d - ins.imm if ins.sub else d + ins.imm)
+                            continue
+                        raise Bail()
+                    if FB_REG in srcs:
+                        if fb is None:
+                            continue        # x29 is not a frame pointer here
+                        if ins.op == "addsub_imm" and ins.rn == FB_REG:
+                            esc = min(esc, fb - ins.imm if ins.sub else fb + ins.imm)
+                        else:
+                            esc = min(esc, fb)
+            # promotable slots
+            stores = {}
+            loads = set()
+            for x, el in accesses.items():
+                for (off, size, load, fp, k) in el:
+                    (loads.add((off, size)) if load else stores.setdefault((off, size), []).append(x))
+            limit = min(esc, 0)
+            ok = set()
+            for (off, size) in stores:
+                if off + size > limit:
+                    continue
+                clash = False
+                for (o2, s2) in stores:
+                    if (o2, s2) != (off, size) and o2 < off + size and off < o2 + s2:
+                        clash = True
+                        break
+                if not clash:
+                    ok.add((off, size))
+            ok &= loads
+            if not ok:
+                return {}
+            slot_id = {k: i for i, k in enumerate(sorted(ok))}
+            # stored on every path from the entry (forward, intersection)
+            allslots = frozenset(slot_id.values())
+
+            def transfer(b, w):
+                a, e = fn.blocks[b]
+                w = set(w)
+                rec = {}
+                for x in range(a, e, 4):
+                    el = accesses.get(x)
+                    if not el:
+                        continue
+                    r = []
+                    for (off, size, load, fp, k) in el:
+                        sid = slot_id.get((off, size))
+                        if sid is None:
+                            r.append(None)
+                        elif load:
+                            r.append(("L", sid, sid in w))
+                        else:
+                            r.append(("S", sid))
+                    # a pair's loads see the state before the instruction, stores after
+                    for t in r:
+                        if t and t[0] == "S":
+                            w.add(t[1])
+                    rec[x] = r
+                return w, rec
+
+            win_out = {}
+            win = {b: (frozenset() if b == entry else allslots) for b in range(nb) if din[b] is not None}
+            changed = True
+            while changed:
+                changed = False
+                for b in sorted(win):
+                    if b != entry:
+                        ps = [win_out.get(p, allslots) for p in preds[b] if p in win]
+                        cur = frozenset.intersection(*ps) if ps else frozenset()
+                        if cur != win[b]:
+                            win[b] = cur
+                            changed = True
+                    out, _ = transfer(b, win[b])
+                    out = frozenset(out)
+                    if win_out.get(b) != out:
+                        win_out[b] = out
+                        changed = True
+            promo = {}
+            for b in win:
+                _, rec = transfer(b, win[b])
+                promo.update(rec)
+            for (off, size), i in slot_id.items():
+                self.slot_size[i] = size
+            return promo
+        except Bail:
+            self.slot_size = {}
+            return {}
+        except (KeyError, AttributeError, IndexError, TypeError):
+            # an instruction form the analysis does not know: left as is
+            self.slot_size = {}
+            return {}
+
     def run(self):
         fn = self.fn
         last = None
         self.elide = self.callee_saved_elision()
+        self.promo = self.stack_promotion()
+        self.promo_check = bool(os.environ.get("MINA_GEN_PROMOTE_CHECK"))
         for ins in fn.insns:
             if ins.addr in fn.labels:
                 self.out.append("%s:" % label(ins.addr))
@@ -859,6 +1090,13 @@ class Lower:
             lines.append("    uint64_t sp = c->sp;")
         if self.vs:
             lines.append("    V128 " + ", ".join(v_init(r) for r in sorted(self.vs)) + ";")
+        if self.slot_size:
+            sx = ["s%d_ = 0" % i for i, z in sorted(self.slot_size.items()) if z != 16]
+            sv = ["s%d_ = vzero()" % i for i, z in sorted(self.slot_size.items()) if z == 16]
+            if sx:
+                lines.append("    uint64_t " + ", ".join(sx) + ";")
+            if sv:
+                lines.append("    V128 " + ", ".join(sv) + ";")
         if self.uses_flags:
             lines.append("    uint64_t fa = 0, fb = 0; double fda = 0, fdb = 0; float ffa = 0, ffb = 0; uint32_t nzcv = %s;"
                          % ("c->nzcv" if self.test_mode else "0"))
@@ -1379,19 +1617,76 @@ class Lower:
             val = self.X(rt, 1 if size == 8 else 0)
         self.emit("ST%d(%s, %s);" % (size * 8, addr, val))
 
+    def slot_raw(self, sid, size):
+        """A promoted slot's value as the raw load of `size` bytes would give it."""
+        if size == 16:
+            return "s%d_" % sid
+        return "((uint%d_t)s%d_)" % (size * 8, sid)
+
+    def slot_load_raw(self, el, size, addr):
+        """The raw value of a load element (a promoted slot's local, or memory);
+        MINA_GEN_PROMOTE_CHECK: the local checked against memory first."""
+        if el is None or el[0] != "L" or not el[2]:
+            return None
+        raw = self.slot_raw(el[1], size)
+        if self.promo_check:
+            if size == 16:
+                self.emit("{ V128 k_ = LD128(%s); if (memcmp(&k_, &%s, 16)) rt_promo_bad(c, 0x%xu, %d); }"
+                          % (addr, raw, rel(self.cur.addr), el[1]))
+            else:
+                self.emit("if (LD%d(%s) != %s) rt_promo_bad(c, 0x%xu, %d);"
+                          % (size * 8, addr, raw, rel(self.cur.addr), el[1]))
+        return raw
+
+    def slot_store(self, el, rt, size, fp):
+        if el is None or el[0] != "S":
+            return
+        if fp:
+            v = self.V(rt)
+            val = {1: "%s.b[0]", 2: "%s.h[0]", 4: "%s.s[0]", 8: "%s.d[0]", 16: "%s"}[size] % v
+        else:
+            val = self.X(rt, 1 if size == 8 else 0)
+        if size == 16:
+            self.emit("s%d_ = %s;" % (el[1], val))
+        else:
+            self.emit("s%d_ = (uint%d_t)(%s);" % (el[1], size * 8, val))
+
+    def load_expr_from(self, size, signed, fp, raw):
+        """load_expr with a raw value instead of a memory read."""
+        if fp:
+            return {1: "vset_u32(%s)", 2: "vset_u32(%s)", 4: "vset_u32(%s)",
+                    8: "vset_u64(%s)", 16: "%s"}[size] % raw
+        if signed == 64:
+            ct = {1: "int8_t", 2: "int16_t", 4: "int32_t"}[size]
+            return "(uint64_t)(int64_t)(%s)%s" % (ct, raw)
+        if signed == 32:
+            ct = {1: "int8_t", 2: "int16_t"}[size]
+            return "(uint32_t)(int32_t)(%s)%s" % (ct, raw)
+        return raw
+
     def i_ldst(self, ins):
         addr, wb = self.ea(ins)
         if ins.addr in self.elide:
             if wb:
                 self.setX(wb[0], 1, wb[1])
             return
+        el = self.promo.get(ins.addr, [None])[0]
         if wb:
             self.emit("{ uint64_t ea_ = %s;" % addr)
             addr = "ea_"
         if ins.load:
-            self.do_load(ins.rt, ins.size, ins.signed, ins.fp, addr)
+            raw = self.slot_load_raw(el, ins.size, addr)
+            if raw is None:
+                self.do_load(ins.rt, ins.size, ins.signed, ins.fp, addr)
+            else:
+                e = self.load_expr_from(ins.size, ins.signed, ins.fp, raw)
+                if ins.fp:
+                    self.setV(ins.rt, e)
+                else:
+                    self.setX(ins.rt, 1 if (ins.size == 8 or ins.signed == 64) else 0, e)
         else:
             self.do_store(ins.rt, ins.size, ins.fp, addr)
+            self.slot_store(el, ins.rt, ins.size, ins.fp)
         if wb:
             self.setX(wb[0], 1, wb[1])
             self.emit("}")
@@ -1404,13 +1699,18 @@ class Lower:
             return
         self.emit("{ uint64_t ea_ = %s;" % addr)
         a2 = "ea_ + %d" % ins.size
+        els = self.promo.get(ins.addr, [None, None])
         if ins.load:
             signed = 64 if ins.signed else 0
+            r1 = self.slot_load_raw(els[0], ins.size, "ea_")
+            r2 = self.slot_load_raw(els[1], ins.size, "(%s)" % a2)
             # load both before writing, in case rt aliases the base
             if not ins.fp:
                 sf = 1 if (ins.size == 8 or signed) else 0
-                e1 = self.load_expr(ins.size, signed, False, "ea_")
-                e2 = self.load_expr(ins.size, signed, False, "(%s)" % a2)
+                e1 = self.load_expr(ins.size, signed, False, "ea_") if r1 is None else \
+                    self.load_expr_from(ins.size, signed, False, r1)
+                e2 = self.load_expr(ins.size, signed, False, "(%s)" % a2) if r2 is None else \
+                    self.load_expr_from(ins.size, signed, False, r2)
                 self.emit("uint64_t l1_ = %s, l2_ = %s;" % (e1, e2))
                 if wb:
                     self.setX(wb[0], 1, wb[1])
@@ -1418,11 +1718,19 @@ class Lower:
                 self.setX(ins.rt2, sf, "l2_")
                 self.emit("}")
                 return
-            self.do_load(ins.rt, ins.size, 0, True, "ea_")
-            self.do_load(ins.rt2, ins.size, 0, True, "(%s)" % a2)
+            if r1 is None:
+                self.do_load(ins.rt, ins.size, 0, True, "ea_")
+            else:
+                self.setV(ins.rt, self.load_expr_from(ins.size, 0, True, r1))
+            if r2 is None:
+                self.do_load(ins.rt2, ins.size, 0, True, "(%s)" % a2)
+            else:
+                self.setV(ins.rt2, self.load_expr_from(ins.size, 0, True, r2))
         else:
             self.do_store(ins.rt, ins.size, ins.fp, "ea_")
             self.do_store(ins.rt2, ins.size, ins.fp, "(%s)" % a2)
+            self.slot_store(els[0], ins.rt, ins.size, ins.fp)
+            self.slot_store(els[1], ins.rt2, ins.size, ins.fp)
         if wb:
             self.setX(wb[0], 1, wb[1])
         self.emit("}")
