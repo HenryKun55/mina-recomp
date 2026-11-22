@@ -5,6 +5,7 @@
  * endEncoding); command buffers only run their completion handlers and
  * present their drawable at commit.
  */
+#include <ctype.h>
 #include "metal_gl.h"
 #if defined(__vita__)
 #include <psp2/kernel/processmgr.h>
@@ -1233,14 +1234,245 @@ static GLuint compile(GLenum type, const char *src, int index)
     return s;
 }
 
+static void link_program(MPipeline *p);
 static void pipe_dealloc(void *h)
 {
     MPipeline *p = h;
     gpu_lock();
     if (p->prog && !p->shared_prog) glDeleteProgram(p->prog);
     if (p->vao) glDeleteVertexArrays(1, &p->vao);
+    if (p->batch) {
+        void metal_batch_forget(MPipeline *bp);
+        metal_batch_forget(p->batch);       /* (a batch held with it is drawn first) */
+        if (p->batch->vao) glDeleteVertexArrays(1, &p->batch->vao);
+        free(p->batch);
+    }
     gpu_unlock();
 }
+
+#if defined(__vita__)
+/* The vertex shader with vcb1[k].xyzw (k < 4) read from attribute mina_b<k>
+ * instead: NULL when it reads vcb1 any other way (or not at all). */
+static char *batch_vsrc(const char *src, int *rows)
+{
+    const char *decl = strstr(src, "uniform float4 vcb1[");
+    const char *mainp = strstr(src, "void main(\n");
+    if (!decl || !mainp || mainp < decl)
+        return NULL;
+    const char *decl_end = strchr(decl, '\n');
+    const char *body = strstr(mainp, "\n{\n");
+    const char *first_out = strstr(mainp, "\n    out ");
+    if (!decl_end || !body || !first_out || first_out > body)
+        return NULL;
+    first_out++;
+    size_t cap = strlen(src) + 512, n = 0;
+    char *out = malloc(cap);
+    int used = 0;
+    for (const char *q = src; *q;) {
+        if (q == decl) {                     /* the declaration goes */
+            q = decl_end + 1;
+            continue;
+        }
+        if (q == first_out) {
+            /* after the shader's own inputs: vitaGL takes a program's first
+             * attribute for the one at the lowest offset of a vertex */
+            const char *ins = "    float4 mina_b0,\n    float4 mina_b1,\n    float4 mina_b2,\n    float4 mina_b3,\n";
+            size_t l = strlen(ins);
+            memcpy(out + n, ins, l);
+            n += l;
+        }
+        if (!strncmp(q, "vcb1[", 5)) {
+            int k = -1, len = 0;
+            if (sscanf(q, "vcb1[%d].xyzw%n", &k, &len) != 1 || len == 0 || k < 0 || k > 3) {
+                free(out);
+                return NULL;
+            }
+            n += (size_t)sprintf(out + n, "mina_b%d", k);
+            used |= 1 << k;
+            q += len;
+            continue;
+        }
+        if (n + 64 >= cap) {
+            cap *= 2;
+            out = realloc(out, cap);
+        }
+        out[n++] = *q++;
+    }
+    out[n] = 0;
+    if (!used) {
+        free(out);
+        return NULL;
+    }
+    *rows = 4;
+    return out;
+}
+
+/* The components each <prefix>N[R] row a shader reads, as bits of m[N][R].
+ * The translated shaders load a row whole into a temporary ("t21 = fcb1[6].xyzw;")
+ * and read its components ("t21.x"), or copy it ("t29 = t21;"): the components
+ * read through those; anything else (an index that is not a number, a
+ * temporary used whole) counts as all of them. */
+static unsigned swz_bits(const char *q)
+{
+    unsigned m = 0;
+    for (; *q == 'x' || *q == 'y' || *q == 'z' || *q == 'w' || *q == 'r' || *q == 'g' || *q == 'b' || *q == 'a'; q++)
+        m |= 1u << (*q == 'x' || *q == 'r' ? 0 : *q == 'y' || *q == 'g' ? 1 : *q == 'z' || *q == 'b' ? 2 : 3);
+    return m ? m : 15;
+}
+static int ident_at(const char *src, const char *q, size_t len)
+{
+    return (q == src || !(isalnum((unsigned char)q[-1]) || q[-1] == '_')) &&
+           !(isalnum((unsigned char)q[len]) || q[len] == '_');
+}
+/* the components of temporary <name> read (depth: copies followed) */
+static unsigned temp_reads(const char *src, const char *name, int depth)
+{
+    const size_t nl = strlen(name);
+    unsigned m = 0;
+    for (const char *q = src; (q = strstr(q, name)) != NULL; q += nl) {
+        if (!ident_at(src, q, nl))
+            continue;
+        const char *after = q + nl;
+        /* its definition ("    tN = ...;" or a declaration "float4 tN;") */
+        const char *ls = q;
+        while (ls > src && ls[-1] != '\n')
+            ls--;
+        while (*ls == ' ')
+            ls++;
+        if (ls == q && after[0] == ' ' && after[1] == '=' && after[2] == ' ')
+            continue;
+        if (*after == ';' && q > src && q[-1] == ' ' && ls != q)
+            if (!strncmp(ls, "float", 5) || !strncmp(ls, "int", 3) || !strncmp(ls, "bool", 4))
+                continue;
+        if (*after == '.') {
+            m |= swz_bits(after + 1);
+            continue;
+        }
+        /* "tM = tN;": what tM reads */
+        if (*after == ';' && q - ls > 4 && q[-3] == ' ' && q[-2] == '=' && q[-1] == ' ' && depth < 8) {
+            char other[32];
+            int ol = 0;
+            while (ls + ol < q - 3 && ol < 31 && ls[ol] != ' ')
+                ol++;
+            memcpy(other, ls, (size_t)ol);
+            other[ol] = 0;
+            if (ol && ls + ol == q - 3) {
+                m |= temp_reads(src, other, depth + 1);
+                continue;
+            }
+        }
+        return 15;
+    }
+    return m;
+}
+static void used_comps(const char *src, const char *prefix, uint8_t m[MAX_VBUF][32])
+{
+    const size_t pl = strlen(prefix);
+    for (const char *q = src; (q = strstr(q, prefix)) != NULL; q += pl) {
+        if (q > src && (isalnum((unsigned char)q[-1]) || q[-1] == '_'))
+            continue;
+        int n = 0, r = 0, len = 0, len2 = 0;
+        if (sscanf(q + pl, "%d[%n", &n, &len) != 1 || len == 0 || n < 0 || n >= MAX_VBUF)
+            continue;
+        if (sscanf(q + pl + len, "%d]%n", &r, &len2) != 1 || len2 == 0 || r < 0 || r >= 32) {
+            memset(m[n], 15, 32);            /* an index that is not a number: all of it */
+            continue;
+        }
+        const char *after = q + pl + len + len2;
+        unsigned c = 15;
+        if (*after == '.') {
+            c = swz_bits(after + 1);
+            /* "    tN = <row>.xyzw;": what tN reads */
+            const char *ls = q;
+            while (ls > src && ls[-1] != '\n')
+                ls--;
+            while (*ls == ' ')
+                ls++;
+            const char *end = after + 1;
+            while (isalpha((unsigned char)*end))
+                end++;
+            char name[32];
+            int nl = 0;
+            while (ls + nl < q && nl < 31 && ls[nl] != ' ')
+                nl++;
+            if (c == 15 && *end == ';' && nl && !strncmp(ls + nl, " = ", 3) && ls + nl + 3 == q) {
+                memcpy(name, ls, (size_t)nl);
+                name[nl] = 0;
+                c = temp_reads(src, name, 0);
+            }
+        }
+        m[n][r] |= (uint8_t)c;
+    }
+}
+
+MPipeline *metal_batch_pipeline(MPipeline *p)
+{
+    if (p->batch || p->batch_tried)
+        return p->batch;
+    p->batch_tried = 1;
+    if (p->vs < 0 || (p->attr_mask & 0xf000u) || getenv("MINA_NO_BATCH"))
+        return NULL;
+    /* one program per shader pair, as for the pipelines */
+    static struct { int vs, fs; MPipeline t; } progs[256];
+    static int nprogs;
+    int i = 0;
+    while (i < nprogs && !(progs[i].vs == p->vs && progs[i].fs == p->fs))
+        i++;
+    if (i == nprogs) {
+        int rows = 0;
+        char *src = batch_vsrc(g_shaders[p->vs].glsl, &rows);
+        if (!src || nprogs == (int)(sizeof progs / sizeof progs[0])) {
+            free(src);
+            return NULL;
+        }
+        MPipeline *t = &progs[nprogs].t;
+        memset(t, 0, sizeof *t);
+        t->vs = p->vs;
+        t->fs = p->fs;
+        t->vsrc_override = src;
+        t->batch_rows = rows;
+        t->bmask = calloc(1, sizeof *t->bmask);
+        used_comps(g_shaders[p->vs].glsl, "vcb", t->bmask->v);
+        if (p->fs >= 0)
+            used_comps(g_shaders[p->fs].glsl, "fcb", t->bmask->f);
+        gpu_lock();
+        link_program(t);
+        gpu_unlock();
+        progs[nprogs].vs = p->vs;
+        progs[nprogs].fs = p->fs;
+        nprogs++;
+        rt_log("[batch] vs %d fs %d: a batching program (%u)\n", p->vs, p->fs, t->prog);
+    }
+    const MPipeline *t = &progs[i].t;
+    MPipeline *b = malloc(sizeof *b);
+    *b = *p;
+    b->prog = t->prog;
+    memcpy(b->vcb, t->vcb, sizeof b->vcb);
+    memcpy(b->fcb, t->fcb, sizeof b->fcb);
+    memcpy(b->vcb_size, t->vcb_size, sizeof b->vcb_size);
+    memcpy(b->fcb_size, t->fcb_size, sizeof b->fcb_size);
+    memcpy(b->texb, t->texb, sizeof b->texb);
+    b->ntex = t->ntex;
+    b->yflip_loc = t->yflip_loc;
+    b->depth_cmp_loc = t->depth_cmp_loc;
+    b->dst_xform_loc = t->dst_xform_loc;
+    b->dst_depth_unit = t->dst_depth_unit;
+    b->shared_prog = 1;
+    b->vsrc_override = t->vsrc_override;
+    b->batch_rows = t->batch_rows;
+    b->bmask = t->bmask;
+    b->batch = NULL;
+    b->batch_tried = 1;
+    gpu_lock();
+    glGenVertexArrays(1, &b->vao);
+    gpu_unlock();
+    p->batch = b;
+    return b;
+}
+#else
+MPipeline *metal_batch_pipeline(MPipeline *p) { (void)p; return NULL; }
+void metal_batch_forget(MPipeline *bp) { (void)bp; }
+#endif
 
 /* GLSL 3.30 wants the interpolation qualifiers of the two stages to match:
  * copy the fragment shader's (flat / noperspective) onto the vertex outputs. */
@@ -1357,7 +1589,7 @@ static void link_program_here(MPipeline *p)
     GL_DIRTY();
 #if defined(__vita__)
     const char *fsrc = p->fs >= 0 ? g_shaders[p->fs].glsl : "void main(out float4 o0 : COLOR) { o0 = float4(0, 0, 0, 0); }\n";
-    char *vsrc = strdup(g_shaders[p->vs].glsl);
+    char *vsrc = strdup(p->vsrc_override ? p->vsrc_override : g_shaders[p->vs].glsl);
 #else
     const char *fsrc = p->fs >= 0 ? g_shaders[p->fs].glsl : "#version 330 core\nvoid main() {}\n";
     if (getenv("MINA_DEBUG_FS"))
@@ -1371,11 +1603,17 @@ static void link_program_here(MPipeline *p)
     glAttachShader(p->prog, vs);
     glAttachShader(p->prog, fs);
 #if defined(__vita__)
-    /* CG attributes are bound by name (a<N> is attribute N) */
-    for (int i = 0; i < MAX_ATTRS; i++) {
+    /* CG attributes are bound by name (a<N> is attribute N); vitaGL holds 16
+     * bindings a program: a batching variant's 12..15 are its mina_b<k> */
+    for (int i = 0; i < (p->vsrc_override ? 12 : MAX_ATTRS); i++) {
         char an[8];
         snprintf(an, sizeof an, "a%d", i);
         glBindAttribLocation(p->prog, (GLuint)i, an);
+    }
+    for (int k = 0; p->vsrc_override && k < p->batch_rows; k++) {
+        char an[12];
+        snprintf(an, sizeof an, "mina_b%d", k);
+        glBindAttribLocation(p->prog, (GLuint)(12 + k), an);
     }
 #endif
     glLinkProgram(p->prog);
@@ -2310,6 +2548,16 @@ void metal_present(uint64_t drawable)
                     if (n)
                         rt_log("[fps]   semaphore waits per frame (ms):%s\n", b);
                     memset(g_sem_wait_ns, 0, sizeof g_sem_wait_ns);
+                    struct SemSite { uint32_t id; uint64_t lr, ns; };
+                    extern struct SemSite g_sem_sites[16];
+                    n = 0;
+                    for (int i = 0; i < 16; i++)
+                        if (g_sem_sites[i].ns / frames > 300000 && n < 200)
+                            n += snprintf(b + n, sizeof b - n, " t%u@%llx %.1f", g_sem_sites[i].id,
+                                          (unsigned long long)g_sem_sites[i].lr, g_sem_sites[i].ns / 1e6 / frames);
+                    if (n)
+                        rt_log("[fps]   semaphore waits by site:%s\n", b);
+                    memset(g_sem_sites, 0, sizeof g_sem_sites);
                 }
                 {
                     extern uint32_t g_recalcs, g_recalc_same;
@@ -2325,6 +2573,19 @@ void metal_present(uint64_t drawable)
                        g_draw_calls / frames, g_draw_ns / 1e6 / frames, g_endenc_ns / 1e6 / frames,
                        g_present_sem_ns / 1e6 / frames, g_pipelines_made / (double)frames);
                 g_pipelines_made = 0;
+#if defined(__vita__)
+                {
+                    extern uint32_t g_batched_draws, g_batches;
+                    extern uint32_t g_batch_why[8];
+                    if (g_batches)
+                        rt_log("[fps]   batches: %u draws in %u batches; not joined: key %u, constants %u, vertices %u, "
+                               "no index data %u, encoder %u, pipeline %u\n", g_batched_draws / frames, g_batches / frames,
+                               g_batch_why[0] / frames, g_batch_why[1] / frames, g_batch_why[2] / frames,
+                               g_batch_why[3] / frames, g_batch_why[4] / frames, g_batch_why[5] / frames);
+                    memset(g_batch_why, 0, sizeof g_batch_why);
+                    g_batched_draws = g_batches = 0;
+                }
+#endif
                 extern uint64_t g_dp_ns[4];
                 if (g_dp_ns[0] + g_dp_ns[1] + g_dp_ns[2] + g_dp_ns[3]) {
                     rt_log("[fps]   indexed draws: setup %.1f ms, vertices %.1f ms, indices %.1f ms, GL draw %.1f ms\n",

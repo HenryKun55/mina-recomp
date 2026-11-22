@@ -172,7 +172,16 @@ typedef struct MPipeline {
     GLint depth_cmp_loc, dst_xform_loc;
     int dst_depth_unit;
     int shared_prog;         /* prog belongs to the program cache (one per shader pair, kept) */
+    /* Vita: draw batching (metal_batch_pipeline) - the same pipeline with the
+     * vertex shader's vcb1[0..3] read from attributes 12..15 (mina_b<k>) */
+    const char *vsrc_override;
+    struct MPipeline *batch;
+    int batch_tried, batch_rows;
+    /* variants: the components (bit c of [row]) of each constant buffer the shaders read */
+    struct BMask { uint8_t v[MAX_VBUF][32], f[MAX_VBUF][32]; } *bmask;
 } MPipeline;
+/* the batching variant of a pipeline (NULL: its vertex shader cannot be batched) */
+MPipeline *metal_batch_pipeline(MPipeline *p);
 
 /* GLSL translated from the game's metallibs (generated: build/gen/shaders.c) */
 typedef struct ShaderSrc {

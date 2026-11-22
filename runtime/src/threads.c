@@ -558,6 +558,7 @@ static void imp_pthread_setspecific(Ctx *c)
 
 /* ---- semaphores (libdispatch) ------------------------------------------------- */
 
+struct SemSite { uint32_t id; uint64_t lr, ns; };
 typedef struct HSem {
     pthread_mutex_t m;
     pthread_cond_t cv;
@@ -595,6 +596,18 @@ uint64_t g_present_sem_ns;
 static int hsem_wait_(HSem *s, uint64_t timeout);
 /* MINA_FPS: time each guest thread spends blocked in semaphores (by thread id) */
 uint64_t g_sem_wait_ns[32];
+/* and by the guest call site (x30): the 16 sites waited at the longest */
+struct SemSite g_sem_sites[16];
+static void sem_site_add(uint32_t id, uint64_t lr, uint64_t ns)
+{
+    for (int i = 0; i < 16; i++)
+        if (g_sem_sites[i].ns == 0 || (g_sem_sites[i].id == id && g_sem_sites[i].lr == lr)) {
+            g_sem_sites[i].id = id;
+            g_sem_sites[i].lr = lr;
+            g_sem_sites[i].ns += ns;
+            return;
+        }
+}
 static int hsem_wait(HSem *s, uint64_t timeout)
 {
     {
@@ -606,7 +619,16 @@ static int hsem_wait(HSem *s, uint64_t timeout)
             int r = (!g_present_thread_set || !pthread_equal(pthread_self(), g_present_thread)) ? hsem_wait_(s, timeout) : -1;
             if (r >= 0) {
                 clock_gettime(CLOCK_MONOTONIC, &b);
-                g_sem_wait_ns[id] += (uint64_t)(b.tv_sec - a.tv_sec) * 1000000000ull + (uint64_t)(b.tv_nsec - a.tv_nsec);
+                const uint64_t ns = (uint64_t)(b.tv_sec - a.tv_sec) * 1000000000ull + (uint64_t)(b.tv_nsec - a.tv_nsec);
+                g_sem_wait_ns[id] += ns;
+                {
+                    /* the waiting function's caller and its caller (frame records) */
+                    const uint64_t fp = tc->x[29];
+                    const uint64_t r1 = fp ? rt_ld64(G(fp + 8)) : 0;
+                    const uint64_t fp2 = fp ? rt_ld64(G(fp)) : 0;
+                    const uint64_t r2 = fp2 ? rt_ld64(G(fp2 + 8)) : 0;
+                    sem_site_add(id, (r1 & 0xffffffffull) << 32 | (r2 & 0xffffffffull), ns);
+                }
                 return r;
             }
         }

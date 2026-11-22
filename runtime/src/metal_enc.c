@@ -1,4 +1,5 @@
 /* Metal on OpenGL: render and blit command encoders (executed immediately). */
+#include <stddef.h>
 #include "metal_gl.h"
 
 #include <string.h>
@@ -23,6 +24,47 @@ static void gl_check(const char *where);
 static GLuint ring;
 static uint32_t ring_pos;
 
+#if defined(__vita__)
+/* vitaGL's glBufferSubData on a buffer drawn from in the last frames makes a
+ * new one and copies all of it (8 MiB for each upload): the ring's memory is
+ * written in place instead (glMapBuffer hands its pointer), and the ring
+ * starts over from 0 - it only gets a new store (orphaned) when it went round
+ * in fewer frames than the GPU can be behind. */
+static uint8_t *ring_ptr;
+static uint32_t ring_wrap_frame;
+static void ring_map(void)
+{
+    glBindBuffer(GL_ARRAY_BUFFER, ring);
+    ring_ptr = glMapBuffer(GL_ARRAY_BUFFER, GL_WRITE_ONLY);
+    glUnmapBuffer(GL_ARRAY_BUFFER);
+    if (!ring_ptr)
+        rt_fatal("metal: the vertex ring cannot be mapped");
+}
+static uint32_t ring_upload(const void *data, uint32_t size)
+{
+    if (!ring) {
+        glGenBuffers(1, &ring);
+        glBindBuffer(GL_ARRAY_BUFFER, ring);
+        glBufferData(GL_ARRAY_BUFFER, RING_SIZE, NULL, GL_STREAM_DRAW);
+        ring_map();
+    }
+    uint32_t pos = (ring_pos + 255u) & ~255u;
+    if (pos + size > RING_SIZE) {
+        if (size > RING_SIZE)
+            rt_fatal("metal: %u bytes for the vertex ring", size);
+        if (g_rdbg.presents - ring_wrap_frame < 4) {
+            glBindBuffer(GL_ARRAY_BUFFER, ring);
+            glBufferData(GL_ARRAY_BUFFER, RING_SIZE, NULL, GL_STREAM_DRAW);   /* orphan */
+            ring_map();
+        }
+        ring_wrap_frame = g_rdbg.presents;
+        pos = 0;
+    }
+    memcpy(ring_ptr + pos, data, size);
+    ring_pos = pos + size;
+    return pos;
+}
+#else
 static uint32_t ring_upload(const void *data, uint32_t size)
 {
     if (!ring) {
@@ -40,6 +82,7 @@ static uint32_t ring_upload(const void *data, uint32_t size)
     ring_pos = pos + size;
     return pos;
 }
+#endif
 
 /* ---- render encoder ------------------------------------------------------------------------ */
 
@@ -647,8 +690,11 @@ uint64_t metal_render_encoder(Ctx *c, uint64_t pd)
     return o;
 }
 
+static void batch_flush(void);
+static int batch_pending(void);
 static void re_endEncoding(Ctx *c)
 {
+    batch_flush();
     GL_DIRTY();
     REnc *e = objc_host(SELF);
     if (e->ended)
@@ -752,6 +798,9 @@ static void re_setViewport(Ctx *c)
     double h = u2d(rt_ld64(G(v + 24))), zn = u2d(rt_ld64(G(v + 32))), zf = u2d(rt_ld64(G(v + 40)));
     REnc *e = objc_host(SELF);
     double vp[6] = { x, y, w, h, zn, zf };
+    if (batch_pending() && e->vp_set && !memcmp(e->vp, vp, sizeof vp))
+        return;                          /* (the same: a held batch stays) */
+    batch_flush();
     memcpy(e->vp, vp, sizeof vp);
     e->vp_set = 1;
     if (e->begun)
@@ -762,8 +811,13 @@ static void re_setScissor(Ctx *c)
 {
     uint64_t r = MARG(0);
     REnc *e = objc_host(SELF);
+    int sc[4];
     for (int k = 0; k < 4; k++)
-        e->sc[k] = (int)rt_ld64(G(r + 8 * k));
+        sc[k] = (int)rt_ld64(G(r + 8 * k));
+    if (batch_pending() && e->sc_set && !memcmp(e->sc, sc, sizeof sc))
+        return;
+    batch_flush();
+    memcpy(e->sc, sc, sizeof sc);
     e->sc_set = 1;
     if (e->begun)
         glScissor(e->sc[0], screen_y(e, e->sc[1], e->sc[3]), e->sc[2], e->sc[3]);
@@ -991,28 +1045,11 @@ static void set_uniform1f(GLint loc, GLfloat v)
     if (!uni_memo_same(loc, &v, 4))
         glUniform1f(loc, v);
 }
+/* (no memo: a draw's constant buffers change from one draw to the next,
+ * comparing them cost more than it saved) */
 static void set_uniform4fv(GLint loc, GLsizei n, const GLfloat *d)
 {
-    const uint32_t len = (uint32_t)n * 16;
-    uint32_t h = ((uint32_t)loc * 2654435761u) >> 22;
-    for (int probe = 0; probe < 8; probe++, h = (h + 1) & 1023) {
-        UniMemo *m = &uni_memo[h];
-        if (m->loc == loc || m->loc == 0) {
-            if (m->loc == loc && m->len == len && !memcmp(m->data, d, len))
-                return;
-            if (m->cap < len) {
-                free(m->data);
-                m->cap = len < 64 ? 64 : len;
-                m->data = malloc(m->cap);
-            }
-            memcpy(m->data, d, len);
-            m->len = len;
-            m->loc = loc;
-            glUniform4fv(loc, n, d);
-            return;
-        }
-    }
-    glUniform4fv(loc, n, d);        /* (table crowded: no memo) */
+    glUniform4fv(loc, n, d);
 }
 static void apply_uniforms(REnc *e, MPipeline *p)
 {
@@ -1401,12 +1438,13 @@ static void depth_alias(REnc *e, MPipeline *p)
 }
 #endif
 
-static MPipeline *draw_setup(REnc *e)
+/* force: the pipeline to draw with instead of the bound one (its batching variant) */
+static MPipeline *draw_setup_p(REnc *e, MPipeline *force)
 {
     g_rdbg.stage = 1;
     if (!e->pipeline)
         return NULL;
-    MPipeline *p = objc_host(e->pipeline);
+    MPipeline *p = force ? force : (MPipeline *)objc_host(e->pipeline);
     g_rdbg.pipe = p;
     g_rdbg.vs = p->vs;
     g_rdbg.fs = p->fs;
@@ -1524,6 +1562,7 @@ static MPipeline *draw_setup(REnc *e)
     g_rdbg.stage = 9;
     return p;
 }
+static MPipeline *draw_setup(REnc *e) { return draw_setup_p(e, NULL); }
 
 static const uint8_t *binding_data(const Binding *b, uint32_t *avail);
 static void framelog_draw(REnc *e, MPipeline *p, const char *kind, uint32_t count)
@@ -1556,6 +1595,34 @@ static void framelog_draw(REnc *e, MPipeline *p, const char *kind, uint32_t coun
         const char *v = getenv("MINA_FRAMELOG_FS");
         dump_fs = v ? atoi(v) : -1;
     }
+    /* MINA_FRAMELOG_VS=n: that vertex shader's constant buffers and vertex bytes */
+    static int dump_vs = -2;
+    if (dump_vs == -2) {
+        const char *v = getenv("MINA_FRAMELOG_VS");
+        dump_vs = v ? atoi(v) : -1;
+    }
+    if (p->vs == dump_vs) {
+        for (int i = 0; i < MAX_VBUF; i++) {
+            uint32_t avail = 0;
+            const uint8_t *d = binding_data(&e->vb[i], &avail);
+            if (e->vb[i].buf && (!d || !avail)) {
+                const MBuffer *b = e->vb[i].buf;
+                rt_log("[frame %d]     vb%d: buffer %#llx at %u (length %u, gpu_only %d, shadow %d)\n", g_framelog, i,
+                       (unsigned long long)e->vb[i].obj, e->vb[i].offset, b->length, b->gpu_only, b->shadow != NULL);
+            }
+            if (!d || !avail)
+                continue;
+            char line[1024];
+            int m = snprintf(line, sizeof line, "[frame %d]     vb%d(%u%s):", g_framelog, i, avail,
+                             e->vb[i].buf && e->vb[i].buf->gl ? " private" : "");
+            for (uint32_t k = 0; k + 4 <= avail && k < 40 * 4 && m < (int)sizeof line; k += 4) {
+                float f;
+                memcpy(&f, d + k, 4);
+                m += snprintf(line + m, sizeof line - m, " %g", f);
+            }
+            rt_log("%s\n", line);
+        }
+    }
     if (p->fs == dump_fs) {
         for (int i = 0; i < MAX_VBUF; i++) {
             uint32_t avail = 0;
@@ -1574,10 +1641,294 @@ static void framelog_draw(REnc *e, MPipeline *p, const char *kind, uint32_t coun
     }
 }
 
+#if defined(__vita__)
+/* ---- draw batching -------------------------------------------------------------------------
+ * The game draws a sprite (a glyph and each of its outline copies, a tile of a
+ * dialog box's frame, a particle) per draw call: a quad of its own vertices,
+ * its transform in vcb1, everything else as in the draw before. With text on
+ * the screen that is ~700 draws a frame at ~45 us each on the Vita. Consecutive
+ * draws whose state is the same (pipeline, depth/stencil, viewport, scissor,
+ * textures and samplers, the bytes of every other constant buffer) go to the
+ * GPU as one: their triangles in their order, each vertex followed by its
+ * draw's vcb1[0..3], drawn by the pipeline's batching variant (the same shaders
+ * with vcb1 read from attributes 12..15: metal_batch_pipeline). The same
+ * triangles in the same order through the same arithmetic. MINA_NO_BATCH: off. */
+#define BATCH_UB 2048
+typedef struct BKey {
+    REnc *e;
+    uint64_t pipeline, ds;
+    uint32_t stencil_ref, cull, winding;
+    int vp_set, sc_set, to_display;
+    double vp[6];
+    int sc[4];
+    float depth_bias, depth_slope;
+    uint64_t tex[16], samp[16];
+} BKey;
+static struct {
+    int n;                       /* draws held */
+    BKey key;
+    MPipeline *p, *bp;
+    uint32_t vbi, vstride, voff, stride;
+    uint8_t ub[BATCH_UB];        /* the other constant buffers' bytes */
+    uint32_t ub_len;
+    uint8_t *v;                  /* vertices: each one's bytes, then vcb1[0..3] */
+    uint32_t nv, cap;
+    uint64_t held[34];           /* objects kept alive while held (a texture released between draws) */
+    int nheld;
+} B;
+static int batch_on = -1;
+uint32_t g_batched_draws, g_batches;
+uint32_t g_batch_why[8];     /* a held batch not joined: key, constants, vertices, no index data, encoder, pipeline */
+
+static void batch_key(BKey *k, REnc *e, MPipeline *p)
+{
+    memset(k, 0, sizeof *k);
+    k->e = e;
+    k->pipeline = e->pipeline;
+    k->ds = e->ds;
+    k->stencil_ref = e->stencil_ref;
+    k->cull = e->cull;
+    k->winding = e->winding;
+    k->vp_set = e->vp_set;
+    k->sc_set = e->sc_set;
+    k->to_display = e->to_display;
+    memcpy(k->vp, e->vp, sizeof k->vp);
+    memcpy(k->sc, e->sc, sizeof k->sc);
+    k->depth_bias = e->depth_bias;
+    k->depth_slope = e->depth_slope;
+    for (int i = 0; i < p->ntex && i < 16; i++) {
+        const int t = p->texb[i].tex & 15, sm = p->texb[i].samp;
+        k->tex[i] = p->texb[i].stage ? e->ftex[t] : e->vtex[t];
+        k->samp[i] = sm < 0 ? 0 : p->texb[i].stage ? e->fsamp[sm & 15] : e->vsamp[sm & 15];
+    }
+}
+
+/* The rows of every constant buffer but vcb1 the shaders read, as
+ * apply_uniforms would send them: into out (0: a row read is missing, so a
+ * draw would read an older value), or compared with B.ub (cmp). */
+static uint32_t batch_ub(REnc *e, MPipeline *p, MPipeline *bp, uint8_t *out, int cmp)
+{
+    uint32_t n = 0;
+    for (int st = 0; st < 2; st++)
+        for (int i = 0; i < MAX_VBUF; i++) {
+            const GLint loc = st ? p->fcb[i] : p->vcb[i];
+            if (loc < 0 || (!st && i == 1))
+                continue;
+            const uint8_t *rows = st ? bp->bmask->f[i] : bp->bmask->v[i];
+            const uint32_t size = (uint32_t)(st ? p->fcb_size[i] : p->vcb_size[i]);
+            uint32_t avail;
+            const uint8_t *d = NULL;
+            for (uint32_t r = 0; r < 32 && r < size; r++) {
+                if (!rows[r])
+                    continue;
+                if (!d && !(d = binding_data(st ? &e->fb[i] : &e->vb[i], &avail)))
+                    return 0;
+                if (r >= (avail / 16 < size ? avail / 16 : size))
+                    return 0;                /* not sent: the program keeps an older value */
+                for (int k = 0; k < 4; k++) {
+                    if (!(rows[r] & (1u << k)))
+                        continue;
+                    if (n + 4 > BATCH_UB)
+                        return 0;
+                    if (cmp ? memcmp(B.ub + n, d + 16 * r + 4 * k, 4) != 0 : (memcpy(out + n, d + 16 * r + 4 * k, 4), 0))
+                        return 0;
+                    n += 4;
+                }
+            }
+        }
+    return n ? n : 1;
+}
+static int batch_ub_same(REnc *e, MPipeline *p) { return batch_ub(e, p, B.bp, NULL, 1) != 0; }
+
+/* every attribute from one buffer, per vertex, float formats */
+static int batch_layout(MPipeline *p, uint32_t *vbi)
+{
+    int bi = -1;
+    for (int a = 0; a < MAX_ATTRS; a++) {
+        if (!(p->attr_mask & (1u << a)))
+            continue;
+        const int b = (int)(p->attrs[a].buffer % MAX_VBUF);
+        if (bi >= 0 && b != bi)
+            return 0;
+        bi = b;
+        VFmt vf;
+        if (p->attrs[a].format == 42 || !vertex_format(p->attrs[a].format, &vf) || vf.integer)
+            return 0;
+    }
+    if (bi < 0 || bi == 1 || p->vcb[bi] >= 0)
+        return 0;
+    const MVertexLayout *lay = &p->layouts[bi];
+    if (lay->step_fn != 1 || !lay->stride || lay->stride > 64)
+        return 0;
+    *vbi = (uint32_t)bi;
+    return 1;
+}
+
+static const uint8_t *batch_vdata(const Binding *bd, uint32_t *avail)
+{
+    const uint8_t *d = binding_data(bd, avail);
+    if (d)
+        return d;
+    if (bd->buf && bd->buf->gpu_only && bd->buf->shadow && bd->buf->length > bd->offset) {
+        *avail = bd->buf->length - bd->offset;
+        return bd->buf->shadow + bd->offset;
+    }
+    return NULL;
+}
+
+static int batch_append(REnc *e, const uint8_t *idx, uint32_t count, uint32_t type)
+{
+    uint32_t avail, mavail;
+    const uint8_t *vd = batch_vdata(&e->vb[B.vbi], &avail);
+    const uint8_t *m = binding_data(&e->vb[1], &mavail);
+    if (!vd || !m || mavail < 64)
+        return 0;
+    for (uint32_t i = 0; i < count; i++) {
+        const uint32_t v = type ? rt_ld32(idx + 4 * i) : rt_ld16(idx + 2 * i);
+        if ((uint64_t)(v + 1) * B.vstride > avail)
+            return 0;
+    }
+    const uint32_t need = (B.nv + count) * B.stride;
+    if (need > B.cap) {
+        B.cap = need * 2 > 65536 ? need * 2 : 65536;
+        B.v = realloc(B.v, B.cap);
+    }
+    uint8_t *o = B.v + B.nv * B.stride;
+    for (uint32_t i = 0; i < count; i++, o += B.stride) {
+        const uint32_t v = type ? rt_ld32(idx + 4 * i) : rt_ld16(idx + 2 * i);
+        memcpy(o, vd + v * B.vstride, B.vstride);
+        memcpy(o + B.voff, m, 64);
+    }
+    B.nv += count;
+    return 1;
+}
+
+static void batch_flush(void)
+{
+    if (!B.n)
+        return;
+    MPipeline *bp = B.bp;
+    glBindVertexArray(bp->vao);
+    /* from memory (vitaGL copies the vertices to its frame's GPU memory): from
+     * a buffer, its "packed" attributes keep their offset in the buffer in 16
+     * bits (the ring's go past 64 KiB) */
+    const uintptr_t pos = (uintptr_t)B.v;
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    for (int a = 0; a < MAX_ATTRS; a++) {
+        if (!(bp->attr_mask & (1u << a)))
+            continue;
+        const MVertexAttr *at = &bp->attrs[a];
+        VFmt vf;
+        vertex_format(at->format, &vf);
+        glEnableVertexAttribArray((GLuint)a);
+        glVertexAttribPointer((GLuint)a, vf.size, vf.type, vf.norm, (GLsizei)B.stride,
+                              (const void *)(pos + at->offset));
+    }
+    for (int k = 0; k < bp->batch_rows; k++) {
+        glEnableVertexAttribArray((GLuint)(12 + k));
+        glVertexAttribPointer((GLuint)(12 + k), 4, GL_FLOAT, GL_FALSE, (GLsizei)B.stride,
+                              (const void *)(pos + B.voff + 16 * (uint32_t)k));
+    }
+    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)B.nv);
+    gl_check("batch");
+    g_batches++;
+    g_batched_draws += (uint32_t)B.n;
+    B.n = 0;
+    B.nv = 0;
+    for (int i = 0; i < B.nheld; i++)
+        objc_release_obj(B.held[i]);
+    B.nheld = 0;
+}
+
+static int batch_pending(void) { return B.n; }
+void metal_batch_forget(MPipeline *bp)
+{
+    if (B.n && B.bp == bp)
+        batch_flush();
+}
+
+/* drawIndexedPrimitives through the batch: 1 when it was taken (held, or
+ * nothing to draw); otherwise what is held is drawn and the caller draws it */
+static int batch_draw(Ctx *c, REnc *e, uint32_t instances)
+{
+    if (batch_on < 0)
+        batch_on = getenv("MINA_NO_BATCH") == NULL;
+    if (!batch_on || g_framelog || !e->pipeline) {
+        batch_flush();
+        return 0;
+    }
+    const uint32_t prim = (uint32_t)MARG(0), count = (uint32_t)MARG(1), type = (uint32_t)MARG(2);
+    const uint32_t off = (uint32_t)MARG(4);
+    MBuffer *ib = MARG(3) ? objc_host(MARG(3)) : NULL;
+    MPipeline *p = objc_host(e->pipeline);
+    const uint32_t isz = type ? 4 : 2;
+    const uint8_t *idx = NULL;
+    if (prim == 3 && instances == 1 && ib && count && count % 3 == 0 && count <= 96 && e->begun && !e->folded)
+        idx = ib->gpu_only ? (ib->shadow && off + count * isz <= ib->length ? ib->shadow + off : NULL)
+                           : G(metal_buf_mem(ib) + off);
+    if (idx && B.n && B.key.e == e && B.p == p) {
+        BKey k;
+        batch_key(&k, e, p);
+        if (!memcmp(&k, &B.key, sizeof k) && batch_ub_same(e, p) && batch_append(e, idx, count, type)) {
+            B.n++;
+            return 1;
+        }
+        g_batch_why[!memcmp(&k, &B.key, sizeof k) ? (batch_ub_same(e, p) ? 2 : 1) : 0]++;
+    } else if (B.n) {
+        g_batch_why[!idx ? 3 : B.key.e != e ? 4 : 5]++;
+    }
+    batch_flush();
+    if (!idx)
+        return 0;
+    uint32_t vbi;
+    if (!batch_layout(p, &vbi))
+        return 0;
+    MPipeline *bp = metal_batch_pipeline(p);
+    if (!bp)
+        return 0;
+    const uint32_t ub = batch_ub(e, p, bp, B.ub, 0);
+    if (!ub)
+        return 0;
+    B.ub_len = ub;
+    B.p = p;
+    B.bp = bp;
+    B.vbi = vbi;
+    B.vstride = p->layouts[vbi].stride;
+    B.voff = (B.vstride + 3) & ~3u;
+    B.stride = B.voff + 64;
+    B.nv = 0;
+    if (!batch_append(e, idx, count, type))
+        return 0;
+    if (!draw_setup_p(e, bp)) {          /* nothing to draw (as for the draw itself) */
+        B.nv = 0;
+        return 1;
+    }
+    batch_key(&B.key, e, p);
+    B.n = 1;
+    B.nheld = 0;
+    B.held[B.nheld++] = objc_retain_obj(e->pipeline);
+    if (e->ds)
+        B.held[B.nheld++] = objc_retain_obj(e->ds);
+    for (int i = 0; i < p->ntex && i < 16; i++) {
+        if (B.key.tex[i])
+            B.held[B.nheld++] = objc_retain_obj(B.key.tex[i]);
+        if (B.key.samp[i] && B.nheld < 34)
+            B.held[B.nheld++] = objc_retain_obj(B.key.samp[i]);
+        if (B.nheld >= 33)
+            break;
+    }
+    return 1;
+}
+#else
+static void batch_flush(void) {}
+static int batch_pending(void) { return 0; }
+#endif
+
 /* drawPrimitives:vertexStart:vertexCount:[instanceCount:] */
 static void draw_arrays(Ctx *c, uint32_t instances)
 {
     REnc *e = objc_host(SELF);
+    batch_flush();
 #if defined(__vita__)
     if (e->pipeline && fold_pass(e, objc_host(e->pipeline), (uint32_t)MARG(2), instances))
         return;
@@ -1627,6 +1978,10 @@ static void draw_indexed(Ctx *c, uint32_t instances)
         drawprof = getenv("MINA_DRAWPROF") != NULL;
     uint64_t dp_t = drawprof ? dp_now() : 0;
     REnc *e = objc_host(SELF);
+#if defined(__vita__)
+    if (batch_draw(c, e, instances))
+        return;
+#endif
     MPipeline *p = draw_setup(e);
     DP_MARK(0);
     if (!p)
@@ -1648,8 +2003,14 @@ static void draw_indexed(Ctx *c, uint32_t instances)
     }
     apply_vertices(e, p, maxv, instances);
     DP_MARK(1);
-    if (g_framelog)
+    if (g_framelog) {
         framelog_draw(e, p, "indexed", count);
+        const char *v = getenv("MINA_FRAMELOG_VS");
+        if (v && atoi(v) == p->vs)
+            rt_log("[frame %d]     ib %#llx at %u (gpu_only %d, shadow %d) first %u max %u\n", g_framelog,
+                   (unsigned long long)MARG(3), off, ib->gpu_only, ib->shadow != NULL,
+                   idx ? (type ? rt_ld32(idx) : rt_ld16(idx)) : 0, maxv);
+    }
     uint32_t ipos;
     if (ib->gpu_only) {
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ib->gl);
