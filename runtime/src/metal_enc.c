@@ -774,10 +774,14 @@ static void re_setFragmentBufferOffset(Ctx *c) { ((REnc *)objc_host(SELF))->fb[M
 static void re_setVertexBytes(Ctx *c) { set_bytes(&((REnc *)objc_host(SELF))->vb[MARG(2) % MAX_VBUF], MARG(0), (uint32_t)MARG(1)); }
 static void re_setFragmentBytes(Ctx *c) { set_bytes(&((REnc *)objc_host(SELF))->fb[MARG(2) % MAX_VBUF], MARG(0), (uint32_t)MARG(1)); }
 
+/* bumped by every change to the state a batch is keyed on (batch_key):
+ * while it holds, a draw's key is the batch's */
+static uint32_t g_kgen;
 static void set_obj(uint64_t *slot, uint64_t v)
 {
     if (*slot == v)
         return;
+    g_kgen++;
     objc_retain_obj(v);
     objc_release_obj(*slot);
     *slot = v;
@@ -788,9 +792,9 @@ static void re_setVertexSampler(Ctx *c) { set_obj(&((REnc *)objc_host(SELF))->vs
 static void re_setFragmentSampler(Ctx *c) { set_obj(&((REnc *)objc_host(SELF))->fsamp[MARG(1) & 15], MARG(0)); }
 static void re_setPipeline(Ctx *c) { set_obj(&((REnc *)objc_host(SELF))->pipeline, MARG(0)); }
 static void re_setDepthStencil(Ctx *c) { set_obj(&((REnc *)objc_host(SELF))->ds, MARG(0)); }
-static void re_setStencilRef(Ctx *c) { ((REnc *)objc_host(SELF))->stencil_ref = (uint32_t)MARG(0); }
-static void re_setCull(Ctx *c) { ((REnc *)objc_host(SELF))->cull = (uint32_t)MARG(0); }
-static void re_setWinding(Ctx *c) { ((REnc *)objc_host(SELF))->winding = (uint32_t)MARG(0); }
+static void re_setStencilRef(Ctx *c) { g_kgen++; ((REnc *)objc_host(SELF))->stencil_ref = (uint32_t)MARG(0); }
+static void re_setCull(Ctx *c) { g_kgen++; ((REnc *)objc_host(SELF))->cull = (uint32_t)MARG(0); }
+static void re_setWinding(Ctx *c) { g_kgen++; ((REnc *)objc_host(SELF))->winding = (uint32_t)MARG(0); }
 
 /* setViewport:(MTLViewport) — six doubles: not an HFA (more than four
  * members), so the 48-byte struct is passed by pointer */
@@ -806,6 +810,7 @@ static void re_setViewport(Ctx *c)
     batch_flush();
     memcpy(e->vp, vp, sizeof vp);
     e->vp_set = 1;
+    g_kgen++;
     if (e->begun)
         apply_viewport(e);
 }
@@ -822,6 +827,7 @@ static void re_setScissor(Ctx *c)
     batch_flush();
     memcpy(e->sc, sc, sizeof sc);
     e->sc_set = 1;
+    g_kgen++;
     if (e->begun)
         glScissor(e->sc[0], screen_y(e, e->sc[1], e->sc[3]), e->sc[2], e->sc[3]);
 }
@@ -832,6 +838,7 @@ static void re_setDepthBias(Ctx *c)
     REnc *e = objc_host(SELF);
     e->depth_bias = c->v[0].f[0];
     e->depth_slope = c->v[1].f[0];
+    g_kgen++;
 }
 static void re_nop(Ctx *c) { (void)c; }
 static void re_label(Ctx *c) { RET(0); }
@@ -1685,6 +1692,7 @@ typedef struct BKey {
 static struct {
     int n;                       /* draws held */
     BKey key;
+    uint32_t kgen;               /* g_kgen when key was taken */
     MPipeline *p, *bp;
     uint32_t vbi, vstride, voff, stride;
     uint8_t ub[BATCH_UB];        /* the other constant buffers' bytes */
@@ -1966,13 +1974,17 @@ static int batch_draw(Ctx *c, REnc *e, uint32_t instances)
         idx = ib->gpu_only ? (ib->shadow && off + count * isz <= ib->length ? ib->shadow + off : NULL)
                            : G(metal_buf_mem(ib) + off);
     if (idx && B.n && B.key.e == e && B.p == p) {
+        int same = g_kgen == B.kgen;
         BKey k;
-        batch_key(&k, e, p);
-        if (key_same(&k, &B.key) && batch_ub_same(e, p) && batch_append(e, idx, count, type)) {
+        if (!same) {
+            batch_key(&k, e, p);
+            same = key_same(&k, &B.key);
+        }
+        if (same && batch_ub_same(e, p) && batch_append(e, idx, count, type)) {
             B.n++;
             return 1;
         }
-        g_batch_why[key_same(&k, &B.key) ? (batch_ub_same(e, p) ? 2 : 1) : 0]++;
+        g_batch_why[same ? (batch_ub_same(e, p) ? 2 : 1) : 0]++;
     } else if (B.n) {
         g_batch_why[!idx ? 3 : B.key.e != e ? 4 : 5]++;
     }
@@ -2005,6 +2017,7 @@ static int batch_draw(Ctx *c, REnc *e, uint32_t instances)
         return 1;
     }
     batch_key(&B.key, e, p);
+    B.kgen = g_kgen;
     B.n = 1;
     B.nheld = 0;
     B.held[B.nheld++] = objc_retain_obj(e->pipeline);
