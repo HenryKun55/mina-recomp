@@ -1023,7 +1023,10 @@ def glsl_to_cg(glsl, stage):
         if m:
             samplers[m.group(2)] = m.group(1)
             if m.group(1) == "sampler2DMS":
-                raise ValueError("multisampled textures have no CG form")
+                # no MSAA on the Vita: a multisampled texture is a plain one, and
+                # its samples' fetches (texelFetch below drops the index) read it
+                samplers[m.group(2)] = "sampler2D"
+                line = line.replace("sampler2DMS", "sampler2D")
         decls.append(_cg_types(line))
     # GXM keeps Metal's depth: the runtime maps it with glDepthRange, so z is
     # not moved to GL's -w..w (GXM clips below 0 like Metal, it seems)
@@ -1065,6 +1068,7 @@ def glsl_to_cg(glsl, stage):
             decls.append(decl)
         return "((int2)(%s_texsize))" % m.group(1)
     body = re.sub(r"\btextureSize\((\w+), [^)]*\)", texsize, body)
+    body = re.sub(r"\btextureSize\((\w+)\)", texsize, body)        # a multisampled texture's (no lod)
     # texelFetch(s, p, lod): tex2D at the texel's center (tex2Dfetch does not
     # read like GLSL's on the Vita; the textures read this way are nearest)
     def fetch(m):
