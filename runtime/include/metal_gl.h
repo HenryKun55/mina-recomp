@@ -179,6 +179,7 @@ typedef struct MPipeline {
     int batch_tried, batch_rows;
     /* variants: the components (bit c of [row]) of each constant buffer the shaders read */
     struct BMask { uint8_t v[MAX_VBUF][32], f[MAX_VBUF][32]; } *bmask;
+    void *bplan;             /* metal_enc.c: the words of those to compare (made at the first batch) */
 } MPipeline;
 /* the batching variant of a pipeline (NULL: its vertex shader cannot be batched) */
 MPipeline *metal_batch_pipeline(MPipeline *p);

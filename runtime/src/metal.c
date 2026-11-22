@@ -1245,6 +1245,7 @@ static void pipe_dealloc(void *h)
         void metal_batch_forget(MPipeline *bp);
         metal_batch_forget(p->batch);       /* (a batch held with it is drawn first) */
         if (p->batch->vao) glDeleteVertexArrays(1, &p->batch->vao);
+        free(p->batch->bplan);
         free(p->batch);
     }
     gpu_unlock();

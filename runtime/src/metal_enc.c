@@ -1662,7 +1662,7 @@ typedef struct BKey {
     double vp[6];
     int sc[4];
     float depth_bias, depth_slope;
-    uint64_t tex[16], samp[16];
+    uint64_t tex[8], samp[8];
 } BKey;
 static struct {
     int n;                       /* draws held */
@@ -1696,46 +1696,106 @@ static void batch_key(BKey *k, REnc *e, MPipeline *p)
     memcpy(k->sc, e->sc, sizeof k->sc);
     k->depth_bias = e->depth_bias;
     k->depth_slope = e->depth_slope;
-    for (int i = 0; i < p->ntex && i < 16; i++) {
+    for (int i = 0; i < p->ntex && i < 8; i++) {
         const int t = p->texb[i].tex & 15, sm = p->texb[i].samp;
         k->tex[i] = p->texb[i].stage ? e->ftex[t] : e->vtex[t];
         k->samp[i] = sm < 0 ? 0 : p->texb[i].stage ? e->fsamp[sm & 15] : e->vsamp[sm & 15];
     }
 }
+static int key_same(const BKey *a, const BKey *b)
+{
+    const uint64_t *x = (const uint64_t *)(const void *)a, *y = (const uint64_t *)(const void *)b;
+    for (size_t i = 0; i < sizeof *a / 8; i++)
+        if (x[i] != y[i])
+            return 0;
+    return 1;
+}
 
 /* The rows of every constant buffer but vcb1 the shaders read, as
  * apply_uniforms would send them: into out (0: a row read is missing, so a
  * draw would read an older value), or compared with B.ub (cmp). */
-static uint32_t batch_ub(REnc *e, MPipeline *p, MPipeline *bp, uint8_t *out, int cmp)
+/* what batch_ub reads, made once per variant: for each constant buffer the
+ * shaders read (but vcb1), the bytes the draw must have sent, and the runs of
+ * 4-byte words read */
+typedef struct BPlan {
+    int nbuf, nrun, ok;
+    struct { uint8_t st, idx; uint16_t need, run0, nrun; } buf[16];
+    struct { uint16_t off, words; } run[96];
+} BPlan;
+static BPlan *batch_plan(MPipeline *p, MPipeline *bp)
 {
-    uint32_t n = 0;
-    for (int st = 0; st < 2; st++)
-        for (int i = 0; i < MAX_VBUF; i++) {
+    if (bp->bplan)
+        return bp->bplan;
+    BPlan *pl = calloc(1, sizeof *pl);
+    pl->ok = 1;
+    for (int st = 0; st < 2 && pl->ok; st++)
+        for (int i = 0; i < MAX_VBUF && pl->ok; i++) {
             const GLint loc = st ? p->fcb[i] : p->vcb[i];
             if (loc < 0 || (!st && i == 1))
                 continue;
             const uint8_t *rows = st ? bp->bmask->f[i] : bp->bmask->v[i];
             const uint32_t size = (uint32_t)(st ? p->fcb_size[i] : p->vcb_size[i]);
-            uint32_t avail;
-            const uint8_t *d = NULL;
-            for (uint32_t r = 0; r < 32 && r < size; r++) {
-                if (!rows[r])
+            int first = 1;
+            for (uint32_t w = 0; w < 32 * 4 && w / 4 < size; w++) {
+                if (!(rows[w / 4] & (1u << (w & 3))))
                     continue;
-                if (!d && !(d = binding_data(st ? &e->fb[i] : &e->vb[i], &avail)))
-                    return 0;
-                if (r >= (avail / 16 < size ? avail / 16 : size))
-                    return 0;                /* not sent: the program keeps an older value */
-                for (int k = 0; k < 4; k++) {
-                    if (!(rows[r] & (1u << k)))
-                        continue;
-                    if (n + 4 > BATCH_UB)
-                        return 0;
-                    if (cmp ? memcmp(B.ub + n, d + 16 * r + 4 * k, 4) != 0 : (memcpy(out + n, d + 16 * r + 4 * k, 4), 0))
-                        return 0;
-                    n += 4;
+                if (first) {
+                    if (pl->nbuf == 16) {
+                        pl->ok = 0;
+                        break;
+                    }
+                    pl->buf[pl->nbuf].st = (uint8_t)st;
+                    pl->buf[pl->nbuf].idx = (uint8_t)i;
+                    pl->buf[pl->nbuf].run0 = (uint16_t)pl->nrun;
+                    pl->nbuf++;
+                    first = 0;
+                }
+                pl->buf[pl->nbuf - 1].need = (uint16_t)((w / 4 + 1) * 16);
+                if (pl->nrun && pl->buf[pl->nbuf - 1].nrun &&
+                    pl->run[pl->nrun - 1].off + 4 * pl->run[pl->nrun - 1].words == 4 * w)
+                    pl->run[pl->nrun - 1].words++;
+                else if (pl->nrun == 96)
+                    pl->ok = 0;
+                else {
+                    pl->run[pl->nrun].off = (uint16_t)(4 * w);
+                    pl->run[pl->nrun].words = 1;
+                    pl->nrun++;
+                    pl->buf[pl->nbuf - 1].nrun++;
                 }
             }
         }
+    bp->bplan = pl;
+    return pl;
+}
+/* The words of every constant buffer but vcb1 the shaders read, as
+ * apply_uniforms sent them: into out (0: one read was not sent, so the draw
+ * would read an older value), or compared with B.ub (cmp) */
+static uint32_t batch_ub(REnc *e, MPipeline *p, MPipeline *bp, uint8_t *out, int cmp)
+{
+    const BPlan *pl = batch_plan(p, bp);
+    if (!pl->ok)
+        return 0;
+    uint32_t n = 0;
+    for (int b = 0; b < pl->nbuf; b++) {
+        const int st = pl->buf[b].st, i = pl->buf[b].idx;
+        uint32_t avail;
+        const uint8_t *d = binding_data(st ? &e->fb[i] : &e->vb[i], &avail);
+        if (!d || avail < pl->buf[b].need)
+            return 0;
+        for (int r = pl->buf[b].run0; r < pl->buf[b].run0 + pl->buf[b].nrun; r++) {
+            const uint32_t len = 4u * pl->run[r].words;
+            if (n + len > BATCH_UB)
+                return 0;
+            if (cmp) {
+                const uint8_t *x = B.ub + n, *y = d + pl->run[r].off;
+                for (uint32_t k = 0; k < len; k += 4)
+                    if (rt_ld32(x + k) != rt_ld32(y + k))
+                        return 0;
+            } else
+                memcpy(out + n, d + pl->run[r].off, len);
+            n += len;
+        }
+    }
     return n ? n : 1;
 }
 static int batch_ub_same(REnc *e, MPipeline *p) { return batch_ub(e, p, B.bp, NULL, 1) != 0; }
@@ -1869,11 +1929,11 @@ static int batch_draw(Ctx *c, REnc *e, uint32_t instances)
     if (idx && B.n && B.key.e == e && B.p == p) {
         BKey k;
         batch_key(&k, e, p);
-        if (!memcmp(&k, &B.key, sizeof k) && batch_ub_same(e, p) && batch_append(e, idx, count, type)) {
+        if (key_same(&k, &B.key) && batch_ub_same(e, p) && batch_append(e, idx, count, type)) {
             B.n++;
             return 1;
         }
-        g_batch_why[!memcmp(&k, &B.key, sizeof k) ? (batch_ub_same(e, p) ? 2 : 1) : 0]++;
+        g_batch_why[key_same(&k, &B.key) ? (batch_ub_same(e, p) ? 2 : 1) : 0]++;
     } else if (B.n) {
         g_batch_why[!idx ? 3 : B.key.e != e ? 4 : 5]++;
     }
@@ -1881,7 +1941,7 @@ static int batch_draw(Ctx *c, REnc *e, uint32_t instances)
     if (!idx)
         return 0;
     uint32_t vbi;
-    if (!batch_layout(p, &vbi))
+    if (p->ntex > 8 || !batch_layout(p, &vbi))
         return 0;
     MPipeline *bp = metal_batch_pipeline(p);
     if (!bp)
@@ -1909,7 +1969,7 @@ static int batch_draw(Ctx *c, REnc *e, uint32_t instances)
     B.held[B.nheld++] = objc_retain_obj(e->pipeline);
     if (e->ds)
         B.held[B.nheld++] = objc_retain_obj(e->ds);
-    for (int i = 0; i < p->ntex && i < 16; i++) {
+    for (int i = 0; i < p->ntex && i < 8; i++) {
         if (B.key.tex[i])
             B.held[B.nheld++] = objc_retain_obj(B.key.tex[i]);
         if (B.key.samp[i] && B.nheld < 34)
@@ -1994,7 +2054,15 @@ static void draw_indexed(Ctx *c, uint32_t instances)
     uint32_t isz = type ? 4 : 2;
     const uint8_t *idx = ib->gpu_only ? (ib->shadow ? ib->shadow + off : NULL) : G(metal_buf_mem(ib) + off);
     uint32_t maxv = UINT32_MAX;          /* unknown: shared vertex buffers go up whole */
-    if (idx) {
+    /* (only a buffer that goes up needs it: the tile layers' private meshes
+     * read ~100k indices a frame) */
+    int uploads = 0;
+    for (int a = 0; a < MAX_ATTRS && !uploads; a++)
+        if (p->attr_mask & (1u << a)) {
+            const Binding *bd = &e->vb[p->attrs[a].buffer % MAX_VBUF];
+            uploads = !(bd->buf && bd->buf->gpu_only);
+        }
+    if (idx && uploads) {
         maxv = 0;
         for (uint32_t i = 0; i < count; i++) {
             uint32_t v = type ? rt_ld32(idx + 4 * i) : rt_ld16(idx + 2 * i);
@@ -2350,3 +2418,38 @@ static const Method benc_m[] = {
     { NULL, NULL },
 };
 Class cls_BlitEnc = { "MTLBlitCommandEncoder_GL", "NSObject", benc_m, NULL, sizeof(BEnc), NULL };
+
+/* ---- for ycRenderDevice::DrawCall's native: the render encoder's state ------------------
+ * A message that would change nothing (the value the encoder already holds:
+ * its setter returns at once) is not sent; the bytes and the draw go to the
+ * methods directly. Render thread. */
+void *metal_renc_of(uint64_t obj)
+{
+    Obj *o = obj ? objc_obj_tagged(obj) : NULL;
+    return o && o->cls == &cls_RenderEnc ? o->host : NULL;
+}
+int renc_same_pipeline(void *re, uint64_t v) { return ((REnc *)re)->pipeline == v; }
+int renc_same_tex(void *re, int frag, int i, uint64_t t)
+{
+    return (frag ? ((REnc *)re)->ftex : ((REnc *)re)->vtex)[i & 15] == t;
+}
+int renc_same_stencil_ref(void *re, uint32_t v) { return ((REnc *)re)->stencil_ref == v; }
+int renc_same_winding(void *re, uint32_t v) { return ((REnc *)re)->winding == v; }
+int renc_same_cull(void *re, uint32_t v) { return ((REnc *)re)->cull == v; }
+int renc_same_bias(void *re, float b, float s)
+{
+    const REnc *e = re;
+    return !memcmp(&e->depth_bias, &b, 4) && !memcmp(&e->depth_slope, &s, 4);
+}
+int renc_same_vbuffer(void *re, int i, uint64_t buf, uint32_t off)
+{
+    const Binding *b = &((REnc *)re)->vb[i % MAX_VBUF];
+    return b->obj == buf && !b->nbytes && b->offset == off;
+}
+void renc_set_bytes(void *re, int frag, int i, uint64_t src, uint32_t n)
+{
+    REnc *e = re;
+    set_bytes(frag ? &e->fb[i % MAX_VBUF] : &e->vb[i % MAX_VBUF], src, n);
+}
+/* drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset: with c->x[0] the encoder, x[2..6] its arguments */
+void renc_draw_indexed(Ctx *c) { re_drawIndexed(c); }

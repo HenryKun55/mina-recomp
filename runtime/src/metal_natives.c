@@ -101,6 +101,18 @@ static uint32_t tex_samples(uint64_t t)
     return m ? m->samples : 0;
 }
 
+/* metal_enc.c: the render encoder's state (DrawCall skips messages that change nothing) */
+void *metal_renc_of(uint64_t obj);
+int renc_same_pipeline(void *re, uint64_t v);
+int renc_same_tex(void *re, int frag, int i, uint64_t t);
+int renc_same_stencil_ref(void *re, uint32_t v);
+int renc_same_winding(void *re, uint32_t v);
+int renc_same_cull(void *re, uint32_t v);
+int renc_same_bias(void *re, float b, float s);
+int renc_same_vbuffer(void *re, int i, uint64_t buf, uint32_t off);
+void renc_set_bytes(void *re, int frag, int i, uint64_t src, uint32_t n);
+void renc_draw_indexed(Ctx *c);
+
 /* set a property to v if it is not v already; 1 if it changed */
 static int upd(uint64_t obj, const char *key, uint64_t v)
 {
@@ -217,6 +229,7 @@ void nat__ZN14ycRenderDevice8DrawCallEPv(Ctx *c)
         return;
     }
     const uint64_t pass = L64(G_CUR_PASS), dev = L64(G_DEVICE);
+    void *const re = metal_renc_of(pass);    /* our encoder: messages that change nothing are not sent */
     int changed = 0;
     uint64_t key[SNAP_MAX];
     const int nkey = snap_key(gm_, P, R, key);
@@ -344,7 +357,8 @@ void nat__ZN14ycRenderDevice8DrawCallEPv(Ctx *c)
         sn->desc = 0;
     }
 pipeline_set:
-    SEND("setRenderPipelineState:", pass, L64(R + 0x128));
+    if (!re || !renc_same_pipeline(re, L64(R + 0x128)))
+        SEND("setRenderPipelineState:", pass, L64(R + 0x128));
 
     if (pass) {
         /* ---- constant buffers ---- */
@@ -360,6 +374,13 @@ pipeline_set:
                 uint64_t len = (uint64_t)L32(e + 0x10) << 4;
                 len = len < 0x1000 ? len : 0x1000;
                 len = len > 0x80 ? len : 0x80;
+                if (re) {
+                    if (vs)
+                        renc_set_bytes(re, 0, i, data, (uint32_t)len);
+                    if (fs)
+                        renc_set_bytes(re, 1, i, data, (uint32_t)len);
+                    continue;
+                }
                 if (vs)
                     SEND("setVertexBytes:length:atIndex:", pass, data, len, (uint64_t)i);
                 if (fs)
@@ -399,9 +420,9 @@ pipeline_set:
             case 3: tex = L64(o + 0x18); break;
             case 4: tex = L64(o + 0x8); break;
             }
-            if ((fl >> 8 & 1) && (L64(R + 0x8) >> i & 1))
+            if ((fl >> 8 & 1) && (L64(R + 0x8) >> i & 1) && !(re && renc_same_tex(re, 0, i, tex)))
                 SEND("setVertexTexture:atIndex:", pass, tex, (uint64_t)i);
-            if ((fl >> 9 & 1) && (L64(R + 0x18) >> i & 1))
+            if ((fl >> 9 & 1) && (L64(R + 0x18) >> i & 1) && !(re && renc_same_tex(re, 1, i, tex)))
                 SEND("setFragmentTexture:atIndex:", pass, tex, (uint64_t)i);
         }
         /* ---- samplers ---- */
@@ -495,7 +516,7 @@ pipeline_set:
             mh = (mh ^ raw[i]) * 16777619u;
         __typeof__(&ds_memo[0]) dm = &ds_memo[mh & 63];
         if (dm->valid && !memcmp(dm->raw, raw, 16) && dm->h == L64(G_DS_HASH)) {
-            if (L8(P + 0x20e))
+            if (L8(P + 0x20e) && !(re && renc_same_stencil_ref(re, L8(P + 0x203))))
                 SEND("setStencilReferenceValue:", pass, (uint64_t)L8(P + 0x203));
             goto ds_done;
         }
@@ -566,16 +587,18 @@ ds_done:
         c->sp = sp;
         S8(G_APPLY_SCISSOR, 0);
     }
-    SEND("setFrontFacingWinding:", pass, 1);
-    if (L8(P + 0x1f1) <= 2)
+    if (!(re && renc_same_winding(re, 1)))
+        SEND("setFrontFacingWinding:", pass, 1);
+    if (L8(P + 0x1f1) <= 2 && !(re && renc_same_cull(re, L8(P + 0x1f1))))
         SEND("setCullMode:", pass, (uint64_t)L8(P + 0x1f1));
     memcpy(&c->v[0].f[0], GP(P + 0x1f4), 4);
     memcpy(&c->v[1].f[0], GP(P + 0x1f8), 4);
     memcpy(&c->v[2].f[0], GP(P + 0x1fc), 4);
-    SEND("setDepthBias:slopeScale:clamp:", pass);
+    if (!(re && renc_same_bias(re, c->v[0].f[0], c->v[1].f[0])))
+        SEND("setDepthBias:slopeScale:clamp:", pass);
     for (int k = 0; k < 3; k++) {
         const uint64_t vb = L64(P + 0x10 + k * 8);
-        if (vb)
+        if (vb && !(re && renc_same_vbuffer(re, 8 + k, L64(vb + 0x18), 0)))
             SEND("setVertexBuffer:offset:atIndex:", pass, L64(vb + 0x18), 0, (uint64_t)(8 + k));
     }
 
@@ -593,7 +616,15 @@ ds_done:
     const uint64_t ib = L64(P + 0x30);
     const uint32_t isz = L32(ib + 0xc);
     const uint64_t buf = L64(ib + 0x18);
-    if (inst < 2)
+    if (inst < 2 && re) {
+        c->x[0] = pass;
+        c->x[2] = prim;
+        c->x[3] = count;
+        c->x[4] = (uint64_t)(isz != 2);
+        c->x[5] = buf;
+        c->x[6] = (uint64_t)(uint32_t)(isz * (uint32_t)start);
+        renc_draw_indexed(c);
+    } else if (inst < 2)
         SEND("drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:", pass, prim, count,
              (uint64_t)(isz != 2), buf, (uint64_t)(uint32_t)(isz * (uint32_t)start));
     else
