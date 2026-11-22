@@ -2546,3 +2546,18 @@ void nat__ZN8AnimTile10PostUpdateEP20ycUpdateQueueContext(Ctx *c)
         f_9a7b98(c);
     }
 }
+
+/* ---- SessionManager::StartActiveSaveSlot -------------------------------------------------------
+ * MINA_START_LEVEL (tests): the game, once its save slot starts, goes to that
+ * level instead (the level index it was about to warp to, 0x1e48120) */
+void f_a907dc_orig(Ctx *c);
+int mina_start_level_index(void);
+void nat__ZN14SessionManager19StartActiveSaveSlotEv(Ctx *c)
+{
+    f_a907dc_orig(c);
+    const int idx = mina_start_level_index();
+    if (idx >= 0) {
+        rt_log("[levels] the save slot starts in level %d (was %d)\n", idx, (int)(int32_t)rt_ld32(G(0x1e48120)));
+        rt_st32(G(0x1e48120), (uint32_t)idx);
+    }
+}

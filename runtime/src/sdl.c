@@ -509,15 +509,72 @@ static void levels_dump(void)
     const uint32_t base = (uint32_t)rt_ld64(G(tab));
     const int count = (int)(int32_t)rt_ld64(G(tab + 8));
     rt_log("[levels] %d (start level index %d)\n", count, (int)(int32_t)rt_ld32(G(GUEST_IMAGE_BASE + 0x00e48120u)));
+    {
+        const int argc = (int)(int32_t)rt_ld32(G(GUEST_IMAGE_BASE + 0x05031ab0u));
+        const uint32_t argv = (uint32_t)rt_ld64(G(GUEST_IMAGE_BASE + 0x05031ab8u));
+        rt_log("[levels] argc %d argv %#x\n", argc, argv);
+        for (int i = 0; i < argc && i < 8 && argv; i++) {
+            const uint32_t a = (uint32_t)rt_ld64(G(argv + 8u * (uint32_t)i));
+            rt_log("[levels]   argv[%d] %s\n", i, a ? (const char *)G(a) : "-");
+        }
+    }
     for (int i = 0; i < count && i < 400; i++) {
         const uint32_t name = (uint32_t)rt_ld64(G(base + 72u * (uint32_t)i + 0x30));
         rt_log("[levels] %d %s\n", i, name ? (const char *)G(name) : "-");
     }
 }
+/* MINA_START_LEVEL=levels/core/introBeach: the level a new game starts in
+ * (what -loadlevel sets, Game::PostLoad looking it up before the level table
+ * is read): written once the table is there */
+static void start_level(void)
+{
+    static int done;
+    const char *want = done ? NULL : getenv("MINA_START_LEVEL");
+    if (!want)
+        return;
+    const uint32_t tab = GUEST_IMAGE_BASE + 0x05044f68u;
+    const uint32_t base = (uint32_t)rt_ld64(G(tab));
+    const int count = (int)(int32_t)rt_ld64(G(tab + 8));
+    if (count <= 0 || !base)
+        return;
+    done = 1;
+    for (int i = 0; i < count; i++) {
+        const uint32_t name = (uint32_t)rt_ld64(G(base + 72u * (uint32_t)i + 0x30));
+        if (name && !strcmp((const char *)G(name), want)) {
+            rt_st32(G(GUEST_IMAGE_BASE + 0x00e48120u), (uint32_t)i);
+            rt_log("[levels] a new game starts in %s (%d)\n", want, i);
+            return;
+        }
+    }
+    rt_log("[levels] no level %s\n", want);
+}
+/* (the index of MINA_START_LEVEL, -1 none or not found yet) */
+int mina_start_level_index(void)
+{
+    static int idx = -2;
+    if (idx != -2)
+        return idx;
+    const char *want = getenv("MINA_START_LEVEL");
+    if (!want)
+        return idx = -1;
+    const uint32_t tab = GUEST_IMAGE_BASE + 0x05044f68u;
+    const uint32_t base = (uint32_t)rt_ld64(G(tab));
+    const int count = (int)(int32_t)rt_ld64(G(tab + 8));
+    if (count <= 0 || !base)
+        return -1;
+    for (int i = 0; i < count; i++) {
+        const uint32_t name = (uint32_t)rt_ld64(G(base + 72u * (uint32_t)i + 0x30));
+        if (name && !strcmp((const char *)G(name), want))
+            return idx = i;
+    }
+    rt_log("[levels] no level %s\n", want);
+    return idx = -1;
+}
 static void scripted_input(void)
 {
     test_resize();
     levels_dump();
+    start_level();
     static Uint32 last_mem;
     if (getenv("MINA_MEMSTAT") && SDL_GetTicks() - last_mem > 5000) {
         last_mem = SDL_GetTicks();
