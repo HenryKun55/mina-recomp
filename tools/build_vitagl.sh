@@ -5,6 +5,8 @@
 #   LOG_ERRORS           GL errors on the console (Vita3K shows sceClibPrintf)
 #   HAVE_SHARK_LOG       shader compiler messages
 #   NO_SPLASHSCREEN      no vitaGL logo at boot (the bubble's pic0 shows instead)
+#   NO_CLIB              memcpy/memset of our own (runtime/src/fastmem.c), not
+#                        the sceClib imports (an HLE call each in Vita3K)
 #   HAVE_SHADER_CACHE    each shader compiled once (ux0:data/shader_cache): a
 #                        compile holds the renderer for 1-3 s (the opening froze)
 # The SDK's libvitaGL.a skips error handling and crashes on this game's draws.
@@ -43,6 +45,6 @@ if ! git apply --reverse --check "$last" > /dev/null 2>&1; then
 fi
 make clean > /dev/null 2>&1 || true
 PATH="$VITASDK/bin:$PATH" VITASDK="$VITASDK" make -j"$(sysctl -n hw.ncpu 2>/dev/null || echo 4)" \
-    STORE_DEPTH_STENCIL=1 LOG_ERRORS=1 HAVE_SHARK_LOG=1 NO_SPLASHSCREEN=1 HAVE_SHADER_CACHE=1 ${VITAGL_FLAGS:-} > build-mina.log 2>&1 \
+    STORE_DEPTH_STENCIL=1 LOG_ERRORS=1 HAVE_SHARK_LOG=1 NO_SPLASHSCREEN=1 HAVE_SHADER_CACHE=1 NO_CLIB=1 ${VITAGL_FLAGS:-} > build-mina.log 2>&1 \
     || { tail -20 build-mina.log >&2; exit 1; }
 echo "built $DEST/libvitaGL.a"

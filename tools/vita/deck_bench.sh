@@ -17,7 +17,9 @@ DATA="$V3/fs/ux0/data/mina"
 for p in $(pgrep -f "tools/run_vita3k[.]sh"); do kill "$p" 2>/dev/null; done
 "$ROOT/tools/vita/stop.sh"
 # a new game every time (the save moves on as it is played)
-rm -f "$DATA/warp.txt" "$DATA/mina.log" "$V3/fs/ux0/data/Yacht Club Games/Mina the Hollower (recomp)/saveData.yc"
+# (and its backup: the game restores a missing save from it)
+SAVE="$V3/fs/ux0/data/Yacht Club Games/Mina the Hollower (recomp)"
+rm -f "$DATA/warp.txt" "$DATA/mina.log" "$SAVE/saveData.yc" "$SAVE/saveData.bak.yc"
 (MHZ=${MHZ:-240} GPU_SCALE=${GPU_SCALE:-0} "$ROOT/tools/run_vita3k.sh" 3000 > /dev/null 2>&1 &)
 sleep 5
 alive() { pgrep -f "Vita3K -c .* -r MINA00001" > /dev/null || { echo "Vita3K is gone" >&2; exit 1; }; }

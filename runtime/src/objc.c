@@ -779,6 +779,17 @@ Obj *objc_obj(uint64_t a)
         if (on < 0)
             on = getenv("MINA_OBJSTATS") != NULL;
         if (on) {
+            /* and by caller: the 8 commonest */
+            static uintptr_t ra[8];
+            static uint32_t ran[8];
+            const uintptr_t r = (uintptr_t)__builtin_return_address(0);
+            int j = 0;
+            while (j < 8 && ra[j] && ra[j] != r)
+                j++;
+            if (j < 8) {
+                ra[j] = r;
+                ran[j]++;
+            }
             static const char *names[64];
             static uint32_t n[64], nn, total;
             const char *nm = o ? o->cls->name : "(none)";
@@ -792,6 +803,9 @@ Obj *objc_obj(uint64_t a)
             if ((++total & 0xffff) == 0)
                 for (uint32_t j = 0; j < nn; j++)
                     rt_log("[untagged] %s: %u\n", names[j], n[j]);
+            if ((total & 0xffff) == 0)
+                for (int k = 0; k < 8 && ra[k]; k++)
+                    rt_log("[untagged] from %p: %u\n", (void *)ra[k], ran[k]);
         }
     }
     return o;

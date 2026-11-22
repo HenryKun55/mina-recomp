@@ -2064,7 +2064,17 @@ static uint64_t mono_ns(void)
     return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
 #endif
 }
-#define TIMED(acc, call) do { uint64_t t0_ = mono_ns(); call; acc += mono_ns() - t0_; g_draw_calls++; } while (0)
+/* one draw in 8 is timed (the clock is an import): its time counts 8 times */
+#define TIMED(acc, call)                                                                       \
+    do {                                                                                       \
+        if ((g_draw_calls++ & 7) == 0) {                                                       \
+            const uint64_t t0_ = mono_ns();                                                    \
+            call;                                                                              \
+            acc += (mono_ns() - t0_) * 8;                                                      \
+        } else {                                                                               \
+            call;                                                                              \
+        }                                                                                      \
+    } while (0)
 static void re_drawPrimitives(Ctx *c) { TIMED(g_draw_ns, draw_arrays(c, 1)); }
 static void re_drawPrimitivesInstanced(Ctx *c) { TIMED(g_draw_ns, draw_arrays(c, (uint32_t)MARG(3))); }
 

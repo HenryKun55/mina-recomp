@@ -379,7 +379,8 @@ static void bag_set_value(PropBag *b, const char *key, uint64_t v)
 {
     const int i = pb_slot(b, key);
     const uint64_t old = b->p[i].v, bit = 1ull << i;
-    const int had = (b->held & bit) != 0, obj = v && objc_obj(v) != NULL;
+    /* (most values are enums and sizes: no object lives in the first 64 KiB) */
+    const int had = (b->held & bit) != 0, obj = v >= 0x10000 && objc_obj(v) != NULL;
     if (obj)
         objc_retain_obj(v);
     b->p[i].v = v;

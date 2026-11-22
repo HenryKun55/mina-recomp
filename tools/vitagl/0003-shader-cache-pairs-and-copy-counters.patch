@@ -1,0 +1,79 @@
+diff --git a/source/custom_shaders.c b/source/custom_shaders.c
+index 3b91d11..aa77913 100644
+--- a/source/custom_shaders.c
++++ b/source/custom_shaders.c
+@@ -136,15 +136,18 @@ char vgl_file_cache_path[256];
+ 		disable_draw_attrib(i) \
+ 	}
+ 
++uint32_t vgl_dbg_copies[4], vgl_dbg_bytes[4];
+ #ifndef HAVE_FFP_SHADER_SUPPORT
+ #define upload_uniforms() \
+ 	if (p->vert_uniforms && dirty_shader_vert_unifs) { \
+ 		void *buffer = vglReserveVertexUniformBuffer(p->vshader->unif_buf_size); \
++		vgl_dbg_copies[2]++; vgl_dbg_bytes[2] += p->vshader->unif_buf_size; \
+ 		vgl_fast_memcpy(buffer, p->unif_vbuffer, p->vshader->unif_buf_size); \
+ 		dirty_shader_vert_unifs = GL_FALSE; \
+ 	} \
+ 	if (p->frag_uniforms && dirty_shader_frag_unifs) { \
+ 		void *buffer = vglReserveFragmentUniformBuffer(p->fshader->unif_buf_size); \
++		vgl_dbg_copies[3]++; vgl_dbg_bytes[3] += p->fshader->unif_buf_size; \
+ 		vgl_fast_memcpy(buffer, p->unif_fbuffer, p->fshader->unif_buf_size); \
+ 		dirty_shader_frag_unifs = GL_FALSE; \
+ 	} \
+@@ -456,6 +459,7 @@ static inline __attribute__((always_inline)) void vertex_layout_setup_ptrs(progr
+ #endif
+ 			{
+ 				ptrs[0] = gpu_alloc_mapped_temp(size);
++				vgl_dbg_copies[0]++; vgl_dbg_bytes[0] += size;
+ 				vgl_fast_memcpy(ptrs[0], (void *)cur_vao->vertex_attrib_offsets[first_attr_idx] + first * stride, size);
+ 			}
+ 		}
+@@ -477,6 +481,7 @@ static inline __attribute__((always_inline)) void vertex_layout_setup_ptrs(progr
+ #endif
+ 					{
+ 						ptrs[i] = gpu_alloc_mapped_temp(size);
++						vgl_dbg_copies[1]++; vgl_dbg_bytes[1] += size;
+ 						vgl_fast_memcpy(ptrs[i], (void *)cur_vao->vertex_attrib_offsets[attr_idx] + first * stride, size);
+ 					}
+ 				}
+@@ -2384,11 +2389,29 @@ void glLinkProgram(GLuint progr) {
+ #ifdef HAVE_SHADER_CACHE
+ 		char frag_fname[256], vert_fname[256];
+ 		char *fname;
++		/* A pair is taken from the cache whole or compiled whole: translating one
++		 * shader against the other's saved bindings broke fragment shaders
++		 * ("undeclared identifier 'gl_FragColor'") */
++		int pair_cached = 1;
++		if (!p->vshader->prog || !p->fshader->prog) {
++			SceIoStat st;
++			char tmp[256];
++			if (!p->vshader->prog) {
++				uint64_t h = XXH3_64bits(p->vshader->source, p->vshader->size);
++				sprintf(tmp, "%s/v/%02X/%llX.gxp", vgl_shader_cache_path, (uint8_t)(h >> 56), h);
++				pair_cached &= sceIoGetstat(tmp, &st) >= 0;
++			}
++			if (!p->fshader->prog) {
++				uint64_t h = XXH3_64bits(p->fshader->source, p->fshader->size);
++				sprintf(tmp, "%s/f/%02X/%llX.gxp", vgl_shader_cache_path, (uint8_t)(h >> 56), h);
++				pair_cached &= sceIoGetstat(tmp, &st) >= 0;
++			}
++		}
+ 		if (!p->vshader->prog) {
+ 			uint64_t hash = XXH3_64bits(p->vshader->source, p->vshader->size);
+ 			uint8_t subdir_hash = hash >> 56;
+ 			sprintf(vert_fname, "%s/v/%02X/%llX.gxp", vgl_shader_cache_path, subdir_hash, hash);
+-			SceUID f = sceIoOpen(vert_fname, SCE_O_RDONLY, 0777);
++			SceUID f = pair_cached ? sceIoOpen(vert_fname, SCE_O_RDONLY, 0777) : -1;
+ 			if (f >= 0) {
+ 				size_t sz = sceIoLseek(f, 0, SCE_SEEK_END);
+ 				sceIoLseek(f, 0, SCE_SEEK_SET);
+@@ -2403,7 +2426,7 @@ void glLinkProgram(GLuint progr) {
+ 			uint64_t hash = XXH3_64bits(p->fshader->source, p->fshader->size);
+ 			uint8_t subdir_hash = hash >> 56;
+ 			sprintf(frag_fname, "%s/f/%02X/%llX.gxp", vgl_shader_cache_path, subdir_hash, hash);
+-			SceUID f = sceIoOpen(frag_fname, SCE_O_RDONLY, 0777);
++			SceUID f = pair_cached ? sceIoOpen(frag_fname, SCE_O_RDONLY, 0777) : -1;
+ 			if (f >= 0) {
+ 				size_t sz = sceIoLseek(f, 0, SCE_SEEK_END);
+ 				sceIoLseek(f, 0, SCE_SEEK_SET);
