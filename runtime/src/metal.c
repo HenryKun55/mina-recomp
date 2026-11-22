@@ -152,8 +152,12 @@ static int pb_find(PropBag *b, const char *key)
             return i;
     return -1;
 }
+/* bumped by every write to any bag: a reader's cache of descriptor values
+ * holds while it has not changed (metal_natives.c: the pass descriptor's) */
+uint32_t g_pb_gen;
 static int pb_slot(PropBag *b, const char *key)
 {
+    g_pb_gen++;
     int i = pb_find(b, key);
     if (i >= 0)
         return i;
@@ -2708,6 +2712,16 @@ static Class cls_DepthStencil = { "MTLDepthStencilState_GL", "NSObject", simple_
 static Class cls_Library = { "MTLLibrary_GL", "NSObject", library_m, NULL, sizeof(MLib), NULL };
 static Class cls_Function = { "MTLFunction_GL", "NSObject", simple_m, NULL, sizeof(MFunc), NULL };
 static Class cls_Pipeline = { "MTLRenderPipelineState_GL", "NSObject", simple_m, NULL, sizeof(MPipeline), pipe_dealloc };
+/* a render pipeline state's host struct, NULL when obj is not a live one (*cls: what it is then) */
+MPipeline *metal_pipeline_of(uint64_t obj, const char **cls)
+{
+    Obj *o = obj ? objc_obj(obj) : NULL;
+    if (o && o->cls == &cls_Pipeline)
+        return o->host;
+    if (cls)
+        *cls = o ? o->cls->name : NULL;
+    return NULL;
+}
 static Class cls_Layer = { "CAMetalLayer", "NSObject", layer_m, NULL, sizeof(MLayer), NULL };
 static Class cls_Drawable = { "CAMetalDrawable_GL", "NSObject", drawable_m, NULL, sizeof(MDrawable), dr_dealloc };
 

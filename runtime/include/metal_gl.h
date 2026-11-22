@@ -183,6 +183,8 @@ typedef struct MPipeline {
 } MPipeline;
 /* the batching variant of a pipeline (NULL: its vertex shader cannot be batched) */
 MPipeline *metal_batch_pipeline(MPipeline *p);
+/* a render pipeline state's host struct (NULL: not a live one; *cls what it is then) */
+MPipeline *metal_pipeline_of(uint64_t obj, const char **cls);
 
 /* GLSL translated from the game's metallibs (generated: build/gen/shaders.c) */
 typedef struct ShaderSrc {

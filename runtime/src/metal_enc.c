@@ -1444,7 +1444,22 @@ static MPipeline *draw_setup_p(REnc *e, MPipeline *force)
     g_rdbg.stage = 1;
     if (!e->pipeline)
         return NULL;
-    MPipeline *p = force ? force : (MPipeline *)objc_host(e->pipeline);
+    const char *is = NULL;
+    MPipeline *p = force ? force : metal_pipeline_of(e->pipeline, &is);
+    if (!p) {                            /* not a live pipeline: what it is or was, and the draw is not made */
+        static int n;
+        if (n++ < 8) {
+            const char *objc_freed_info(uint64_t a, uint32_t *frames_ago);
+            uint32_t ago = 0;
+            const char *was = objc_freed_info(e->pipeline, &ago);
+            char bt[512];
+            guest_backtrace(bt, sizeof bt, 8);
+            rt_log("metal: the pipeline %#llx bound to a draw is %s%s (freed: %s, %u frames ago): %s\n",
+                   (unsigned long long)e->pipeline, is ? "a live " : "not a live object", is ? is : "",
+                   was ? was : "no", ago, bt);
+        }
+        return NULL;
+    }
     g_rdbg.pipe = p;
     g_rdbg.vs = p->vs;
     g_rdbg.fs = p->fs;
@@ -1920,7 +1935,11 @@ static int batch_draw(Ctx *c, REnc *e, uint32_t instances)
     const uint32_t prim = (uint32_t)MARG(0), count = (uint32_t)MARG(1), type = (uint32_t)MARG(2);
     const uint32_t off = (uint32_t)MARG(4);
     MBuffer *ib = MARG(3) ? objc_host(MARG(3)) : NULL;
-    MPipeline *p = objc_host(e->pipeline);
+    MPipeline *p = metal_pipeline_of(e->pipeline, NULL);
+    if (!p) {                            /* (draw_setup says what it is) */
+        batch_flush();
+        return 0;
+    }
     const uint32_t isz = type ? 4 : 2;
     const uint8_t *idx = NULL;
     if (prim == 3 && instances == 1 && ib && count && count % 3 == 0 && count <= 96 && e->begun && !e->folded)
@@ -1990,7 +2009,8 @@ static void draw_arrays(Ctx *c, uint32_t instances)
     REnc *e = objc_host(SELF);
     batch_flush();
 #if defined(__vita__)
-    if (e->pipeline && fold_pass(e, objc_host(e->pipeline), (uint32_t)MARG(2), instances))
+    MPipeline *fp = e->pipeline ? metal_pipeline_of(e->pipeline, NULL) : NULL;
+    if (fp && fold_pass(e, fp, (uint32_t)MARG(2), instances))
         return;
 #endif
     MPipeline *p = draw_setup(e);

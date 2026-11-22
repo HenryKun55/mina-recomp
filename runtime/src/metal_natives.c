@@ -183,23 +183,41 @@ static int snap_key(uint8_t *gm_, uint64_t P, uint64_t R, uint64_t *k)
         return -1;
     k[n++] = nc;
     const uint64_t pd = L64(G_PASS_DESC);
-    if (nc) {
-        const uint64_t pcolors = md_child(pd, K("colorAttachments"));
-        for (uint32_t i = 0; i < nc; i++) {
-            const uint64_t t = md_get(md_elem(pcolors, i), K("texture"));
-            MTexture *m = t ? objc_host(t) : NULL;
-            k[n++] = m ? (uint64_t)m->format << 32 | m->samples : 0;
+    const int depth = L8(G_DEPTH_TARGET) & 1;
+    /* the pass descriptor's targets: looked up again only when a descriptor
+     * changed (g_pb_gen) or it is another one */
+    extern uint32_t g_pb_gen;
+    static struct { uint64_t pd, fmt[8], dsamp; uint32_t gen, nc; int depth, valid; } pdc;
+    if (!pdc.valid || pdc.pd != pd || pdc.gen != g_pb_gen || pdc.nc != nc || pdc.depth != depth) {
+        if (nc) {
+            const uint64_t pcolors = md_child(pd, K("colorAttachments"));
+            for (uint32_t i = 0; i < nc; i++) {
+                const uint64_t t = md_get(md_elem(pcolors, i), K("texture"));
+                MTexture *m = t ? objc_host(t) : NULL;
+                pdc.fmt[i] = m ? (uint64_t)m->format << 32 | m->samples : 0;
+            }
         }
+        pdc.dsamp = 0;
+        if (depth) {
+            const uint64_t t = md_get(md_child(pd, K("depthAttachment")), K("texture"));
+            MTexture *m = t ? objc_host(t) : NULL;
+            pdc.dsamp = m ? m->samples : 0;
+        }
+        pdc.pd = pd;
+        pdc.nc = nc;
+        pdc.depth = depth;
+        pdc.gen = g_pb_gen;              /* (after the lookups: they may make a child) */
+        pdc.valid = 1;
+    }
+    if (nc) {
+        for (uint32_t i = 0; i < nc; i++)
+            k[n++] = pdc.fmt[i];
         k[n++] = L32(P + 0x210);                 /* blend factors */
         k[n++] = L32(P + 0x214) & 15;            /* write mask */
     }
-    const int depth = L8(G_DEPTH_TARGET) & 1;
     k[n++] = depth;
-    if (depth) {
-        const uint64_t t = md_get(md_child(pd, K("depthAttachment")), K("texture"));
-        MTexture *m = t ? objc_host(t) : NULL;
-        k[n++] = m ? m->samples : 0;
-    }
+    if (depth)
+        k[n++] = pdc.dsamp;
     return n;
 }
 
