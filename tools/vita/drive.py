@@ -8,7 +8,8 @@ x = cross, enter = start). Unknown screens (intro, letter, loading) get
 "cross, hold start" (shows the skip prompt, then skips). Ends at "[play]" in
 the game log.
 
-usage: tools/vita/drive.py [timeout seconds]
+usage: tools/vita/drive.py [timeout seconds] [--until state]
+       (--until title: stops at the title screen, e.g. to warp from there)
 """
 import os, subprocess, sys, time
 
@@ -38,7 +39,13 @@ def in_play():
         return False
 
 def main():
-    limit = float(sys.argv[1]) if len(sys.argv) > 1 else 900
+    args = sys.argv[1:]
+    until = None
+    if "--until" in args:
+        k = args.index("--until")
+        until = args[k + 1]
+        del args[k:k + 2]
+    limit = float(args[0]) if args else 900
     refs = {}
     for name in ACTIONS:
         p = os.path.join(REF, name + ".png")
@@ -46,6 +53,9 @@ def main():
             refs[name] = subprocess.run(["magick", p, "-depth", "8", "gray:-"], capture_output=True).stdout
     start = time.time()
     while time.time() - start < limit:
+        if subprocess.run(["pgrep", "-f", "Vita3K -c .* -r MINA00001"], capture_output=True).returncode:
+            print("no Vita3K running", file=sys.stderr)
+            return 2
         if in_play():
             print("gameplay after %d s" % (time.time() - start))
             return 0
@@ -62,6 +72,9 @@ def main():
                     best, dist = name, d
         state = best if dist < 15 else None
         print("[drive] %4ds %s (%.1f)" % (time.time() - start, state or "other", dist), flush=True)
+        if until and state == until:
+            print("%s after %d s" % (until, time.time() - start))
+            return 0
         if state:
             subprocess.run([VKEY, ""] + ACTIONS[state])
         else:
