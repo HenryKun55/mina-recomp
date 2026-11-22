@@ -41,10 +41,58 @@ static void shark_log(const char *msg, shark_log_level level, int line)
                line, msg);
 }
 
+/* The shaders compiled by vitaGL are kept (HAVE_SHADER_CACHE): a compile
+ * holds the renderer 1-3 s. The VPK carries the ones a run through the game
+ * made (app0:shader_cache, tools/vita/pull_shader_cache.sh); the first boot
+ * copies those not on the card yet, so even the first run compiles none. */
+#include <psp2/io/fcntl.h>
+#include <psp2/io/stat.h>
+#include <psp2/io/dirent.h>
+#define SHADER_CACHE "ux0:data/mina_shader_cache"
+static int shader_cache_seed(const char *from, const char *to)
+{
+    SceUID d = sceIoDopen(from);
+    if (d < 0)
+        return 0;
+    sceIoMkdir(to, 0777);
+    int copied = 0;
+    SceIoDirent ent;
+    static uint8_t buf[64 * 1024];
+    while (sceIoDread(d, &ent) > 0) {
+        if (ent.d_name[0] == '.')
+            continue;
+        char src[256], dst[256];
+        snprintf(src, sizeof src, "%s/%s", from, ent.d_name);
+        snprintf(dst, sizeof dst, "%s/%s", to, ent.d_name);
+        if (SCE_S_ISDIR(ent.d_stat.st_mode)) {
+            copied += shader_cache_seed(src, dst);
+            continue;
+        }
+        SceIoStat st;
+        if (sceIoGetstat(dst, &st) >= 0 && st.st_size == ent.d_stat.st_size)
+            continue;
+        SceUID in = sceIoOpen(src, SCE_O_RDONLY, 0);
+        SceUID out = in >= 0 ? sceIoOpen(dst, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777) : -1;
+        int n;
+        while (out >= 0 && (n = sceIoRead(in, buf, sizeof buf)) > 0)
+            sceIoWrite(out, buf, n);
+        if (out >= 0)
+            sceIoClose(out);
+        if (in >= 0)
+            sceIoClose(in);
+        copied += out >= 0;
+    }
+    sceIoDclose(d);
+    return copied;
+}
+
 void metal_vita_init(void)
 {
     void mem_free_report(void);
     mem_free_report();           /* before vitaGL takes its share */
+    rt_log("[shader] cache: %d compiled shaders copied from the VPK\n",
+           shader_cache_seed("app0:shader_cache", SHADER_CACHE));
+    vglSetShaderCachePath(SHADER_CACHE);
     vglInitExtended(0x800000, 960, 544, 0x1000000, SCE_GXM_MULTISAMPLE_NONE);
     shark_install_log_cb(shark_log);
     shark_set_warnings_level(SHARK_WARN_HIGH);

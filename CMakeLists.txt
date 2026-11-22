@@ -154,6 +154,12 @@ if(VITA)
   else()
     message(WARNING "no bubble art: run tools/vita/make_art.py (the VPK gets the SDK's placeholder icon)")
   endif()
+  # the shaders a run through the game compiled (tools/vita/pull_shader_cache.sh): the first run compiles none
+  file(GLOB_RECURSE MINA_SHADER_CACHE RELATIVE "${CMAKE_SOURCE_DIR}/deps/shader_cache"
+       "${CMAKE_SOURCE_DIR}/deps/shader_cache/*.gxp")
+  foreach(f ${MINA_SHADER_CACHE})
+    list(APPEND MINA_VPK_FILES FILE "${CMAKE_SOURCE_DIR}/deps/shader_cache/${f}" "shader_cache/${f}")
+  endforeach()
   vita_create_vpk(mina.vpk ${VITA_TITLEID} eboot.bin VERSION ${VITA_VERSION} NAME "${VITA_APP_NAME}"
                   ${MINA_VPK_FILES})
 else()

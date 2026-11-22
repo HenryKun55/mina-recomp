@@ -1,5 +1,8 @@
 /* Metal on OpenGL: render and blit command encoders (executed immediately). */
 #include <stddef.h>
+#if defined(__vita__)
+#include <psp2/kernel/processmgr.h>
+#endif
 #include "metal_gl.h"
 
 #include <string.h>
@@ -1688,6 +1691,8 @@ static struct {
     uint32_t ub_len;
     uint8_t *v;                  /* vertices: each one's bytes, then vcb1[0..3] */
     uint32_t nv, cap;
+    uint16_t *idx;               /* the triangles, indices into v */
+    uint32_t ni, icap;
     uint64_t held[34];           /* objects kept alive while held (a texture released between draws) */
     int nheld;
 } B;
@@ -1858,23 +1863,36 @@ static int batch_append(REnc *e, const uint8_t *idx, uint32_t count, uint32_t ty
     const uint8_t *m = binding_data(&e->vb[1], &mavail);
     if (!vd || !m || mavail < 64)
         return 0;
+    /* the draw's vertices (lo..hi), each with its vcb1, and its indices moved onto them */
+    uint32_t lo = UINT32_MAX, hi = 0;
     for (uint32_t i = 0; i < count; i++) {
         const uint32_t v = type ? rt_ld32(idx + 4 * i) : rt_ld16(idx + 2 * i);
-        if ((uint64_t)(v + 1) * B.vstride > avail)
-            return 0;
+        lo = v < lo ? v : lo;
+        hi = v > hi ? v : hi;
     }
-    const uint32_t need = (B.nv + count) * B.stride;
+    const uint32_t nv = hi - lo + 1;
+    if ((uint64_t)(hi + 1) * B.vstride > avail || nv > 256 || B.nv + nv > 65535)
+        return 0;
+    const uint32_t need = (B.nv + nv) * B.stride;
     if (need > B.cap) {
         B.cap = need * 2 > 65536 ? need * 2 : 65536;
         B.v = realloc(B.v, B.cap);
     }
+    if (B.ni + count > B.icap) {
+        B.icap = (B.ni + count) * 2 > 8192 ? (B.ni + count) * 2 : 8192;
+        B.idx = realloc(B.idx, B.icap * sizeof B.idx[0]);
+    }
     uint8_t *o = B.v + B.nv * B.stride;
-    for (uint32_t i = 0; i < count; i++, o += B.stride) {
-        const uint32_t v = type ? rt_ld32(idx + 4 * i) : rt_ld16(idx + 2 * i);
+    for (uint32_t v = lo; v <= hi; v++, o += B.stride) {
         memcpy(o, vd + v * B.vstride, B.vstride);
         memcpy(o + B.voff, m, 64);
     }
-    B.nv += count;
+    for (uint32_t i = 0; i < count; i++) {
+        const uint32_t v = type ? rt_ld32(idx + 4 * i) : rt_ld16(idx + 2 * i);
+        B.idx[B.ni + i] = (uint16_t)(B.nv + v - lo);
+    }
+    B.nv += nv;
+    B.ni += count;
     return 1;
 }
 
@@ -1904,12 +1922,14 @@ static void batch_flush(void)
         glVertexAttribPointer((GLuint)(12 + k), 4, GL_FLOAT, GL_FALSE, (GLsizei)B.stride,
                               (const void *)(pos + B.voff + 16 * (uint32_t)k));
     }
-    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)B.nv);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+    glDrawElements(GL_TRIANGLES, (GLsizei)B.ni, GL_UNSIGNED_SHORT, B.idx);
     gl_check("batch");
     g_batches++;
     g_batched_draws += (uint32_t)B.n;
     B.n = 0;
     B.nv = 0;
+    B.ni = 0;
     for (int i = 0; i < B.nheld; i++)
         objc_release_obj(B.held[i]);
     B.nheld = 0;
@@ -1976,10 +1996,12 @@ static int batch_draw(Ctx *c, REnc *e, uint32_t instances)
     B.voff = (B.vstride + 3) & ~3u;
     B.stride = B.voff + 64;
     B.nv = 0;
+    B.ni = 0;
     if (!batch_append(e, idx, count, type))
         return 0;
     if (!draw_setup_p(e, bp)) {          /* nothing to draw (as for the draw itself) */
         B.nv = 0;
+        B.ni = 0;
         return 1;
     }
     batch_key(&B.key, e, p);
@@ -2033,9 +2055,14 @@ uint64_t g_draw_ns, g_endenc_ns;
 uint32_t g_draw_calls;
 static uint64_t mono_ns(void)
 {
+#if defined(__vita__)
+    /* (clock_gettime is an import and a 64-bit division, twice a draw) */
+    return sceKernelGetProcessTimeWide() * 1000ull;
+#else
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
     return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+#endif
 }
 #define TIMED(acc, call) do { uint64_t t0_ = mono_ns(); call; acc += mono_ns() - t0_; g_draw_calls++; } while (0)
 static void re_drawPrimitives(Ctx *c) { TIMED(g_draw_ns, draw_arrays(c, 1)); }

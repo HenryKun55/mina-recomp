@@ -1,6 +1,6 @@
 #!/bin/sh
 # Runs the Vita build in Vita3K: installs build-vita/mina.vpk as MINA00001
-# (eboot.bin and sce_sys), links the game data into ux0:data/mina (once),
+# (eboot.bin, sce_sys and the shader cache), links the game data into ux0:data/mina (once),
 # starts Vita3K in its PS Vita speed mode (the patched fork) and follows
 # ux0:data/mina/mina.log. Speed mode: CPU at the Vita's clock, 3 cores, the
 # user/cdram/phycont memory budgets, microSD reads, the GPU model calibrated
@@ -30,7 +30,7 @@ DATA="$UX0/data/mina"
 [ "$BUILD/mina.vpk" -nt "$BUILD/mina" ] || { echo "$BUILD/mina.vpk is older than the binary (did the vpk step fail?)" >&2; exit 1; }
 
 mkdir -p "$APP" "$DATA"
-(cd "$APP" && rm -rf sce_sys && unzip -oq "$BUILD/mina.vpk" eboot.bin 'sce_sys/*')
+(cd "$APP" && rm -rf sce_sys shader_cache && unzip -oq "$BUILD/mina.vpk" eboot.bin 'sce_sys/*' 'shader_cache/*' 2>/dev/null || unzip -oq "$BUILD/mina.vpk" eboot.bin 'sce_sys/*')
 if [ ! -e "$DATA/Contents" ]; then
     ln -s "$ROOT/gamedata/app/Contents" "$DATA/Contents"
 fi
