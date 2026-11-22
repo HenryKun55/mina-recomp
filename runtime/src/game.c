@@ -106,13 +106,20 @@ static void warp_requests(Ctx *c)
     f_ae1690(c);
     *c = save;
 }
+static void phys_stats_tick(void);
+static int g_in_fixed;     /* in Game::FixedUpdate (MINA_RPU_STATS: where the passes update) */
+volatile int g_game_stage; /* the watchdog's view: 2 in Game::FixedUpdate, 1 in Game::Update */
 void nat__ZN4Game11FixedUpdateEv(Ctx *c)
 {
     warp_requests(c);
     uint64_t t0 = now_us();
     uint32_t before = recalcs_total;
     g_fixed_updates++;
+    g_in_fixed = 1;
+    g_game_stage = 2;
     f_99f430_orig(c);
+    g_game_stage = 0;
+    g_in_fixed = 0;
     g_fixed_us += now_us() - t0;
     static int heavy;          /* consecutive fixed updates moving thousands of transforms */
     heavy = recalcs_total - before > 1500 ? heavy + 1 : 0;
@@ -120,6 +127,7 @@ void nat__ZN4Game11FixedUpdateEv(Ctx *c)
         g_in_play = 1;
         rt_log("[play] gameplay (%u world transforms in a fixed update)\n", recalcs_total - before);
     }
+    phys_stats_tick();
 }
 
 void f_9a0638_orig(Ctx *c);
@@ -127,7 +135,9 @@ void nat__ZN4Game6UpdateEf(Ctx *c)
 {
     uint64_t t0 = now_us();
     g_updates++;
+    g_game_stage = 1;
     f_9a0638_orig(c);
+    g_game_stage = 0;
     g_update_us += now_us() - t0;
 }
 
@@ -908,6 +918,31 @@ void f_1e13ac_orig(Ctx *c);
 
 typedef struct { float x, y, z, w; } Plane;
 typedef struct { float x, y, z, w, ax, ay, az; } PlaneA;
+/* ycRenderPass::Update's per-camera work, by the camera's matrices' bytes */
+typedef struct { uint32_t key[32]; float inv[16]; PlaneA act[6]; int nact; float soa[7][8]; } CamCache;
+static CamCache cam_cache[4];
+static int cam_cache_n, cam_cache_next;
+static CamCache *cam_cache_find(const void *ab)
+{
+    for (int i = 0; i < cam_cache_n; i++) {
+        const uint32_t *k = cam_cache[i].key, *m = ab;
+        uint32_t d = 0;
+        for (int j = 0; j < 32; j++)
+            d |= k[j] ^ m[j];
+        if (!d)
+            return &cam_cache[i];
+    }
+    return NULL;
+}
+static CamCache *cam_cache_slot(const void *ab)
+{
+    CamCache *cc = &cam_cache[cam_cache_next];
+    cam_cache_next = (cam_cache_next + 1) & 3;
+    if (cam_cache_n < 4)
+        cam_cache_n++;
+    memcpy(cc->key, ab, 128);
+    return cc;
+}
 static inline float fabs_sel(float v) { return v > 0.0f ? v : -v; }
 static void make_plane(Plane *p, float x, float y, float z, float w)
 {
@@ -974,9 +1009,31 @@ static void grow_bounds_vis(float *bc, float *be, const float *box)
     bc[2] = lo_z + be[2];
 }
 
+/* grow_bounds and grow_bounds_vis for x, y, z at once: the same operations per
+ * axis (blo > lo ? lo : blo is lo < blo ? lo : blo, NaN and signed zeros
+ * included; the additions commute), so one NEON lane each; vcgt.f32 itself
+ * (GCC turns the intrinsic compare into a VFP compare per lane) */
+static inline uint32x4_t vgt4(float32x4_t a, float32x4_t b)
+{
+    uint32x4_t r;
+    __asm__("vcgt.f32 %q0, %q1, %q2" : "=w"(r) : "w"(a), "w"(b));
+    return r;
+}
+static inline void grow4(float32x4_t *bc, float32x4_t *be, float32x4_t bx, float32x4_t bex)
+{
+    float32x4_t lo = vsubq_f32(*bc, *be);
+    const float32x4_t blo = vsubq_f32(bx, bex);
+    lo = vbslq_f32(vgt4(blo, lo), lo, blo);
+    float32x4_t hi = vaddq_f32(*bc, *be);
+    const float32x4_t bhi = vaddq_f32(bx, bex);
+    hi = vbslq_f32(vgt4(bhi, hi), bhi, hi);
+    *be = vmulq_n_f32(vsubq_f32(hi, lo), 0.5f);
+    *bc = vaddq_f32(lo, *be);
+}
+
 /* MINA_RPU_STATS: per 60 calls of ycRenderPass::Update, objects seen, culled,
  * keyed (by a call) and sorted, and the time in the scan and the sort */
-static struct { uint64_t calls, objs, culled, keyed, sorted, scan_us, sort_us; } rpu;
+static struct { uint64_t calls, objs, culled, keyed, sorted, scan_us, sort_us, slots, views, in_fixed; } rpu;
 /* ycRenderPass::Update's sort: bottom-up merge sort by key, ties taking the
  * right run first, the game's two buffers (the result ends in the first) -
  * done in local arrays (the same merges, so the same order); keys already
@@ -991,8 +1048,7 @@ static void rpu_sort(uint8_t *gm_, uint64_t RP, uint32_t v, uint32_t n)
     if (i == n)
         return;
     enum { MAXN = 4096 };
-    static uint32_t ka[MAXN], kb[MAXN];
-    static uint64_t oa[MAXN], ob[MAXN];
+    static uint64_t oa[MAXN];
     if (n > MAXN) {           /* (not seen) the game's buffers, as before */
         const uint64_t o1 = lp(RP + 0x248), k1 = lp(RP + 0x240);
         uint64_t so = o0, sk = k0, dob = o1, dk = k1;
@@ -1020,49 +1076,90 @@ static void rpu_sort(uint8_t *gm_, uint64_t RP, uint32_t v, uint32_t n)
         }
         return;
     }
+    /* The game's merges (bottom-up, a tie taking the right run first) give the
+     * order by key, then by position from last to first: any sort by that pair
+     * gives the same. (key, ~position) in one 64-bit value: insertion for the
+     * usual few objects, merges for more; the objects follow at the end. */
+    static uint64_t pa[MAXN], pb[MAXN];
+    /* the big passes: the same keys as last time (a still camera), the same order */
+    typedef struct { uint64_t rp; uint32_t v, n, cap; uint32_t *keys; uint16_t *order; } SortMemo;
+    static SortMemo memo[32];
+    SortMemo *sm = NULL;
+    if (n > 48) {
+        sm = &memo[((uint32_t)RP >> 4 ^ v * 7) & 31];
+        if (sm->rp == RP && sm->v == v && sm->n == n && !memcmp(sm->keys, keys, 4 * (size_t)n)) {
+            const uint8_t *ob8 = GP(o0);
+            for (uint32_t j = 0; j < n; j++)
+                memcpy(&oa[j], ob8 + 8 * j, 8);
+            uint32_t *kd = GP(k0);
+            uint8_t *od = GP(o0);
+            for (uint32_t j = 0; j < n; j++) {
+                const uint32_t k = sm->order[j];
+                kd[j] = sm->keys[k];
+                memcpy(od + 8 * j, &oa[k], 8);
+            }
+            return;
+        }
+    }
+    for (uint32_t j = 0; j < n; j++)
+        pa[j] = (uint64_t)keys[j] << 32 | (uint32_t)~j;
+    if (sm) {
+        if (sm->cap < n) {
+            free(sm->keys);
+            free(sm->order);
+            sm->cap = n + 64;
+            sm->keys = malloc(4 * (size_t)sm->cap);
+            sm->order = malloc(2 * (size_t)sm->cap);
+        }
+        memcpy(sm->keys, keys, 4 * (size_t)n);
+    }
+    uint64_t *srt = pa;
+    if (n <= 48) {
+        for (uint32_t j = 1; j < n; j++) {
+            const uint64_t v = pa[j];
+            uint32_t k = j;
+            while (k && pa[k - 1] > v) {
+                pa[k] = pa[k - 1];
+                k--;
+            }
+            pa[k] = v;
+        }
+    } else {
+        uint64_t *src = pa, *dst = pb;
+        for (uint32_t w = 1; w < n; w *= 2) {
+            for (uint32_t s0 = 0; s0 < n; s0 += 2 * w) {
+                const uint32_t mid = s0 + w < n ? s0 + w : n, end = s0 + 2 * w < n ? s0 + 2 * w : n;
+                uint32_t x = s0, y = mid, d = s0;
+                while (x < mid && y < end)
+                    dst[d++] = src[x] < src[y] ? src[x++] : src[y++];
+                while (x < mid)
+                    dst[d++] = src[x++];
+                while (y < end)
+                    dst[d++] = src[y++];
+            }
+            uint64_t *t = src;
+            src = dst;
+            dst = t;
+        }
+        srt = src;
+    }
     {
         const uint8_t *ob8 = GP(o0);
-        for (uint32_t j = 0; j < n; j++) {
-            ka[j] = keys[j];
+        for (uint32_t j = 0; j < n; j++)
             memcpy(&oa[j], ob8 + 8 * j, 8);
-        }
-    }
-    uint32_t *sk = ka, *dk = kb;
-    uint64_t *so = oa, *dob = ob;
-    for (uint32_t w = 1;; w *= 2) {
-        for (uint32_t s0 = 0; s0 < n; s0 += 2 * w) {
-            const uint32_t mid = s0 + w < n ? s0 + w : n, end = s0 + 2 * w < n ? s0 + 2 * w : n;
-            uint32_t a = s0, b = mid, d = s0;
-            while (a < mid && b < end) {
-                if (sk[a] < sk[b]) {
-                    dk[d] = sk[a];
-                    dob[d++] = so[a++];
-                } else {
-                    dk[d] = sk[b];
-                    dob[d++] = so[b++];
-                }
-            }
-            while (a < mid) {
-                dk[d] = sk[a];
-                dob[d++] = so[a++];
-            }
-            while (b < end) {
-                dk[d] = sk[b];
-                dob[d++] = so[b++];
-            }
-        }
-        uint32_t *tk = sk; sk = dk; dk = tk;
-        uint64_t *to = so; so = dob; dob = to;
-        if (2 * w >= n)
-            break;
-    }
-    {
         uint32_t *kd = GP(k0);
         uint8_t *od = GP(o0);
         for (uint32_t j = 0; j < n; j++) {
-            kd[j] = sk[j];
-            memcpy(od + 8 * j, &so[j], 8);
+            kd[j] = (uint32_t)(srt[j] >> 32);
+            memcpy(od + 8 * j, &oa[~(uint32_t)srt[j]], 8);
         }
+    }
+    if (sm) {
+        for (uint32_t j = 0; j < n; j++)
+            sm->order[j] = (uint16_t)~(uint32_t)srt[j];
+        sm->rp = RP;
+        sm->v = v;
+        sm->n = n;
     }
 }
 static void render_pass_update(Ctx *c)
@@ -1072,8 +1169,10 @@ static void render_pass_update(Ctx *c)
     if (stats < 0)
         stats = getenv("MINA_RPU_STATS") != NULL;
     uint64_t t_scan = stats ? now_us() : 0;
-    if (stats)
+    if (stats) {
         rpu.calls++;
+        rpu.in_fixed += g_in_fixed;
+    }
     const uint64_t RP = c->x[0];
     if (!*(uint8_t *)GP(RP + 0x258))
         return;
@@ -1083,16 +1182,27 @@ static void render_pass_update(Ctx *c)
         const uint64_t cam = lp(RP + 0x10 + 8 * v);
         if (!cam)
             continue;
+        if (stats)
+            rpu.views++;
         const uint32_t mask = *(uint8_t *)GP(RP + 0x9);
         const float *A = GP(cam), *B = GP(cam + 0x40);
+        /* the camera's matrices (A, B: 128 bytes) seen in an earlier call: its
+         * inverse and planes again (the passes of a frame share a few cameras) */
+        CamCache *cc = cam_cache_find(A);
+        PlaneA *act;
+        int nact;
+        if (cc) {
+            memcpy(GP(fr + 0x20), cc->inv, 64);
+            act = cc->act;
+            nact = cc->nact;
+        } else {
+        cc = cam_cache_slot(A);
+        act = cc->act;
         /* camera position: the translation of B's inverse (the game's code) */
         c->x[0] = cam + 0x40;
         c->x[8] = fr + 0x20;
         f_a33c0(c);
-        const float *Binv = GP(fr + 0x20);
-        float *campos = GP(fr), *camdir = GP(fr + 0x10);
-        campos[0] = Binv[12]; campos[1] = Binv[13]; campos[2] = Binv[14];
-        memcpy(camdir, GP(cam + 0x10c), 12);
+        memcpy(cc->inv, GP(fr + 0x20), 64);
         /* M = B x A, by rows */
         float M[4][4];
         for (int r = 0; r < 4; r++)
@@ -1113,20 +1223,47 @@ static void render_pass_update(Ctx *c)
         make_plane(&P[5], M[0][3] + M[0][1], M[1][3] + M[1][1], M[2][3] + M[2][1], M[3][3] + M[3][1]);
         /* the planes that can cull (not at infinity), with their absolute normals:
          * plane_culls's operations, what does not depend on the box done once */
-        PlaneA act[6];
-        int nact = 0;
-        for (int k = 0; k < 6; k++) {
+        nact = 0;
+        /* the side planes first (in a 2D game they cull; the order of the
+           tests does not change the result: any plane culls) */
+        static const int porder[6] = { 2, 3, 4, 5, 0, 1 };
+        for (int kk = 0; kk < 6; kk++) {
+            const int k = porder[kk];
             if (__builtin_fabsf(P[k].w) == __builtin_inff())
                 continue;
             act[nact] = (PlaneA){ P[k].x, P[k].y, P[k].z, P[k].w, fabs_sel(P[k].x), fabs_sel(P[k].y), fabs_sel(P[k].z) };
             nact++;
         }
+        cc->nact = nact;
+        /* the planes by component, 4 to a NEON register; the padding never
+           culls (0 < -inf is false, and so is NaN < -inf) */
+        for (int k = 0; k < 8; k++) {
+            const int on = k < nact;
+            cc->soa[0][k] = on ? act[k].x : 0.0f;
+            cc->soa[1][k] = on ? act[k].y : 0.0f;
+            cc->soa[2][k] = on ? act[k].z : 0.0f;
+            cc->soa[3][k] = on ? act[k].ax : 0.0f;
+            cc->soa[4][k] = on ? act[k].ay : 0.0f;
+            cc->soa[5][k] = on ? act[k].az : 0.0f;
+            cc->soa[6][k] = on ? act[k].w : -__builtin_inff();
+        }
+        }
+        const float *Binv = GP(fr + 0x20);
+        float *campos = GP(fr), *camdir = GP(fr + 0x10);
+        campos[0] = Binv[12]; campos[1] = Binv[13]; campos[2] = Binv[14];
+        memcpy(camdir, GP(cam + 0x10c), 12);
         /* bounds of all objects: empty */
         float *abm = GP(RP + 0xb0 + 0x18 * v);        /* center 3, extent 3 */
         const float neg_max = hexf(0xfe7fffff);
-        float ab[6] = { 0.0f, 0.0f, 0.0f, neg_max, neg_max, neg_max };   /* (in registers; stored at the end) */
-        float vc[3] = { 0, 0, 0 }, ve[3] = { neg_max, neg_max, neg_max };
+        /* (in registers; stored at the end) */
+        float32x4_t abc = vdupq_n_f32(0.0f), abe = vdupq_n_f32(neg_max);
+        float32x4_t vcc = vdupq_n_f32(0.0f), vce = vdupq_n_f32(neg_max);
         const uint32_t skip_flag = ((1u << v) & mask) ? 8 : 0;
+        /* the planes in registers for the whole loop */
+        float32x4_t pl[2][7];
+        for (int q = 0; q < 2; q++)
+            for (int m = 0; m < 7; m++)
+                pl[q][m] = vld1q_f32(&cc->soa[m][4 * q]);
         uint32_t n = 0;
         const uint32_t sortfn = (uint32_t)lp(RP + 0x128);
         const uint32_t npages = (uint32_t)lp(RP + 0x138);
@@ -1138,6 +1275,8 @@ static void render_pass_update(Ctx *c)
             const uint32_t page = (uint32_t)lp(pages + 8 * pg);
             for (uint32_t j = 0; left; j++) {
                 const uint64_t obj = lp(page + 8 * j);
+                if (stats)
+                    rpu.slots++;
                 if (!obj)
                     continue;
                 left--;
@@ -1145,7 +1284,8 @@ static void render_pass_update(Ctx *c)
                     rpu.objs++;
                 const uint32_t boxa = page + 0x4800 + 0x18 * j;
                 const float *box = GP(boxa);
-                grow_bounds(ab, ab + 3, box);
+                const float32x4_t bx = vld1q_f32(box), bex = vld1q_f32(box + 3);   /* (lane 3: the next float, unused) */
+                grow4(&abc, &abe, bx, bex);
                 const uint8_t layer = *(uint8_t *)GP(page + 8 * j + 0x6001);
                 if (!(*(uint8_t *)GP(RP + 0x8) & layer))
                     continue;
@@ -1154,16 +1294,28 @@ static void render_pass_update(Ctx *c)
                 if (f & skip_flag)
                     continue;
                 if (f & 1) {
+                    /* outside any plane: x b0 + b1 y + b2 z + (ax b3 + ay b4 + az b5) < w,
+                     * each product rounded, then the additions in that order
+                     * (vmul + vadd: no fusing); 4 planes at a time, no
+                     * VFP compare-and-transfer per plane */
                     int culled = 0;
-                    for (int k = 0; k < nact && !culled; k++) {
-                        const PlaneA *q = &act[k];
-                        float dd = q->x * box[0];
-                        dd = dd + box[1] * q->y;
-                        dd = dd + box[2] * q->z;
-                        float r = q->ax * box[3];
-                        r = r + q->ay * box[4];
-                        r = r + q->az * box[5];
-                        culled = dd + r < q->w;
+                    for (int q4 = 0; q4 < nact; q4 += 4) {
+                        const float32x4_t *pq = pl[q4 >> 2];
+                        float32x4_t dd = vmulq_n_f32(pq[0], box[0]);
+                        dd = vaddq_f32(dd, vmulq_n_f32(pq[1], box[1]));
+                        dd = vaddq_f32(dd, vmulq_n_f32(pq[2], box[2]));
+                        float32x4_t r = vmulq_n_f32(pq[3], box[3]);
+                        r = vaddq_f32(r, vmulq_n_f32(pq[4], box[4]));
+                        r = vaddq_f32(r, vmulq_n_f32(pq[5], box[5]));
+                        /* vcgt.f32 itself: GCC turns vcltq_f32 into a VFP compare per lane */
+                        uint32x4_t lt;
+                        const float32x4_t sum = vaddq_f32(dd, r), wv = pq[6];
+                        __asm__("vcgt.f32 %q0, %q1, %q2" : "=w"(lt) : "w"(wv), "w"(sum));
+                        const uint32x2_t m = vorr_u32(vget_low_u32(lt), vget_high_u32(lt));
+                        if (vget_lane_u32(vpmax_u32(m, m), 0)) {
+                            culled = 1;
+                            break;
+                        }
                     }
                     if (culled) {
                         if (stats)
@@ -1231,10 +1383,14 @@ static void render_pass_update(Ctx *c)
                 const uint64_t o64 = obj;
                 memcpy(GP(lp(RP + 0x218 + 8 * v) + 8 * (uint64_t)n), &o64, 8);
                 n++;
-                grow_bounds_vis(vc, ve, box);
+                grow4(&vcc, &vce, vld1q_f32(box), vld1q_f32(box + 3));   /* (read again, as the game does) */
             }
         }
-        memcpy(abm, ab, sizeof ab);
+        float ab[8];
+        vst1q_f32(ab, abc);
+        vst1q_f32(ab + 4, abe);
+        abm[0] = ab[0]; abm[1] = ab[1]; abm[2] = ab[2];
+        abm[3] = ab[4]; abm[4] = ab[5]; abm[5] = ab[6];
         {   /* MINA_POISON_ALLBOUNDS: is the bounds of all objects read at all? */
             static int poison = -1;
             if (poison < 0)
@@ -1244,8 +1400,13 @@ static void render_pass_update(Ctx *c)
                     abm[k] = __builtin_nanf("");
         }
         float *vb = GP(RP + 0x150 + 0x18 * v);
-        vb[0] = vc[0]; vb[1] = vc[1]; vb[2] = vc[2];
-        vb[3] = ve[0]; vb[4] = ve[1]; vb[5] = ve[2];
+        {
+            float v8[8];
+            vst1q_f32(v8, vcc);
+            vst1q_f32(v8 + 4, vce);
+            vb[0] = v8[0]; vb[1] = v8[1]; vb[2] = v8[2];
+            vb[3] = v8[4]; vb[4] = v8[5]; vb[5] = v8[6];
+        }
         uint64_t t_sort = stats ? now_us() : 0;
         if (stats) {
             rpu.scan_us += t_sort - t_scan;
@@ -1261,9 +1422,9 @@ static void render_pass_update(Ctx *c)
     }
     c->sp = saved_sp;
     if (stats && rpu.calls % 600 == 0) {
-        rt_log("[rpu] per call: %.0f objects, %.0f culled, %.0f keyed, %.0f sorted; %.1f us scan, %.1f us sort\n",
+        rt_log("[rpu] per call: %.0f objects, %.0f culled, %.0f keyed, %.0f sorted; %.1f us scan, %.1f us sort; %.0f slots, %.2f views, %.0f%% in fixed updates\n",
                rpu.objs / 600.0, rpu.culled / 600.0, rpu.keyed / 600.0, rpu.sorted / 600.0, rpu.scan_us / 600.0,
-               rpu.sort_us / 600.0);
+               rpu.sort_us / 600.0, rpu.slots / 600.0, rpu.views / 600.0, rpu.in_fixed / 6.0);
         memset(&rpu, 0, sizeof rpu);
     }
 }
@@ -2601,4 +2762,2206 @@ void nat__ZN14SessionManager19StartActiveSaveSlotEv(Ctx *c)
         rt_log("[levels] the save slot starts in level %d (was %d)\n", idx, (int)(int32_t)rt_ld32(G(0x1e48120)));
         rt_st32(G(0x1e48120), (uint32_t)idx);
     }
+}
+
+/* ---- PhysicsManager::Overlap -------------------------------------------------------------------
+ * Which physics objects and tile layers a set of query shapes (PhysicsQueryShape,
+ * 40 bytes: mask, flags, shape) at pos overlaps; the listener (L) gets each hit.
+ * The recompiled scan reloads its spilled locals for every slot of the 12 buckets
+ * of 64-slot pools; here the occupied slots come from the free bitmap's zeros.
+ * Pool slot (0x40): +0 half x/y, +8 offset x/y, +0x10 pos x/y/z, +0x20 owner,
+ * +0x28/+0x30 masks, +0x3a flags, +0x3c z. Same memory reads and calls, in the
+ * same order, as the game's code (callbacks may change what follows).
+ * MINA_VERIFY_PHYS=1: each call runs the game's code, and the shapes this one
+ * would test (its ycGeo::Intersects and TileLayerOverlap calls, made without
+ * calling them) are compared with the game's calls. MINA_PHYS_STATS=1: counts. */
+void f_1abdf4_orig(Ctx *c);     /* ycGeo::Intersects */
+void f_7bdfe4_orig(Ctx *c);     /* TileLevelCollision::TileLayerOverlap */
+void f_9748c0_orig(Ctx *c);     /* PhysicsManager::Overlap */
+
+typedef struct { uint32_t a, b, c, d; } PhysRec;
+static PhysRec phys_rec_buf[2][512];
+static int phys_rec_n[2], phys_rec_on = -1;   /* [0]: the game's calls, [1]: this one's */
+static uint32_t phys_q, phys_slots, phys_cand, phys_tn[3];
+static int phys_stats_on = -1;
+static void phys_stats_tick(void)
+{
+    static int n;
+    if (phys_stats_on < 0)
+        phys_stats_on = getenv("MINA_PHYS_STATS") != NULL;
+    if (!phys_stats_on || ++n < 300)
+        return;
+    rt_log("[phys] per fixed update: %.1f queries, %.0f slots scanned, %.1f shape tests; overlap tiles: %.0f entities, %.0f components, %.0f layers\n",
+           phys_q / 300.0, phys_slots / 300.0, phys_cand / 300.0, phys_tn[0] / 300.0, phys_tn[1] / 300.0, phys_tn[2] / 300.0);
+    memset(phys_tn, 0, sizeof phys_tn);
+    n = 0;
+    phys_q = phys_slots = phys_cand = 0;
+}
+static inline void phys_rec(int w, uint32_t a, uint32_t b, uint32_t c_, uint32_t d)
+{
+    if (phys_rec_n[w] < 512)
+        phys_rec_buf[w][phys_rec_n[w]] = (PhysRec){a, b, c_, d};
+    phys_rec_n[w]++;
+}
+void nat__ZN5ycGeo10IntersectsEjRK7ycShapeRK6ycVec3jS2_S5_j(Ctx *c)
+{
+    if (phys_rec_on > 0)
+        phys_rec(0, (uint32_t)c->x[1], (uint32_t)c->x[3], (uint32_t)c->x[4], (uint32_t)c->x[5]);
+    f_1abdf4_orig(c);
+}
+static void tile_layer_overlap(Ctx *c, int dry);
+static int tile_rec_on = -1, tile_rec_stop;
+/* MINA_VERIFY_TILE=1: the tiles TileLayerOverlap hands to the callback, the
+ * game's (from the callback, CheckOverlap) and this one's (without calling it) */
+void f_7bb798_orig(Ctx *c);
+void nat__ZN33PhysicsTileLevelCollisionCallback12CheckOverlapERKN26TileLevelCollisionCallback11CollideInfoEbRK6ycVec39ShapeTypePK7ycShape(Ctx *c)
+{
+    if (tile_rec_on > 0 && !tile_rec_stop) {
+        GM_BEGIN;
+        const uint64_t ci = c->x[1];
+        phys_rec(0, rt_ld32(GP(ci + 8)), rt_ld32(GP(ci + 0xc)), rt_ld32(GP(ci + 0x20)) & 0xffffff,
+                 ((uint32_t)c->x[2] & 1) | (uint32_t)*(uint8_t *)GP(ci + 0x24) << 8);
+    }
+    f_7bb798_orig(c);
+    if (tile_rec_on > 0 && ((uint32_t)c->x[0] & 1))
+        tile_rec_stop = 1;
+}
+void nat__ZN18TileLevelCollision16TileLayerOverlapEPN26TileLevelCollisionCallback11CollideInfoERKNS_11CommonParamE9ShapeTypePK7ycShapeRK6ycVec3(Ctx *c)
+{
+    if (phys_rec_on > 0) {
+        GM_BEGIN;
+        phys_rec(0, (uint32_t)c->x[0] | 0x80000000u, (uint32_t)c->x[4], rt_ld32(GP(c->x[1] + 0x18)), rt_ld32(GP(c->x[1] + 0x1c)));
+        f_7bdfe4_orig(c);
+        return;
+    }
+    if (tile_rec_on < 0)
+        tile_rec_on = getenv("MINA_VERIFY_TILE") != NULL;
+    if (tile_rec_on > 0) {
+        static uint32_t calls, bad;
+        Ctx save = *c;
+        phys_rec_n[1] = 0;
+        tile_layer_overlap(c, 1);
+        *c = save;
+        phys_rec_n[0] = 0;
+        tile_rec_stop = 0;
+        f_7bdfe4_orig(c);
+        calls++;
+        const int n0 = phys_rec_n[0], n1 = phys_rec_n[1];
+        const int ok = (tile_rec_stop ? n1 >= n0 : n0 == n1) &&
+                       !memcmp(phys_rec_buf[0], phys_rec_buf[1], sizeof(PhysRec) * (n0 < 512 ? n0 : 512));
+        if (!ok && bad++ < 20) {
+            rt_log("[verify] TileLayerOverlap differs (%u of %u): game %d tiles, mine %d%s\n", bad, calls, n0, n1,
+                   tile_rec_stop ? " (stopped)" : "");
+            for (int i = 0; i < 4 && (i < n0 || i < n1); i++) {
+                const PhysRec *a = &phys_rec_buf[0][i], *b = &phys_rec_buf[1][i];
+                rt_log("  %d: %08x %08x %08x %08x | %08x %08x %08x %08x\n", i, i < n0 ? a->a : 0, i < n0 ? a->b : 0,
+                       i < n0 ? a->c : 0, i < n0 ? a->d : 0, i < n1 ? b->a : 0, i < n1 ? b->b : 0, i < n1 ? b->c : 0,
+                       i < n1 ? b->d : 0);
+            }
+        }
+        if ((calls & 0xfff) == 0)
+            rt_log("[verify] TileLayerOverlap: %u calls checked, %u differ\n", calls, bad);
+        return;
+    }
+    tile_layer_overlap(c, 0);
+}
+
+static inline uint64_t ld64g(uint8_t *gm_, uint64_t a) { return rt_ld64(GP(a)); }
+#define L64(a) ld64g(gm_, (a))
+#define L32(a) rt_ld32(GP(a))
+#define L8(a) (*(uint8_t *)GP(a))
+/* the game's lane ops: fcmgt + bsl/bit */
+static inline float gt_sel(float a, float b, float t, float f) { return a > b ? t : f; }
+
+static void phys_verify(Ctx *c, void (*nat)(Ctx *, int), void (*orig)(Ctx *), const char *name, int kreg);
+static void phys_overlap(Ctx *c, int dry)
+{
+    GM_BEGIN;
+    const uint64_t T = c->x[0], S = c->x[2], L = c->x[4];
+    const uint32_t n = (uint32_t)c->x[1], kind = (uint32_t)c->x[5];
+    const uint32_t z = (uint32_t)c->x[3];
+    const float px = c->v[0].f[0], py = c->v[1].f[0], pz = c->v[2].f[0];
+    const uint64_t saved_sp = c->sp, saved_fp = c->x[29];
+    const uint64_t F = saved_sp - 0x190;
+    stfp(F + 0xc0, px);
+    stfp(F + 0xc4, py);
+    stfp(F + 0xc8, pz);
+    uint64_t ret = 0;
+    if (n == 0)
+        goto done;
+    if (!dry)
+        phys_q++;
+    /* the shapes' bounds (the game's registers: types it has no case for reuse
+       the previous shape's box, the first one the caller's v6/v7) */
+    float h6[2] = {c->v[6].f[0], c->v[6].f[1]}, c7[2] = {c->v[7].f[0], c->v[7].f[1]};
+    float ac[2] = {0.0f, 0.0f}, ah[2];
+    {
+        float m = hexf(0xfe7fffffu);
+        ah[0] = ah[1] = m;
+    }
+    uint64_t mask = 0;
+    const uint64_t cfg = L + 0x28dc;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint64_t e = S + (uint64_t)i * 40;
+        const uint64_t m = L64(e);
+        const uint64_t sh = L64(e + 0x10);
+        const uint32_t ty = L32(sh) - 1;
+        if (ty <= 8) {
+            const uint64_t d = L64(sh + 8);
+            if (ty == 0 || ty == 8) {
+                float mn[2], mx[2], v7[2];
+                for (int k = 0; k < 2; k++) {
+                    const float a = ldfp(d + 4 * k);
+                    if (ty == 0) {
+                        const float q = a + ldfp(d + 0xc + 4 * k);
+                        mn[k] = gt_sel(q, a, a, q);
+                        mx[k] = a;
+                        v7[k] = q;
+                    } else {
+                        const float b = ldfp(d + 0x18 + 4 * k), mm = ldfp(d + 0xc + 4 * k);
+                        float lo = gt_sel(b, a, a, b);
+                        mx[k] = gt_sel(a, b, a, b);
+                        mn[k] = gt_sel(lo, mm, mm, lo);
+                        v7[k] = mm;
+                    }
+                    const float x6 = mx[k] + 0.0f;
+                    const float hi = gt_sel(v7[k], x6, v7[k], x6);
+                    h6[k] = (hi - mn[k]) * 0.5f;
+                    c7[k] = mn[k] + h6[k];
+                }
+            } else if (ty == 3) {
+                c7[0] = ldfp(d);
+                c7[1] = ldfp(d + 4);
+                h6[0] = ldfp(d + 0xc);
+                h6[1] = ldfp(d + 0x10);
+            } else if (ty == 7) {
+                c7[0] = ldfp(d);
+                c7[1] = ldfp(d + 4);
+                h6[0] = h6[1] = ldfp(d + 0xc);
+            }
+        }
+        mask |= m;
+        for (int k = 0; k < 2; k++) {
+            const float lo = ac[k] - ah[k], hi = ac[k] + ah[k];
+            float nlo = c7[k] - h6[k];
+            nlo = gt_sel(nlo, lo, lo, nlo);
+            float nhi = c7[k] + h6[k];
+            nhi = gt_sel(nhi, hi, nhi, hi);
+            ah[k] = (nhi - nlo) * 0.5f;
+            ac[k] = nlo + ah[k];
+        }
+    }
+    if (!mask)
+        goto done;
+    const uint32_t zz = L8(cfg + 0xd) ? z : 0;
+    const uint64_t ign = L64(L + 0x60);
+    const uint32_t moff = kind == 0 ? 0x30 : 0x28, coff = kind == 0 ? 0x10 : 0x8;
+    const uint32_t mlo = (uint32_t)mask, mhi = (uint32_t)(mask >> 32);
+    const int stats_on = !dry && phys_stats_on > 0;
+    const float cx = ac[0] + px, cy = ac[1] + py;
+    const float hx = ah[0] + hexf(0x3f4ccccdu), hy = ah[1] + hexf(0x3f4ccccdu);
+    const float s9 = cx - hx, s10 = hx + cx, s11 = hy + cy, s12 = cy - hy;
+    c->sp = F;
+    c->x[29] = F + 0x180;
+    for (uint32_t b = 0; b < 12; b++) {
+        const uint64_t bk = T + (uint64_t)b * 32;
+        const uint64_t cnt = L64(bk + 0x168);
+        if (!cnt || !L32(T + 0x2e4))
+            continue;
+        const uint64_t arr = L64(bk + 0x160);
+        const uint64_t end = (uint32_t)(arr + cnt * 8);
+        uint32_t w9 = 1;
+        for (uint64_t pp = (uint32_t)arr; pp != end; pp = (uint32_t)(pp + 8)) {
+            if (!w9)
+                continue;
+            const uint64_t pool = L64(pp);
+            uint64_t O0 = L64(pool + 0x20);
+            uint32_t w = 0, nw;
+            for (;;) {
+                const uint64_t bits = L64(L64(pool) + (uint64_t)w * 8);
+                if (bits != ~0ull) {
+                    if (stats_on)
+                        phys_slots += __builtin_popcountll(~bits);
+                    /* by 32-bit halves: one word of live slots in a register */
+                    for (int hf = 0; hf < 2; hf++) {
+                    uint32_t live = ~(uint32_t)(bits >> (hf * 32));
+                    const uint32_t ob = (uint32_t)(O0 + hf * 0x800);
+                    const uint8_t *mb = gm_ + (uint32_t)(ob + moff);
+                    while (live) {
+                        const uint32_t j = __builtin_ctz(live);
+                        live &= live - 1;
+                        const uint8_t *mp = mb + (j << 6);
+                        if (!((rt_ld32(mp) & mlo) | (rt_ld32(mp + 4) & mhi)))
+                            continue;
+                        const uint64_t O = (uint32_t)(ob + (j << 6));
+                        const uint64_t own = L64(O + 0x20);
+                        if (own == ign)
+                            continue;
+                        if (zz) {
+                            uint32_t dz = zz - L32(O + 0x3c);
+                            if ((int32_t)dz < 0)
+                                dz = -dz;
+                            if (dz >= 2 && !(L8(O + 0x3a) & 0x80) && L8(cfg + 0xd))
+                                continue;
+                        }
+                        {
+                            const float t = ldfp(O + 0x10) + ldfp(O + 0x8), hw = ldfp(O);
+                            const float lo = t - hw, hi = hw + t;
+                            if (s9 > hi || lo > s10)
+                                continue;
+                        }
+                        {
+                            const float hh = ldfp(O + 0x4), t = ldfp(O + 0x14) + ldfp(O + 0xc);
+                            const float lo = t - hh, hi = hh + t;
+                            if (s12 > hi || lo > s11)
+                                continue;
+                        }
+                        for (uint64_t nd = L64(own + 0x128); nd; nd = L64(nd + 0x18)) {
+                            const uint64_t cp = L64(nd + 8);
+                            for (uint32_t k = 0; k < (n > 1 ? n : 1); k++) {
+                                const uint64_t e = S + (uint64_t)k * 40;
+                                if (!(L64(cp + coff) & L64(e)))
+                                    continue;
+                                const uint32_t fl = L32(e + 8);
+                                if (!(L32(cp + 0x84) & fl & 0x1e00))
+                                    continue;
+                                const uint64_t sh = L64(e + 0x10);
+                                const uint32_t ty = L32(sh);
+                                const uint64_t sd = L64(sh + 8);
+                                const uint32_t ct = L32(cp + 0x18);
+                                const uint64_t cd = L64(cp + 0x20);
+                                if (fl & 0xa00) {
+                                    if (!(pz == 0.0f))
+                                        continue;
+                                    if (!(ldfp(O + 0x18) == 0.0f))
+                                        continue;
+                                }
+                                if (dry) {
+                                    phys_rec(1, (uint32_t)sd, ct, (uint32_t)cd, (uint32_t)(O + 0x10));
+                                    continue;
+                                }
+                                phys_cand++;
+                                c->x[0] = ty;
+                                c->x[1] = sd;
+                                c->x[2] = F + 0xc0;
+                                c->x[3] = ct;
+                                c->x[4] = cd;
+                                c->x[5] = O + 0x10;
+                                f_1abdf4_orig(c);
+                                if (!(uint32_t)c->x[0])
+                                    continue;
+                                rt_st64(GP(L + 0x8), T);
+                                rt_st64(GP(L + 0x18), S);
+                                rt_st64(GP(L + 0x3c), L64(F + 0xc0));
+                                rt_st32(GP(L + 0x44), L32(F + 0xc8));
+                                rt_st64(GP(L + 0x48), 0);
+                                rt_st32(GP(L + 0x50), 0);
+                                c->x[0] = L;
+                                c->x[1] = L64(O + 0x20);
+                                c->x[2] = cp;
+                                c->x[3] = k;
+                                rt_call(c, L64(L64(L) + 8));
+                            }
+                        }
+                    }
+                    }
+                    O0 = (uint32_t)(O0 + 0x1000);
+                } else {
+                    O0 = (uint32_t)(O0 + 0x1000);
+                }
+                w++;
+                nw = L32(T + 0x2e4);
+                if (w == nw)
+                    break;
+            }
+            w9 = nw;
+        }
+    }
+    if (kind == 1) {
+        if (!dry) {
+            rt_st64(GP(L + 0x8), T);
+            rt_st64(GP(L + 0x18), S);
+            rt_st64(GP(L + 0x3c), L64(F + 0xc0));
+            rt_st32(GP(L + 0x44), L32(F + 0xc8));
+            rt_st64(GP(L + 0x48), 0);
+            rt_st32(GP(L + 0x50), 0);
+        }
+        rt_st64(GP(F + 0x98), GUEST_IMAGE_BASE + 0xde6970);
+        rt_st64(GP(F + 0xa0), L);
+        float s0 = 1.0f;
+        if (!L8(cfg))
+            s0 = ldfp(L + 0x28d4);
+        stfp(F + 0xa8, s0);
+        rt_st64(GP(F + 0x88), F + 0x98);
+        rt_st64(GP(F + 0x90), F + 0xa8);
+        for (uint32_t i = 0; i < (n > 1 ? n : 1); i++) {
+            const uint64_t e = S + (uint64_t)i * 40;
+            rt_st64(GP(F + 0xb8), L64(e));
+            rt_st32(GP(F + 0xb4), i);
+            if (!L64(L64(L64(T + 0x10) + 0x50) + 0xb0))
+                continue;
+            for (uint64_t nd = L64(L64(L64(T + 0x10) + 0x50) + 0xb0); nd; nd = L64(nd + 0x18)) {
+                uint64_t r = L64(nd + 8), q;
+                if (stats_on)
+                    phys_tn[0]++;
+                while ((q = L64(r + 0x450)) != 0)
+                    r = q;
+                for (uint64_t n2 = L64(r + 0x438); n2; n2 = L64(n2 + 0x18)) {
+                    const uint64_t cp = L64(n2 + 8);
+                    if (stats_on)
+                        phys_tn[1]++;
+                    if (L32(cp + 0x370) != 5)
+                        continue;
+                    rt_st32(GP(F + 0xac), L32(e + 8));
+                    const uint64_t X = L64(cp + 0x398);
+                    const uint64_t sh = L64(e + 0x10);
+                    const uint32_t ty = L32(sh);
+                    const uint64_t sd = L64(sh + 8);
+                    rt_st64(GP(F + 0xd0), X);
+                    uint64_t x8 = L64(X), x9 = L64(x8 + 0x10);
+                    if (!(L64(x9 + 0x38) >> 34))
+                        continue;
+                    for (uint64_t l = 0; l < (L64(x9 + 0x38) >> 34); l = (uint32_t)(l + 1)) {
+                        const uint64_t lay = L64(x9 + 0x40);
+                        if (stats_on)
+                            phys_tn[2]++;
+                        const uint64_t a = L64(lay + l * 168 + 0x60);
+                        if (a) {
+                            const uint64_t x12 = a & ~L64(x8 + 0xb0);
+                            const uint32_t pass = (x12 & ~1ull) == 0 ? !(a & 1) : (uint32_t)a;
+                            if (!(pass & 1))
+                                continue;
+                        }
+                        if (!L8(L64(X + 8) + l))
+                            continue;
+                        const uint32_t lz = L32(lay + l * 168 + 0x88);
+                        if (!lz)
+                            continue;
+                        if (zz) {
+                            uint32_t dz = lz - zz;
+                            if ((int32_t)dz < 0)
+                                dz = -dz;
+                            if (dz > 1)
+                                continue;
+                        }
+                        rt_st32(GP(F + 0xe8), lz);
+                        rt_st32(GP(F + 0xec), (uint32_t)l);
+                        if (dry) {
+                            phys_rec(1, (uint32_t)X | 0x80000000u, (uint32_t)sd, lz, (uint32_t)l);
+                            continue;
+                        }
+                        c->x[0] = X;
+                        c->x[1] = F + 0xd0;
+                        c->x[2] = F + 0x88;
+                        c->x[3] = ty;
+                        c->x[4] = sd;
+                        c->x[5] = F + 0xc0;
+                        nat__ZN18TileLevelCollision16TileLayerOverlapEPN26TileLevelCollisionCallback11CollideInfoERKNS_11CommonParamE9ShapeTypePK7ycShapeRK6ycVec3(c);
+                        x8 = L64(X);
+                        x9 = L64(x8 + 0x10);
+                    }
+                }
+            }
+        }
+    }
+    c->sp = saved_sp;
+    c->x[29] = saved_fp;
+done:
+    ret = L64(L + 0x1480) != 0;
+    c->x[0] = ret;
+}
+
+void nat__ZN14PhysicsManager7OverlapEjP17PhysicsQueryShapei6ycVec3P20PhysicsQueryListenerj(Ctx *c)
+{
+    if (phys_rec_on < 0)
+        phys_rec_on = getenv("MINA_VERIFY_PHYS") != NULL;
+    if (phys_rec_on > 0) {
+        phys_verify(c, phys_overlap, f_9748c0_orig, "Overlap", 5);
+        return;
+    }
+    phys_overlap(c, 0);
+}
+
+/* ---- PhysicsManager::Sweep ---------------------------------------------------------------------
+ * Overlap's scan for a moving query: the shapes' box swept along the segment
+ * (ycLineSeg: start +0, delta +0xc), hits from ycGeo::Sweep (time of impact,
+ * normal) and TileLevelCollision::TileLayerSweep. L+0x2c: the unit direction,
+ * +0x38 its length, +0x3c the segment. Same verification as Overlap. */
+void f_1ad96c_orig(Ctx *c);     /* ycGeo::Sweep */
+void f_7bd5bc_orig(Ctx *c);     /* TileLevelCollision::TileLayerSweep */
+void f_974fe0_orig(Ctx *c);     /* PhysicsManager::Sweep */
+void nat__ZN5ycGeo5SweepEPfP6ycVec3jRK7ycShapeRK9ycLineSegjS5_S8_j(Ctx *c)
+{
+    if (phys_rec_on > 0)
+        phys_rec(0, (uint32_t)c->x[3], (uint32_t)c->x[5], (uint32_t)c->x[6], (uint32_t)c->x[4]);
+    f_1ad96c_orig(c);
+}
+void nat__ZN18TileLevelCollision14TileLayerSweepEPN26TileLevelCollisionCallback11CollideInfoERKNS_11CommonParamE9ShapeTypePK7ycShapeRK6ycVec3SC_(Ctx *c)
+{
+    if (phys_rec_on > 0) {
+        GM_BEGIN;
+        phys_rec(0, (uint32_t)c->x[0] | 0x80000000u, (uint32_t)c->x[4], rt_ld32(GP(c->x[1] + 0x18)), rt_ld32(GP(c->x[1] + 0x1c)));
+    }
+    f_7bd5bc_orig(c);
+}
+
+static void phys_sweep(Ctx *c, int dry)
+{
+    GM_BEGIN;
+    const uint64_t T = c->x[0], S = c->x[2], G = c->x[4], L = c->x[5];
+    const uint32_t n = (uint32_t)c->x[1], kind = (uint32_t)c->x[6];
+    const uint32_t z = (uint32_t)c->x[3];
+    const uint64_t saved_sp = c->sp, saved_fp = c->x[29];
+    const uint64_t F = saved_sp - 0x1b0;
+    if (n == 0)
+        goto done;
+    if (!dry)
+        phys_q++;
+    float h4[2] = {c->v[4].f[0], c->v[4].f[1]}, c5[2] = {c->v[5].f[0], c->v[5].f[1]};
+    float ac[2] = {0.0f, 0.0f}, ah[2];
+    ah[0] = ah[1] = hexf(0xfe7fffffu);
+    uint64_t mask = 0;
+    const uint64_t cfg = L + 0x28dc;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint64_t e = S + (uint64_t)i * 40;
+        const uint64_t m = L64(e);
+        const uint64_t sh = L64(e + 0x10);
+        const uint32_t ty = L32(sh) - 1;
+        if (ty <= 8) {
+            const uint64_t d = L64(sh + 8);
+            if (ty == 0 || ty == 8) {
+                for (int k = 0; k < 2; k++) {
+                    const float a = ldfp(d + 4 * k);
+                    float mn, x4, v5;
+                    if (ty == 0) {
+                        const float q = a + ldfp(d + 0xc + 4 * k);
+                        mn = gt_sel(q, a, a, q);
+                        x4 = a + 0.0f;
+                        v5 = q;
+                    } else {        /* no +0 on this path (the jump skips it) */
+                        const float b = ldfp(d + 0x18 + 4 * k), mm = ldfp(d + 0xc + 4 * k);
+                        const float lo = gt_sel(b, a, a, b);
+                        x4 = gt_sel(a, b, a, b);
+                        mn = gt_sel(lo, mm, mm, lo);
+                        v5 = mm;
+                    }
+                    const float hi = gt_sel(v5, x4, v5, x4);
+                    h4[k] = (hi - mn) * 0.5f;
+                    c5[k] = mn + h4[k];
+                }
+            } else if (ty == 3) {
+                c5[0] = ldfp(d);
+                c5[1] = ldfp(d + 4);
+                h4[0] = ldfp(d + 0xc);
+                h4[1] = ldfp(d + 0x10);
+            } else if (ty == 7) {
+                c5[0] = ldfp(d);
+                c5[1] = ldfp(d + 4);
+                h4[0] = h4[1] = ldfp(d + 0xc);
+            }
+        }
+        mask |= m;
+        for (int k = 0; k < 2; k++) {
+            const float lo = ac[k] - ah[k], hi = ac[k] + ah[k];
+            float nlo = c5[k] - h4[k];
+            nlo = gt_sel(nlo, lo, lo, nlo);
+            float nhi = c5[k] + h4[k];
+            nhi = gt_sel(nhi, hi, nhi, hi);
+            ah[k] = (nhi - nlo) * 0.5f;
+            ac[k] = nlo + ah[k];
+        }
+    }
+    if (!mask)
+        goto done;
+    const uint32_t zz = L8(cfg + 0xd) ? z : 0;
+    rt_st64(GP(F + 0xe8), 0);
+    rt_st64(GP(F + 0xf0), 0);
+    rt_st64(GP(F + 0xf8), 0);
+    if (!dry) {
+        uint8_t seg[24];
+        memcpy(seg, GP(G), 24);
+        memcpy(GP(L + 0x3c), seg, 24);
+        rt_st64(GP(L + 0x2c), L64(G + 0xc));
+        rt_st32(GP(L + 0x34), L32(G + 0x14));
+        const float dx = ldfp(L + 0x2c), dy = ldfp(L + 0x30), dz = ldfp(L + 0x34);
+        float len = dx * dx + dy * dy + dz * dz;
+        if (len == 0.0f) {
+            len = 0.0f;
+        } else {
+            len = sqrtf(len);
+            const float inv = 1.0f / len;
+            const float ux = ldfp(L + 0x2c) * inv, uy = ldfp(L + 0x30) * inv;
+            stfp(L + 0x2c, ux);
+            stfp(L + 0x30, uy);
+            stfp(L + 0x34, inv * dz);
+        }
+        stfp(L + 0x38, len);
+    }
+    const uint64_t ign = L64(L + 0x60);
+    const uint32_t moff = kind == 0 ? 0x30 : 0x28, coff = kind == 0 ? 0x10 : 0x8;
+    const uint32_t mlo = (uint32_t)mask, mhi = (uint32_t)(mask >> 32);
+    const int stats_on = !dry && phys_stats_on > 0;
+    float lo[2], hi[2];
+    {
+        const float e8 = hexf(0x3f4ccccdu);
+        const float h0[2] = {ah[0] + e8, ah[1] + e8};
+        for (int k = 0; k < 2; k++) {
+            const float p = ldfp(G + 4 * k), d = ldfp(G + 0xc + 4 * k);
+            const float v3 = ac[k] + p;
+            const float v1 = ac[k] + (p + d);
+            const float l2 = v3 - h0[k], l4 = v1 - h0[k];
+            lo[k] = l2 > l4 ? l4 : l2;
+            const float u3 = h0[k] + v3, u0 = h0[k] + v1;
+            hi[k] = u0 > u3 ? u0 : u3;
+        }
+    }
+    const float hx = (hi[0] - lo[0]) * 0.5f, hy = (hi[1] - lo[1]) * 0.5f;
+    const float cx = lo[0] + hx, cy = lo[1] + hy;
+    const float s8 = cx - hx, s9 = hx + cx, s10 = hy + cy, s11 = cy - hy;
+    c->sp = F;
+    c->x[29] = F + 0x1a0;
+    for (uint32_t b = 0; b < 12; b++) {
+        const uint64_t bk = T + (uint64_t)b * 32;
+        const uint64_t cnt = L64(bk + 0x168);
+        if (!cnt || !L32(T + 0x2e4))
+            continue;
+        const uint64_t arr = L64(bk + 0x160);
+        const uint64_t end = (uint32_t)(arr + cnt * 8);
+        uint32_t w9 = 1;
+        for (uint64_t pp = (uint32_t)arr; pp != end; pp = (uint32_t)(pp + 8)) {
+            if (!w9)
+                continue;
+            const uint64_t pool = L64(pp);
+            uint64_t O0 = L64(pool + 0x20);
+            uint32_t w = 0, nw;
+            for (;;) {
+                const uint64_t bits = L64(L64(pool) + (uint64_t)w * 8);
+                if (stats_on)
+                    phys_slots += __builtin_popcountll(~bits);
+                /* by 32-bit halves: one word of live slots in a register */
+                for (int hf = 0; hf < 2; hf++) {
+                uint32_t live = ~(uint32_t)(bits >> (hf * 32));
+                const uint32_t ob = (uint32_t)(O0 + hf * 0x800);
+                const uint8_t *mb = gm_ + (uint32_t)(ob + moff);
+                while (live) {
+                    const uint32_t j = __builtin_ctz(live);
+                    live &= live - 1;
+                    const uint8_t *mp = mb + (j << 6);
+                    if (!((rt_ld32(mp) & mlo) | (rt_ld32(mp + 4) & mhi)))
+                        continue;
+                    const uint64_t O = (uint32_t)(ob + (j << 6));
+                    const uint64_t own = L64(O + 0x20);
+                    if (own == ign)
+                        continue;
+                    if (zz) {
+                        uint32_t dz = zz - L32(O + 0x3c);
+                        if ((int32_t)dz < 0)
+                            dz = -dz;
+                        if (dz >= 2 && !(L8(O + 0x3a) & 0x80) && L8(cfg + 0xd))
+                            continue;
+                    }
+                    {
+                        const float t = ldfp(O + 0x10) + ldfp(O + 0x8), hw = ldfp(O);
+                        const float l = t - hw, h = hw + t;
+                        if (s8 > h || l > s9)
+                            continue;
+                    }
+                    {
+                        const float hh = ldfp(O + 0x4), t = ldfp(O + 0x14) + ldfp(O + 0xc);
+                        const float l = t - hh, h = hh + t;
+                        if (s11 > h || l > s10)
+                            continue;
+                    }
+                    for (uint64_t nd = L64(own + 0x128); nd; nd = L64(nd + 0x18)) {
+                        const uint64_t cp = L64(nd + 8);
+                        for (uint32_t k = 0; k < (n > 1 ? n : 1); k++) {
+                            const uint64_t e = S + (uint64_t)k * 40;
+                            if (!(L64(cp + coff) & L64(e)))
+                                continue;
+                            if (!(L32(cp + 0x84) & L32(e + 8) & 0x1e00))
+                                continue;
+                            const uint64_t ow = L64(O + 0x20);
+                            rt_st64(GP(F + 0xe8), L64(ow + 0x140));
+                            rt_st32(GP(F + 0xf0), L32(ow + 0x148));
+                            const uint64_t sh = L64(e + 0x10);
+                            const uint32_t ty = L32(sh);
+                            const uint64_t sd = L64(sh + 8);
+                            const uint32_t ct = L32(cp + 0x18);
+                            const uint64_t cd = L64(cp + 0x20);
+                            if (dry) {
+                                phys_rec(1, (uint32_t)sd, ct, (uint32_t)cd, (uint32_t)G);
+                                continue;
+                            }
+                            phys_cand++;
+                            c->x[0] = F + 0xc0;
+                            c->x[1] = F + 0x100;
+                            c->x[2] = ty;
+                            c->x[3] = sd;
+                            c->x[4] = G;
+                            c->x[5] = ct;
+                            c->x[6] = cd;
+                            c->x[7] = F + 0xe8;
+                            f_1ad96c_orig(c);
+                            if (!(uint32_t)c->x[0])
+                                continue;
+                            rt_st64(GP(L + 0x8), T);
+                            rt_st64(GP(L + 0x18), S);
+                            {
+                                uint8_t seg[24];
+                                memcpy(seg, GP(G), 24);
+                                memcpy(GP(L + 0x3c), seg, 24);
+                            }
+                            c->x[0] = L;
+                            c->x[1] = L64(O + 0x20);
+                            c->x[2] = L64(nd + 8);
+                            memset(&c->v[0], 0, 16);
+                            c->v[0].f[0] = ldfp(F + 0xc0);
+                            c->x[3] = F + 0x100;
+                            c->x[4] = k;
+                            rt_call(c, L64(L64(L)));
+                        }
+                    }
+                }
+                }
+                O0 = (uint32_t)(O0 + 0x1000);
+                w++;
+                nw = L32(T + 0x2e4);
+                if (w == nw)
+                    break;
+            }
+            w9 = nw;
+        }
+    }
+    if (kind == 1) {
+        if (!dry) {
+            rt_st64(GP(L + 0x8), T);
+            rt_st64(GP(L + 0x18), S);
+            uint8_t seg[24];
+            memcpy(seg, GP(G), 24);
+            memcpy(GP(L + 0x3c), seg, 24);
+        }
+        rt_st64(GP(F + 0xc0), GUEST_IMAGE_BASE + 0xde6970);
+        rt_st64(GP(F + 0xc8), L);
+        float s0 = 1.0f;
+        if (!L8(cfg))
+            s0 = ldfp(L + 0x28d4);
+        stfp(F + 0xd0, s0);
+        rt_st64(GP(F + 0xb0), F + 0xc0);
+        rt_st64(GP(F + 0xb8), F + 0xd0);
+        for (uint32_t i = 0; i < (n > 1 ? n : 1); i++) {
+            const uint64_t e = S + (uint64_t)i * 40;
+            rt_st32(GP(F + 0xdc), i);
+            rt_st64(GP(F + 0xe0), L64(e));
+            if (!L64(L64(L64(T + 0x10) + 0x50) + 0xb0))
+                continue;
+            for (uint64_t nd = L64(L64(L64(T + 0x10) + 0x50) + 0xb0); nd; nd = L64(nd + 0x18)) {
+                uint64_t r = L64(nd + 8), q;
+                while ((q = L64(r + 0x450)) != 0)
+                    r = q;
+                for (uint64_t n2 = L64(r + 0x438); n2; n2 = L64(n2 + 0x18)) {
+                    const uint64_t cp = L64(n2 + 8);
+                    if (L32(cp + 0x370) != 5)
+                        continue;
+                    rt_st32(GP(F + 0xd4), L32(e + 8));
+                    const uint64_t X = L64(cp + 0x398);
+                    const uint64_t sh = L64(e + 0x10);
+                    const uint32_t ty = L32(sh);
+                    const uint64_t sd = L64(sh + 8);
+                    {
+                        const float pz = ldfp(G + 8);
+                        stfp(F + 0xa8, pz);
+                        const float ez = pz + ldfp(G + 0x14);
+                        rt_st64(GP(F + 0xa0), L64(G));
+                        const float ex = ldfp(G) + ldfp(G + 0xc), ey = ldfp(G + 4) + ldfp(G + 0x10);
+                        stfp(F + 0x90, ex);
+                        stfp(F + 0x94, ey);
+                        stfp(F + 0x98, ez);
+                    }
+                    rt_st64(GP(F + 0x100), X);
+                    uint64_t x8 = L64(X), x9 = L64(x8 + 0x10);
+                    if (!(L64(x9 + 0x38) >> 34))
+                        continue;
+                    for (uint64_t l = 0; l < (L64(x9 + 0x38) >> 34); l = (uint32_t)(l + 1)) {
+                        const uint64_t lay = L64(x9 + 0x40);
+                        const uint64_t a = L64(lay + l * 168 + 0x60);
+                        if (a) {
+                            const uint64_t x12 = a & ~L64(x8 + 0xb0);
+                            const uint32_t pass = (x12 & ~1ull) == 0 ? !(a & 1) : (uint32_t)a;
+                            if (!(pass & 1))
+                                continue;
+                        }
+                        if (!L8(L64(X + 8) + l))
+                            continue;
+                        const uint32_t lz = L32(lay + l * 168 + 0x88);
+                        if (!lz)
+                            continue;
+                        if (zz) {
+                            uint32_t dz = lz - zz;
+                            if ((int32_t)dz < 0)
+                                dz = -dz;
+                            if (dz > 1)
+                                continue;
+                        }
+                        rt_st32(GP(F + 0x118), lz);
+                        rt_st32(GP(F + 0x11c), (uint32_t)l);
+                        if (dry) {
+                            phys_rec(1, (uint32_t)X | 0x80000000u, (uint32_t)sd, lz, (uint32_t)l);
+                            continue;
+                        }
+                        c->x[0] = X;
+                        c->x[1] = F + 0x100;
+                        c->x[2] = F + 0xb0;
+                        c->x[3] = ty;
+                        c->x[4] = sd;
+                        c->x[5] = F + 0xa0;
+                        c->x[6] = F + 0x90;
+                        f_7bd5bc_orig(c);
+                        x8 = L64(X);
+                        x9 = L64(x8 + 0x10);
+                    }
+                }
+            }
+        }
+    }
+    c->sp = saved_sp;
+    c->x[29] = saved_fp;
+done:
+    c->x[0] = L64(L + 0x1480) != 0;
+}
+
+static void phys_verify(Ctx *c, void (*nat)(Ctx *, int), void (*orig)(Ctx *), const char *name, int kreg)
+{
+    static uint32_t calls[2], bad[2];
+    const int w = kreg == 6;
+    Ctx save = *c;
+    phys_rec_n[1] = 0;
+    nat(c, 1);
+    *c = save;
+    phys_rec_n[0] = 0;
+    orig(c);
+    calls[w]++;
+    const int n0 = phys_rec_n[0], n1 = phys_rec_n[1];
+    if ((n0 != n1 || memcmp(phys_rec_buf[0], phys_rec_buf[1], sizeof(PhysRec) * (n0 < 512 ? n0 : 512))) && bad[w]++ < 20) {
+        rt_log("[verify] %s differs (%u of %u): game %d calls, mine %d (kind %u n %u)\n", name, bad[w], calls[w], n0, n1,
+               (unsigned)save.x[kreg], (unsigned)save.x[1]);
+        for (int i = 0; i < 6 && (i < n0 || i < n1); i++) {
+            const PhysRec *a = &phys_rec_buf[0][i], *b = &phys_rec_buf[1][i];
+            rt_log("  %d: %08x %08x %08x %08x | %08x %08x %08x %08x\n", i, i < n0 ? a->a : 0, i < n0 ? a->b : 0,
+                   i < n0 ? a->c : 0, i < n0 ? a->d : 0, i < n1 ? b->a : 0, i < n1 ? b->b : 0, i < n1 ? b->c : 0,
+                   i < n1 ? b->d : 0);
+        }
+    }
+    if ((calls[w] & 0x7fff) == 0)
+        rt_log("[verify] %s: %u calls checked, %u differ\n", name, calls[w], bad[w]);
+}
+
+void nat__ZN14PhysicsManager5SweepEjP17PhysicsQueryShapeiRK9ycLineSegP20PhysicsQueryListenerj(Ctx *c)
+{
+    if (phys_rec_on < 0)
+        phys_rec_on = getenv("MINA_VERIFY_PHYS") != NULL;
+    if (phys_rec_on > 0)
+        phys_verify(c, phys_sweep, f_974fe0_orig, "Sweep", 6);
+    else
+        phys_sweep(c, 0);
+}
+
+/* ---- ycBezier::GetLengthAppox ------------------------------------------------------------------
+ * The length of a cubic Bezier (p0..p3 at +0, +0xc, +0x18, +0x24) from 0 to t:
+ * 5-point Gauss-Legendre over |B'(u)|, B'(u) = c + u (b + u a) per axis.
+ * The game's operations and groupings (its NEON pairs as scalars); the
+ * recompiled vector code is slow on the Vita. MINA_VERIFY_XFORM: checked. */
+void f_d1db4_orig(Ctx *c);
+static float bez_len(const float *B, float t)
+{
+    const float p0x = B[0], p0y = B[1], p0z = B[2], p1x = B[3], p1y = B[4], p1z = B[5];
+    const float p2x = B[6], p2y = B[7], p2z = B[8], p3x = B[9], p3y = B[10], p3z = B[11];
+    const float h = t * 0.5f;
+    /* y */
+    float s6 = (p3y - p2y) * 3.0f;
+    const float s4 = (p3y - p0y) * 6.0f;
+    const float s3 = s6 * 3.0f;
+    s6 = s6 + s6;
+    const float cy = (p1y - p0y) * 3.0f;
+    const float ay = (3.0f * cy - s4) + s3;
+    const float by = (s4 + -4.0f * cy) - s6;
+    /* x, z */
+    const float cx = (p1x - p0x) * 3.0f, cz = (p1z - p0z) * 3.0f;
+    const float ex = (p3x - p2x) * 3.0f, ez = (p3z - p2z) * 3.0f;
+    const float fx = (p3x - p0x) * 6.0f, fz = (p3z - p0z) * 6.0f;
+    const float ax = (cx * 3.0f - fx) + ex * 3.0f, az = (cz * 3.0f - fz) + ez * 3.0f;
+    const float bx = (fx + cx * -4.0f) - (ex + ex), bz = (fz + cz * -4.0f) - (ez + ez);
+#define BEZ_D(a, b, cc, u) (((b) + (a) * (u)) * (u) + (cc))
+    float sum;
+    {
+        const float y = BEZ_D(ay, by, cy, h), x = BEZ_D(ax, bx, cx, h), z = BEZ_D(az, bz, cz, h);
+        sum = sqrtf(z * z + (x * x + y * y)) * hexf(0x3f11a2b4u) + 0.0f;
+    }
+    static const uint32_t nodes[2][2] = { { 0x3eec4dc0u, 0x3fc4ec90u }, { 0x3dc024c8u, 0x3ff3fdb4u } };
+    static const uint32_t weights[2] = { 0x3ef50ed1u, 0x3e729cf6u };
+    for (int k = 0; k < 2; k++) {
+        float r[2];
+        for (int i = 0; i < 2; i++) {
+            const float u = hexf(nodes[k][i]) * h;
+            const float y = BEZ_D(ay, by, cy, u), x = BEZ_D(ax, bx, cx, u), z = BEZ_D(az, bz, cz, u);
+            r[i] = sqrtf(z * z + (x * x + y * y)) * hexf(weights[k]);
+        }
+        sum = sum + r[0];
+        sum = sum + r[1];
+    }
+#undef BEZ_D
+    return sum * h;
+}
+void nat__ZNK8ycBezier14GetLengthAppoxEf(Ctx *c)
+{
+    GM_BEGIN;
+    float B[12];
+    memcpy(B, GP(c->x[0]), 48);
+    const float t = c->v[0].f[0];
+    const float r = bez_len(B, t);
+    if (verify_xform()) {
+        static uint32_t checked, bad;
+        Ctx save = *c;
+        f_d1db4_orig(c);
+        const float g = c->v[0].f[0];
+        checked++;
+        if (memcmp(&g, &r, 4) && bad++ < 10)
+            rt_log("[verify] Bezier::GetLengthAppox differs (%u of %u): %a / %a (t %a)\n", bad, checked, r, g, t);
+        if ((checked & 0xffff) == 0)
+            rt_log("[verify] Bezier::GetLengthAppox: %u calls checked, %u differ\n", checked, bad);
+        *c = save;
+    }
+    memset(&c->v[0], 0, 16);
+    c->v[0].f[0] = r;
+}
+
+/* ---- CombatManager::ProcessAttackList ----------------------------------------------------------
+ * Attack shapes (pool slots of 0x28: +0 half x/y, +8 center x/y, +0x10 the
+ * CombatShape, +0x18 owner, +0x20 flags: 1 attack, 2 defense) against the
+ * defense shapes of bucket idx (this+0x80+32 idx: pool list, count); pools of
+ * 64 slots with a free bitmap, this+0xe4 words. Every overlapping pair: each
+ * attack shape i of the attacker against each defense shape j of the defender
+ * (AttackShape::CheckAttackOverlap), a hit assigning the damage. The game's
+ * order, reads and calls; its stack frame (0x1b0) for the shape containers
+ * passed by value and the stack arguments. The scans were the cost: the
+ * recompiled code reloads its spills for every slot.
+ * MINA_VERIFY_COMBAT=1: the game's code runs, and the CheckAttackOverlap calls
+ * this one would make (before the first hit) are compared with the game's. */
+void f_986898_orig(Ctx *c);     /* CombatManager::ProcessAttackList */
+void f_987548(Ctx *c);          /* CombatShape::GetShape */
+void f_98944c(Ctx *c);          /* CombatShape::GetModifiedShape */
+void f_5721dc_orig(Ctx *c);     /* AttackShape::CheckAttackOverlap */
+void f_98375c(Ctx *c);          /* CombatCore::AssignDamage */
+static int combat_rec_on = -1, combat_rec_hit;
+void nat__ZN11AttackShape18CheckAttackOverlapE16ycShapeContainerjjS0_jP12DefenseShapejb(Ctx *c)
+{
+    if (combat_rec_on > 0 && !combat_rec_hit) {
+        GM_BEGIN;
+        phys_rec(0, (uint32_t)c->x[0], (uint32_t)c->x[4], (uint32_t)L64(c->sp), L32(c->sp + 8));
+    }
+    f_5721dc_orig(c);
+    if (combat_rec_on > 0 && (uint32_t)c->x[0])
+        combat_rec_hit = 1;
+}
+
+static uint64_t combat_root(uint8_t *gm_, uint64_t r, uint32_t off, uint32_t bit)
+{
+    for (;;) {
+        const uint64_t x9 = r;
+        if (!(L8(r + off) & bit))
+            return x9;
+        r = L64(x9 + 0x40);
+        if (!r)
+            return x9;
+    }
+}
+static inline uint32_t combat_count(uint8_t *gm_, uint64_t s)
+{
+    return L32(s + (L8(s + 0xbe) ? 0x54 : 0x50));
+}
+
+static void combat_tail(Ctx *c, uint8_t *gm_, uint64_t F, uint64_t A, uint64_t D, int dry)
+{
+    const uint64_t fp = F + 0x1a0;      /* x29 */
+    const uint64_t x20 = L64(A + 0x10);
+    if (!combat_count(gm_, x20))
+        return;
+    const uint64_t x22 = L64(D + 0x10);
+    for (uint64_t i = 0; i < combat_count(gm_, x20); i++) {
+        c->x[0] = x20;
+        c->x[1] = i;
+        f_987548(c);
+        uint32_t w0 = (uint32_t)c->x[0];
+        uint64_t x3;
+        if (w0 <= 8 && ((1u << (w0 & 31)) & 0x112)) {
+            rt_st32(GP(fp - 0xa0), w0);
+            x3 = fp - 0x90;
+            rt_st64(GP(fp - 0x98), x3);
+        } else {
+            x3 = L64(fp - 0x98);
+        }
+        c->x[0] = x20;
+        c->x[1] = i;
+        c->x[2] = L64(fp - 0xa0);
+        c->x[3] = x3;
+        f_98944c(c);
+        const uint64_t sc0 = c->x[0], x25 = c->x[1];
+        rt_st64(GP(F + 0xd0), sc0);
+        if (!x25)
+            continue;
+        uint64_t p8 = x20 + 0x198;
+        if (L64(x20 + 0x180) > i)
+            p8 = L64(x20 + 0x178) + (i << 5) + 0x10;
+        const uint32_t w9 = L32(p8);
+        const uint32_t fl = (uint32_t)((L64(x20 + 0x1f8) >> 34) & 0x10) | w9;
+        rt_st32(GP(F + 0xb4), w9);
+        rt_st32(GP(F + 0xcc), fl);
+        const uint64_t a38 = L64(x20 + 0x38);
+        const uint32_t teamA = L32(combat_root(gm_, a38, 0x210, 1) + 0x20c);
+        const uint64_t d38 = L64(x22 + 0x38);
+        if (!(L32(combat_root(gm_, d38, 0x210, 2) + 0x208) & teamA))
+            continue;
+        if (!L8(combat_root(gm_, d38, 0x210, 8) + 0x257))
+            continue;
+        if (a38 && d38) {
+            if (a38 == d38)
+                continue;
+            if (L64(a38 + 0x40) == d38 || L64(d38 + 0x40) == a38) {
+                if (!(L8(d38 + 0x1d2) & 1) && !(L8(a38 + 0x1d2) & 1))
+                    continue;
+            }
+        }
+        if (!combat_count(gm_, x22))
+            continue;
+        for (uint64_t j = 0; j < combat_count(gm_, x22); j++) {
+            c->x[0] = x20;              /* (the attacker's shape j: the game's code) */
+            c->x[1] = j;
+            f_987548(c);
+            w0 = (uint32_t)c->x[0];
+            uint64_t y3;
+            if (w0 <= 8 && ((1u << (w0 & 31)) & 0x112)) {
+                rt_st32(GP(fp - 0xc8), w0);
+                y3 = fp - 0xb8;
+                rt_st64(GP(fp - 0xc0), y3);
+            } else {
+                y3 = L64(fp - 0xc0);
+            }
+            c->x[0] = x22;
+            c->x[1] = j;
+            c->x[2] = L64(fp - 0xc8);
+            c->x[3] = y3;
+            f_98944c(c);
+            const uint64_t x5 = c->x[0], x6 = c->x[1];
+            uint64_t q8 = x22 + 0x198;
+            if (L64(x22 + 0x180) > j)
+                q8 = L64(x22 + 0x178) + (j << 5) + 0x10;
+            const uint32_t w7 = L32(q8);
+            rt_st32(GP(F + 8), (uint32_t)j);
+            rt_st64(GP(F), x22);
+            if (dry) {
+                phys_rec(1, (uint32_t)x20, (uint32_t)i, (uint32_t)x22, (uint32_t)j);
+                continue;
+            }
+            c->x[0] = x20;
+            c->x[1] = L64(F + 0xd0);
+            c->x[2] = x25;
+            c->x[3] = L32(F + 0xcc);
+            c->x[4] = i;
+            c->x[5] = x5;
+            c->x[6] = x6;
+            c->x[7] = w7;
+            f_5721dc_orig(c);
+            if (!(uint32_t)c->x[0])
+                continue;
+            /* a hit */
+            const uint32_t saved = L32(x20 + 0x1ec);
+            if (L32(F + 0xb4) & (1u << 11))
+                rt_st32(GP(x20 + 0x1ec), 1);
+            const uint64_t o = L64(x22 + 0x38);
+            rt_st64(GP(x20 + 0x1c8), o);
+            rt_st64(GP(x20 + 0x238), x22);
+            rt_st32(GP(x20 + 0x240), (uint32_t)j);
+            rt_st32(GP(x20 + 0x244), (uint32_t)i);
+            const uint64_t dd = x20 + 0x1c0;
+            if (!(L8(x20 + 0x1f8) & 8)) {
+                c->x[0] = o;
+                c->x[1] = dd;
+                c->x[2] = j;
+                f_98375c(c);
+            } else {
+                rt_st32(GP(o + 0x204), (uint32_t)j);
+                const uint64_t r = combat_root(gm_, o, 0x211, 2);
+                const uint32_t n = L32(r + 0x1c8);
+                int skip = 0;
+                if (n) {
+                    const uint32_t id = L32(x20 + 0x214);
+                    if (L32(r + 0x10c) == id) {
+                        skip = 1;
+                    } else {
+                        uint64_t k = 0, p = r + 0x114;
+                        for (;;) {
+                            if ((uint64_t)n - 1 == k)
+                                break;
+                            const uint32_t v = L32(p);
+                            p += 8;
+                            k++;
+                            if (v == id) {
+                                skip = k < n;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!skip) {
+                    c->x[0] = o;
+                    c->x[1] = dd;
+                    rt_call(c, L64(L64(o) + 0x68));
+                    const uint64_t res = c->x[0];
+                    const uint64_t x24 = res ? L64(x20 + 0x38) : 0;
+                    if (res && x24) {
+                        rt_st64(GP(x20 + 0x250), res);
+                        const int32_t k = (int32_t)L32(x20 + 0x248);
+                        if (k >= 0) {
+                            const uint64_t obj = L64(GUEST_IMAGE_BASE + 0x5051d28u + (uint64_t)(int64_t)k * 8 + 8);
+                            c->x[0] = obj;
+                            c->x[1] = dd;
+                            rt_call(c, L64(L64(obj) + 0x1a8));
+                        }
+                        const uint64_t x0b = L64(x24 + 0x38);
+                        if (x0b) {
+                            c->x[0] = x0b;
+                            c->x[1] = dd;
+                            rt_call(c, L64(L64(x0b) + 0x50));
+                        }
+                        const uint64_t f250 = L64(x20 + 0x250);
+                        if (!(f250 & 4)) {
+                            rt_st64(GP(x24 + 0x1d8), f250);
+                            rt_st32(GP(x24 + 0x200), (uint32_t)j);
+                        }
+                    }
+                }
+            }
+            rt_st64(GP(x20 + 0x1c8), 0);
+            rt_st64(GP(x20 + 0x238), 0);
+            rt_st64(GP(x20 + 0x240), 0);
+            rt_st32(GP(x20 + 0x1ec), saved);
+        }
+    }
+}
+
+static void process_attack_list(Ctx *c, int dry)
+{
+    GM_BEGIN;
+    const uint64_t T = c->x[0];
+    const uint32_t idx = (uint32_t)c->x[1];
+    const uint64_t cnt = L64(T + 0x88);
+    if (!cnt || !L32(T + 0xe4))
+        return;
+    const uint64_t saved_sp = c->sp, saved_fp = c->x[29];
+    const uint64_t F = saved_sp - 0x1b0;
+    c->sp = F;
+    c->x[29] = F + 0x1a0;
+    const uint64_t arr = L64(T + 0x80);
+    const uint64_t end = (uint32_t)(arr + cnt * 8);
+    const uint64_t B = T + (uint64_t)idx * 32 + 0x80;
+    uint32_t w9 = 1;
+    for (uint64_t cur = (uint32_t)arr; cur != end; cur = (uint32_t)(cur + 8)) {
+        if (!w9)
+            continue;
+        const uint64_t pool = L64(cur);
+        uint64_t abase = L64(pool + 0x20);
+        uint32_t w = 0, nw;
+        for (;;) {
+            const uint64_t bits = L64(L64(pool) + (uint64_t)w * 8);
+            if (bits != ~0ull) {
+                for (int hf = 0; hf < 2; hf++) {
+                    uint32_t live = ~(uint32_t)(bits >> (hf * 32));
+                    const uint32_t ab = (uint32_t)(abase + hf * 32 * 0x28);
+                    while (live) {
+                        const uint32_t j = __builtin_ctz(live);
+                        live &= live - 1;
+                        const uint64_t A = ab + j * 0x28;
+                        if (!L64(A + 0x18) || !(L8(A + 0x20) & 1))
+                            continue;
+                        const uint64_t bcnt = L64(B + 8);
+                        if (!bcnt || !L32(T + 0xe4))
+                            continue;
+                        const float e8 = hexf(0x3f4ccccdu);
+                        const float hx = ldfp(A) + e8, hy = ldfp(A + 4) + e8;
+                        const float cx = ldfp(A + 8), cy = ldfp(A + 0xc);
+                        const float s8 = cx - hx, s9 = hx + cx, s10 = hy + cy, s11 = cy - hy;
+                        const uint64_t barr = L64(B);
+                        const uint64_t bend = (uint32_t)(barr + bcnt * 8);
+                        uint32_t v9 = L32(T + 0xe4);
+                        for (uint64_t pp = (uint32_t)barr; pp != bend; pp = (uint32_t)(pp + 8)) {
+                            if (!v9)
+                                continue;
+                            const uint64_t dpool = L64(pp);
+                            uint64_t dbase0 = L64(dpool + 0x20);
+                            uint32_t w2 = 0, nw2;
+                            for (;;) {
+                                const uint64_t db = L64(L64(dpool) + (uint64_t)w2 * 8);
+                                if (db != ~0ull) {
+                                    for (int h2 = 0; h2 < 2; h2++) {
+                                        uint32_t lv = ~(uint32_t)(db >> (h2 * 32));
+                                        const uint32_t dbase = (uint32_t)(dbase0 + h2 * 32 * 0x28);
+                                        while (lv) {
+                                            const uint32_t k = __builtin_ctz(lv);
+                                            lv &= lv - 1;
+                                            const uint64_t D = dbase + k * 0x28;
+                                            const uint8_t *dp = gm_ + (uint32_t)D;
+                                            if (!(dp[0x20] & 2) || !(rt_ld32(dp + 0x18) | rt_ld32(dp + 0x1c)))
+                                                continue;
+                                            {
+                                                const float t = ldfp(D + 8), h = ldfp(D);
+                                                const float lo = t - h, hi = t + h;
+                                                if (s8 > hi || lo > s9)
+                                                    continue;
+                                            }
+                                            {
+                                                const float h = ldfp(D + 4), t = ldfp(D + 0xc);
+                                                const float lo = t - h, hi = h + t;
+                                                if (s11 > hi || lo > s10)
+                                                    continue;
+                                            }
+                                            combat_tail(c, gm_, F, A, D, dry);
+                                        }
+                                    }
+                                }
+                                dbase0 = (uint32_t)(dbase0 + 0xa00);
+                                w2++;
+                                nw2 = L32(T + 0xe4);
+                                if (w2 == nw2)
+                                    break;
+                            }
+                            v9 = nw2;
+                        }
+                    }
+                }
+            }
+            abase = (uint32_t)(abase + 0xa00);
+            w++;
+            nw = L32(T + 0xe4);
+            if (w == nw)
+                break;
+        }
+        w9 = nw;
+    }
+    c->sp = saved_sp;
+    c->x[29] = saved_fp;
+}
+
+void nat__ZN13CombatManager17ProcessAttackListEi(Ctx *c)
+{
+    if (combat_rec_on < 0)
+        combat_rec_on = getenv("MINA_VERIFY_COMBAT") != NULL;
+    if (combat_rec_on > 0) {
+        static uint32_t calls, bad;
+        Ctx save = *c;
+        phys_rec_n[1] = 0;
+        process_attack_list(c, 1);
+        *c = save;
+        phys_rec_n[0] = 0;
+        combat_rec_hit = 0;
+        f_986898_orig(c);
+        calls++;
+        const int n0 = phys_rec_n[0], n1 = phys_rec_n[1];
+        /* up to the game's first hit (a hit changes what follows) */
+        const int cmp = combat_rec_hit ? n0 : (n0 > n1 ? n0 : n1);
+        const int same = (combat_rec_hit ? n1 >= n0 : n0 == n1) &&
+                         !memcmp(phys_rec_buf[0], phys_rec_buf[1], sizeof(PhysRec) * (cmp < 512 ? cmp : 512));
+        if (!same && bad++ < 20)
+            rt_log("[verify] ProcessAttackList differs (%u of %u): game %d checks, mine %d%s\n", bad, calls, n0, n1,
+                   combat_rec_hit ? " (game hit)" : "");
+        if ((calls & 0x3ff) == 0)
+            rt_log("[verify] ProcessAttackList: %u calls checked, %u differ\n", calls, bad);
+        return;
+    }
+    process_attack_list(c, 0);
+}
+
+/* ---- ycSpline::GetPos --------------------------------------------------------------------------
+ * The point at t (0..1 of the spline's length): the segment from the length
+ * table (data+0x28 pairs (length, start), data+0x38 index by length/0x40,
+ * data+0x44 the total), then the parameter in it: linear (this+0x78 == 1, or
+ * control points on the line at 1/3 and 2/3 within 1e-4) or a bisection on
+ * ycBezier::GetLengthAppox to 1e-4; the cubic (segments of 3 points, 0x24
+ * bytes, at data+8). The game's operations; the bisection's lengths from
+ * bez_len directly (it was ~600 calls through the context a fixed update).
+ * MINA_VERIFY_XFORM: checked against the game's code. */
+void f_1bdc18_orig(Ctx *c);
+static inline uint32_t fcvtzu32(float x)
+{
+    if (!(x >= 0.0f))
+        return 0;
+    if (x >= 4294967296.0f)
+        return 0xffffffffu;
+    return (uint32_t)x;
+}
+static inline float fabs_g(float v) { return v > 0.0f ? v : -v; }   /* fneg + fcsel gt */
+static void spline_pos(uint8_t *gm_, uint64_t S, float t, float out[4])
+{
+    uint64_t data = S + 0x10;
+    const uint64_t p68 = L64(S + 0x68);
+    if (p68) {
+        const uint64_t d = L64(p68 + 8);
+        if (d)
+            data = d;
+    }
+    const uint32_t mode = L8(S + 0x78);
+    float u = 1.0f;
+    int32_t seg;
+    const float eps = hexf(0x38d1b717u), third = hexf(0x3eaaaaabu), two3 = hexf(0x3f2aaaabu);
+    float p0x = 0, p0y = 0, p0z = 0, p3x = 0, p3y = 0, p3z = 0;
+    uint64_t B = 0;
+    int have_pts = 0;
+    if (t >= 1.0f) {
+        const uint64_t n = L64(data) >> 34;
+        seg = n ? (int32_t)((uint32_t)(n - 1) / 3u) - 1 : -1;
+        goto eval;
+    }
+    {
+        const uint64_t tab = L64(data + 0x28);
+        uint32_t w9 = (uint32_t)(L64(data + 0x30) >> 34) - 1;
+        const float unit = ldfp(data + 0x40), total = ldfp(data + 0x44);
+        const float target = total * t;
+        const uint32_t w10 = fcvtzu32(target / unit);
+        const int lo_ = w9 < w10;
+        w9 = lo_ ? w9 : w10;
+        const float s2 = lo_ ? total : target;
+        w9 = L32(L64(data + 0x38) + (uint64_t)w9 * 4);
+        float s1, s0;
+        for (;;) {
+            const uint64_t e = tab + (uint64_t)w9 * 8;
+            s1 = ldfp(e);
+            s0 = s2 - ldfp(e + 4);
+            w9++;
+            if (!(s0 > s1))
+                break;
+        }
+        seg = (int32_t)(w9 - 1);
+        if (mode != 1) {
+            B = L64(data + 8) + (int64_t)seg * 36;
+            p3z = ldfp(B + 0x2c);
+            p3x = ldfp(B + 0x24);
+            p3y = ldfp(B + 0x28);
+            p0x = ldfp(B);
+            p0y = ldfp(B + 4);
+            p0z = ldfp(B + 8);
+            have_pts = 1;
+            const float dx = p3x - p0x, dy = p3y - p0y;
+            int straight = 0;
+            if (fabs_g((p0x + dx * third) - ldfp(B + 0xc)) < eps &&
+                fabs_g((p0y + dy * third) - ldfp(B + 0x10)) < eps) {
+                const float dz = p3z - p0z;
+                if (fabs_g((p0z + dz * third) - ldfp(B + 0x14)) < eps &&
+                    fabs_g((p0x + dx * two3) - ldfp(B + 0x18)) < eps &&
+                    fabs_g((p0y + dy * two3) - ldfp(B + 0x1c)) < eps &&
+                    fabs_g((p0z + dz * two3) - ldfp(B + 0x20)) < eps)
+                    straight = 1;
+            }
+            if (!straight) {
+                const float s13 = s0 + 0.0f;
+                if (!(s13 > 0.0f) && !(s13 != s13)) {     /* b.ls: <= 0 (not NaN) */
+                    u = 0.0f;
+                    goto cubic;
+                }
+                float Bf[12];
+                memcpy(Bf, GP(B), 48);
+                float s8 = bez_len(Bf, 1.0f);
+                if (!(s8 > s13) && !(s8 != s8 || s13 != s13)) {
+                    u = 1.0f;
+                    goto cubic;
+                }
+                float lo = 0.0f, best = 1.0f, bestlen = hexf(0x7f7fffffu), hi = 1.0f;
+                int w8 = 1;
+                for (;;) {
+                    if (w8 && s8 < bestlen) {
+                        const float d = fabs_g(s8 - s13);
+                        best = hi;
+                        bestlen = s8;
+                        if (d < eps) {
+                            u = hi;
+                            goto eval_pts;
+                        }
+                    }
+                    if (lo >= hi + hexf(0xb8d1b717u)) {
+                        u = best;
+                        goto eval_pts;
+                    }
+                    const float mid = lo + (hi - lo) * 0.5f;
+                    const float len = bez_len(Bf, mid);
+                    const int less = len < s13;          /* mi */
+                    w8 = !less;                           /* pl (>= or NaN) */
+                    s8 = less ? s8 : len;
+                    hi = less ? hi : mid;
+                    lo = less ? mid : lo;
+                }
+            }
+        }
+        /* linear */
+        if (s1 == 0.0f)
+            u = 0.0f;
+        else
+            u = s0 / s1;
+    }
+eval:
+eval_pts:
+    B = L64(data + 8) + (int64_t)seg * 36;
+    if (mode == 1) {
+        const float z0 = ldfp(B + 8);
+        const float s2 = u * (ldfp(B + 0x2c) - z0);
+        const float x0 = ldfp(B), y0 = ldfp(B + 4);
+        out[0] = x0 + (ldfp(B + 0x24) - x0) * u;
+        out[1] = y0 + (ldfp(B + 0x28) - y0) * u;
+        out[2] = z0 + s2;
+        return;
+    }
+    p0z = ldfp(B + 8);
+    p3z = ldfp(B + 0x2c);
+    p0x = ldfp(B);
+    p0y = ldfp(B + 4);
+    p3x = ldfp(B + 0x24);
+    p3y = ldfp(B + 0x28);
+    have_pts = 1;
+cubic:
+    (void)have_pts;
+    {
+        const float v = 1.0f - u;
+        const float a = v * (v * v);
+        const float s2a = v * 3.0f;
+        const float b = (v * s2a) * u;
+        const float cc = (s2a * u) * u;
+        const float d = (u * u) * u;
+        float z = a * p0z;
+        z = z + b * ldfp(B + 0x14);
+        z = z + cc * ldfp(B + 0x20);
+        const float z3 = d * p3z;
+        float x = p0x * a, y = p0y * a;
+        x = x + ldfp(B + 0xc) * b;
+        y = y + ldfp(B + 0x10) * b;
+        x = x + ldfp(B + 0x18) * cc;
+        y = y + ldfp(B + 0x1c) * cc;
+        x = x + p3x * d;
+        y = y + p3y * d;
+        out[0] = x;
+        out[1] = y;
+        out[2] = z + z3;
+    }
+}
+void nat__ZNK8ycSpline6GetPosEfb(Ctx *c)
+{
+    GM_BEGIN;
+    float o[4] = { 0, 0, 0, 0 };
+    const float t = c->v[0].f[0];
+    spline_pos(gm_, c->x[0], t, o);
+    if (verify_xform()) {
+        static uint32_t checked, bad;
+        Ctx save = *c;
+        f_1bdc18_orig(c);
+        checked++;
+        if ((memcmp(&c->v[0].f[0], &o[0], 4) || memcmp(&c->v[1].f[0], &o[1], 4) || memcmp(&c->v[2].f[0], &o[2], 4)) &&
+            bad++ < 10)
+            rt_log("[verify] Spline::GetPos differs (%u of %u): %a %a %a / %a %a %a (t %a)\n", bad, checked, o[0], o[1],
+                   o[2], c->v[0].f[0], c->v[1].f[0], c->v[2].f[0], t);
+        if ((checked & 0xfff) == 0)
+            rt_log("[verify] Spline::GetPos: %u calls checked, %u differ\n", checked, bad);
+        *c = save;
+    }
+    memset(&c->v[0], 0, 48);
+    c->v[0].f[0] = o[0];
+    c->v[0].f[1] = o[1];
+    c->v[1].f[0] = o[1];
+    c->v[2].f[0] = o[2];
+}
+
+/* ---- TileLevelCollision::TileLayerOverlap ------------------------------------------------------
+ * The tiles of layer ci+0x1c under a shape's box: the box (by shape type, as
+ * in PhysicsManager::Overlap; types without a case keep the registers' values)
+ * in the layer's tiles (layer offset L->0x40[l]+0x130, scroll layers[l]+0x68,
+ * the world scale at 0x100e14e28, y down), clamped to the layer (+0x80 w,
+ * +0x84 h); each non-empty tile (direct, +0x128 of the transform, or by
+ * chunk when the layer has them) fills ci (+8 center, +0x20 kind, +0x22/+0x23
+ * flips, +0x24 solid) and goes to the callback (cp->0 vtable +0x20, with
+ * whether the tile is inside the range's border), which can stop the scan.
+ * The game's operations. Verified through Overlap's MINA_VERIFY_PHYS (calls
+ * of the callback) and MINA_VERIFY_XFORM (ci compared). */
+static inline int32_t fcvtms32(float x)
+{
+    if (x != x)
+        return 0;
+    const float f = floorf(x);
+    if (f >= 2147483648.0f)
+        return 0x7fffffff;
+    if (f < -2147483648.0f)
+        return (int32_t)0x80000000;
+    return (int32_t)f;
+}
+static inline uint32_t udiv0(uint32_t a, uint32_t b) { return b ? a / b : 0; }   /* arm64 udiv: 0 for /0 */
+static void tile_layer_overlap(Ctx *c, int dry)
+{
+    GM_BEGIN;
+    const uint64_t X = c->x[0], CI = c->x[1], CP = c->x[2], SH = c->x[4], POS = c->x[5];
+    const uint32_t ty = (uint32_t)c->x[3];
+    const uint64_t KA = GUEST_IMAGE_BASE + 0xe14e28u;
+    float K = ldfp(KA);
+    uint64_t M = L64(L64(X) + 0x10);
+    const float tw = (float)L32(M + 8), th = (float)L32(M + 0xc);
+    float v2[2] = { (tw * 0.5f) * K, (th * 0.5f) * K };
+    stfp(CI + 0x10, v2[0]);
+    stfp(CI + 0x14, v2[1]);
+    float v3[2] = { c->v[3].f[0], c->v[3].f[1] };
+    const uint32_t t1 = ty - 1;
+    if (t1 <= 8) {
+        if (t1 == 0 || t1 == 8) {
+            for (int k = 0; k < 2; k++) {
+                float a = ldfp(SH + 4 * k), mn, x2, q;
+                if (t1 == 0) {
+                    q = a + ldfp(SH + 0xc + 4 * k);
+                    mn = gt_sel(q, a, a, q);
+                    x2 = a + 0.0f;
+                } else {
+                    const float b = a;                       /* d3 = [shp] */
+                    const float d2 = ldfp(SH + 0x18 + 4 * k);
+                    const float lo = gt_sel(d2, b, b, d2);   /* v4 = d2 > b ? b : d2 */
+                    x2 = gt_sel(b, d2, b, d2);               /* v2 = b > d2 ? b : d2 */
+                    q = ldfp(SH + 0xc + 4 * k);
+                    mn = gt_sel(lo, q, q, lo);
+                }
+                const float hi = gt_sel(q, x2, q, x2);
+                v3[k] = (hi - mn) * 0.5f;
+                v2[k] = mn + v3[k];
+            }
+        } else if (t1 == 3) {
+            v2[0] = ldfp(SH); v2[1] = ldfp(SH + 4);
+            v3[0] = ldfp(SH + 0xc); v3[1] = ldfp(SH + 0x10);
+        } else if (t1 == 7) {
+            v2[0] = ldfp(SH); v2[1] = ldfp(SH + 4);
+            v3[0] = v3[1] = ldfp(SH + 0xc);
+        }
+    }
+    const uint32_t l = L32(CI + 0x1c);
+    const uint64_t L0 = L64(X);
+    const float px = ldfp(POS), py = ldfp(POS + 4);
+    const float lox = (v2[0] - v3[0]) + px, loy = (v2[1] - v3[1]) + py;
+    const uint64_t T = L64(L0 + 0x40) + (uint64_t)l * 0x1d8;
+    const uint64_t LY = L64(L64(L0 + 0x10) + 0x40) + (uint64_t)l * 0xa8;
+    const float ox = ldfp(T + 0x130), oy = ldfp(T + 0x134), sx = ldfp(LY + 0x68), sy = ldfp(LY + 0x6c);
+    const float nK = -K;
+    const float a4 = (lox - ox) / K - sx, a6 = (loy - oy) / nK - sy;
+    const float hix = (v2[0] + v3[0]) + px, hiy = (v2[1] + v3[1]) + py;
+    const float a1 = (hix - ox) / K - sx, a2 = (hiy - oy) / nK - sy;
+    const int32_t w9 = fcvtms32(a4 / tw), w10 = fcvtms32(a2 / th), w11 = fcvtms32(a1 / tw), w12 = fcvtms32(a6 / th);
+    const int32_t lw0 = (int32_t)L32(LY + 0x80), lh0 = (int32_t)L32(LY + 0x84);
+    const int32_t x0 = w9 > 0 ? w9 : 0, y0 = w10 > 0 ? w10 : 0;
+    const int32_t xm = lw0 > w11 ? w11 : lw0 - 1, ym = lh0 > w12 ? w12 : lh0 - 1;
+    if (y0 > ym || x0 > xm)
+        return;
+    const uint64_t saved_sp = c->sp;
+    for (uint32_t y = (uint32_t)y0;; y++) {
+        for (uint32_t x = (uint32_t)x0; x != (uint32_t)xm + 1; x++) {
+            const uint64_t L1 = L64(X);
+            const uint32_t li = L32(CI + 0x1c);
+            const uint64_t M1 = L64(L1 + 0x10);
+            const uint64_t LY1 = L64(M1 + 0x40) + (uint64_t)li * 0xa8;
+            const uint32_t lw = L32(LY1 + 0x80), lh = L32(LY1 + 0x84);
+            if (!(lw > x && lh > y))
+                continue;
+            const uint64_t T1 = L64(L1 + 0x40) + (uint64_t)li * 0x1d8;
+            uint64_t tp;
+            if (!(L64(LY1 + 0x50) >> 34)) {
+                tp = L64(T1 + 0x128) + (uint64_t)(uint32_t)(y * lw + x) * 2;
+            } else {
+                const uint32_t cw = L32(M1 + 0x10), ch = L32(M1 + 0x14);
+                const uint32_t ci = udiv0(cw - 1 + lw, cw) * udiv0(y, ch) + udiv0(x, cw);
+                const uint32_t chunk = L32(L64(LY1 + 0x58) + (uint64_t)ci * 4);
+                if (chunk == 0xffffffffu)
+                    continue;
+                const uint32_t off = ((ch - 1) & y) * cw + ((cw - 1) & x);
+                tp = L64(T1 + 0x128) + (uint64_t)(uint32_t)(off + chunk) * 2;
+            }
+            if (!tp)
+                continue;
+            const uint32_t tile = rt_ld16(GP(tp));
+            if (!tile)
+                continue;
+            const float ftw = (float)L32(M1 + 8), fth = (float)L32(M1 + 0xc);
+            float cx = 0.5f * ftw + (float)(int32_t)x * ftw;
+            float cy = (float)(int32_t)y * fth + 0.5f * fth;
+            stfp(CI + 8, cx);
+            stfp(CI + 0xc, cy);
+            const uint64_t LY2 = L64(L64(L64(X) + 0x10) + 0x40) + (uint64_t)li * 0xa8;
+            const float K2 = ldfp(KA);
+            cx = (cx + ldfp(LY2 + 0x68)) * K2;
+            cy = (cy + ldfp(LY2 + 0x6c)) * -K2;
+            const uint64_t T2 = L64(L64(X) + 0x40) + (uint64_t)li * 0x1d8;
+            cx = cx + ldfp(T2 + 0x130);
+            cy = cy + ldfp(T2 + 0x134);
+            stfp(CI + 8, cx);
+            stfp(CI + 0xc, cy);
+            *(uint8_t *)GP(CI + 0x22) = (tile >> 14) & 1;
+            *(uint8_t *)GP(CI + 0x23) = (uint8_t)(tile >> 15);
+            const uint64_t def = L64(M1 + 0x80) + (uint64_t)(tile & 0x3fff) * 6;
+            rt_st16(GP(CI + 0x20), rt_ld16(GP(def - 2)));
+            *(uint8_t *)GP(CI + 0x24) = (int16_t)rt_ld16(GP(def - 6)) == -1;
+            const int inner = x > (uint32_t)x0 && (int32_t)x < xm && y > (uint32_t)y0 && (int32_t)y < ym;
+            if (dry) {
+                phys_rec(1, L32(CI + 8), L32(CI + 0xc), L32(CI + 0x20) & 0xffffff, (uint32_t)inner | (uint32_t)L8(CI + 0x24) << 8);
+                continue;
+            }
+            const uint64_t cb = L64(CP);
+            c->x[0] = cb;
+            c->x[1] = CI;
+            c->x[2] = (uint32_t)inner;
+            c->x[3] = POS;
+            c->x[4] = ty;
+            c->x[5] = SH;
+            c->sp = saved_sp - 0xa0;
+            rt_call(c, L64(L64(cb) + 0x20));
+            c->sp = saved_sp;
+            if ((uint32_t)c->x[0] & 1)
+                return;
+        }
+        if ((int32_t)y == ym)
+            return;
+    }
+}
+
+/* ---- World::UpdateSpawnManager ----------------------------------------------------------------
+ * Every spawn manager of the level's tile components: the camera's region
+ * (SM+0xa4.., active area A/B, camera margins D), then each spawn record
+ * (pool slots: records of 0x40 at P+0x36080, spawn points of 0xd8 at P+0x80,
+ * 64 to a word of the free bitmap at P): by state (0 waiting, 2, 3) and kind,
+ * distance tests against the active area and the camera, then IsEventReady
+ * and Spawn, or the kill of what it spawned. ~2900 records a fixed update in
+ * astralOrrery; the recompiled code spent ~190 instructions on each. The
+ * game's operations, writes and calls in order (w1 of Spawn is what the last
+ * call left, as in the game).
+ * MINA_VERIFY_SPAWN=1: the game's code runs with its calls recorded (arguments
+ * and results); the records go back to before it, this one runs on them with
+ * the recorded results instead of the calls, and both outcomes are compared
+ * (slots handed to a call aside: the call's own effects are not replayed);
+ * the game's outcome stays. */
+void f_b66874_orig(Ctx *c);
+void f_ac3554_orig(Ctx *c); /* SpawnManager::SpawnPersistentEntities */
+void f_a7692c_orig(Ctx *c); /* SaveSlot::UpdateMode */
+void f_ac4b18_orig(Ctx *c); /* SpawnPoint::IsEventReady */
+void f_ac4f3c_orig(Ctx *c); /* SpawnPoint::Spawn */
+void f_9ae200_orig(Ctx *c); /* GameComponent::Kill */
+void f_ac5a70_orig(Ctx *c); /* SpawnPoint::DisownParent */
+void f_ac52b8_orig(Ctx *c); /* SpawnPoint::IsEntityPermanentKilled */
+void f_615680_orig(Ctx *c); /* PropUtil::GetPropertyExists */
+enum { SPC_READY = 1, SPC_SPAWN, SPC_KILL, SPC_DISOWN, SPC_PERMKILLED, SPC_PROP, SPC_PERSIST, SPC_MODE, SPC_VCALL };
+typedef struct { uint32_t id; uint64_t a0, a1, r0, r1; } SpCall;
+static SpCall sp_trace[2048];
+static int sp_n, sp_pos, sp_mode, sp_bad, sp_unverifiable;   /* sp_mode: 1 recording (the game's code), 2 replaying */
+static int sp_depth;        /* only the calls the function itself makes (not those inside them) */
+#define SP_WRAP(name, orig, id)                                    \
+    void name(Ctx *c)                                              \
+    {                                                              \
+        if (sp_mode != 1 || sp_depth) {                            \
+            orig(c);                                               \
+            return;                                                \
+        }                                                          \
+        const int k_ = sp_n < 2048 ? sp_n++ : -1;                  \
+        if (k_ < 0)                                                \
+            sp_unverifiable = 1;                                   \
+        else                                                       \
+            sp_trace[k_] = (SpCall){ id, c->x[0], c->x[1], 0, 0 }; \
+        sp_depth++;                                                \
+        orig(c);                                                   \
+        sp_depth--;                                                \
+        if (k_ >= 0) {                                             \
+            sp_trace[k_].r0 = c->x[0];                             \
+            sp_trace[k_].r1 = c->x[1];                             \
+        }                                                          \
+    }
+SP_WRAP(nat__ZN10SpawnPoint12IsEventReadyEfPNS_8CoreDataEPS_P11WorldRegion, f_ac4b18_orig, SPC_READY)
+SP_WRAP(nat__ZN10SpawnPoint5SpawnEb, f_ac4f3c_orig, SPC_SPAWN)
+SP_WRAP(nat__ZN13GameComponent4KillEv, f_9ae200_orig, SPC_KILL)
+SP_WRAP(nat__ZN10SpawnPoint12DisownParentEv, f_ac5a70_orig, SPC_DISOWN)
+SP_WRAP(nat__ZN10SpawnPoint23IsEntityPermanentKilledEb, f_ac52b8_orig, SPC_PERMKILLED)
+SP_WRAP(nat__ZN8PropUtil17GetPropertyExistsEPK11ycDataArrayI20ycTileLevel2PropertyEPKc, f_615680_orig, SPC_PROP)
+SP_WRAP(nat__ZN12SpawnManager23SpawnPersistentEntitiesEv, f_ac3554_orig, SPC_PERSIST)
+SP_WRAP(nat__ZN8SaveSlot10UpdateModeE20ycTileLevel2ModeFlagb, f_a7692c_orig, SPC_MODE)
+static void sp_dbg_dump(uint64_t R);
+/* a call of the native: the function, or the recorded result when replaying */
+static void sp_call(Ctx *c, uint32_t id, void (*fn)(Ctx *))
+{
+    if (sp_mode != 2) {
+        fn(c);
+        return;
+    }
+    if (sp_unverifiable) {      /* past a call whose effects are not replayed: nothing more to compare */
+        c->x[0] = 0;
+        return;
+    }
+    if (sp_pos < sp_n && sp_trace[sp_pos].id == id && sp_trace[sp_pos].a0 == c->x[0] &&
+        (id == SPC_SPAWN || id == SPC_KILL || id == SPC_DISOWN || id == SPC_PERSIST || sp_trace[sp_pos].a1 == c->x[1])) {
+        c->x[0] = sp_trace[sp_pos].r0;
+        c->x[1] = sp_trace[sp_pos].r1;
+        sp_pos++;
+        /* what Spawn, Kill, DisownParent and the persistent spawns change is not replayed */
+        if (id == SPC_SPAWN || id == SPC_KILL || id == SPC_DISOWN || id == SPC_PERSIST)
+            sp_unverifiable = 1;
+        return;
+    }
+    if (!sp_bad++) {
+        rt_log("[verify] UpdateSpawnManager: call %d (id %u x0 %#llx) where the game made %d (id %u x0 %#llx)\n", sp_pos,
+               id, (unsigned long long)c->x[0], sp_pos, sp_pos < sp_n ? sp_trace[sp_pos].id : 0,
+               (unsigned long long)(sp_pos < sp_n ? sp_trace[sp_pos].a0 : 0));
+        for (int k = 0; k < sp_n && k < 8; k++)
+            rt_log("  game %d: id %u x0 %#llx x1 %#llx -> %#llx\n", k, sp_trace[k].id, (unsigned long long)sp_trace[k].a0,
+                   (unsigned long long)sp_trace[k].a1, (unsigned long long)sp_trace[k].r0);
+        if (id == SPC_READY)
+            sp_dbg_dump(c->x[0]);
+    }
+    c->x[0] = 0;
+}
+#define SPCALL(id, fn) sp_call(c, (id), (fn))
+
+typedef struct {
+    float Ax, Ay, Bx, By, Dx, Dy, Z, camx, camy, e0, e4;
+    const float *lofs;      /* the game's array on its stack (an index past what was copied reads what is there) */
+} SpRegion;
+static inline float sp_abs(float v) { return v > 0.0f ? v : -v; }
+static const void *sp_dbg_region;
+static void sp_dbg_dump(uint64_t R)
+{
+    uint8_t *gm_ = g_mem;
+    rt_log("  record: state %u kind %u mask %#llx li %u pos %a %a r1c %a r20 %a r24 %a r28 %a\n", L32(R), L8(R + 4),
+           (unsigned long long)L64(R + 8), L8(R + 0x2c), ldfp(R + 0x10), ldfp(R + 0x14), ldfp(R + 0x1c), ldfp(R + 0x20),
+           ldfp(R + 0x24), ldfp(R + 0x28));
+    const SpRegion *g = sp_dbg_region;
+    if (g)
+        rt_log("  region: A %a %a B %a %a D %a %a cam %a %a e %a %a\n", g->Ax, g->Ay, g->Bx, g->By, g->Dx, g->Dy, g->camx,
+               g->camy, g->e0, g->e4);
+}
+/* the record's position (+ its layer's offset) in the active area A/B */
+static inline int sp_in_area(uint8_t *gm_, uint64_t R, const SpRegion *g)
+{
+    float x = ldfp(R + 0x10), y = ldfp(R + 0x14);
+    const uint32_t li = L8(R + 0x2c);
+    if (li != 0xff) {
+        x = x + g->lofs[2 * li];
+        y = y + g->lofs[2 * li + 1];
+    }
+    if (sp_abs((x + ldfp(R + 0x1c)) - g->Ax) > ldfp(R + 0x24) + g->Bx)
+        return 0;
+    if (sp_abs((y + ldfp(R + 0x20)) - g->Ay) > g->By + ldfp(R + 0x28))
+        return 0;
+    return 1;
+}
+/* bd0: A/B, then the camera with margins D */
+static inline int sp_visible_bd0(uint8_t *gm_, uint64_t R, const SpRegion *g)
+{
+    const float x0 = ldfp(R + 0x10), y0 = ldfp(R + 0x14);
+    const uint32_t li = L8(R + 0x2c);
+    float x = x0, y = y0;
+    if (li != 0xff) {
+        x = x0 + g->lofs[2 * li];
+        y = y0 + g->lofs[2 * li + 1];
+    }
+    const float r1c = ldfp(R + 0x1c), r24 = ldfp(R + 0x24), r20 = ldfp(R + 0x20), r28 = ldfp(R + 0x28);
+    if (sp_abs((x + r1c) - g->Ax) > r24 + g->Bx)
+        return 0;
+    if (sp_abs((y + r20) - g->Ay) > g->By + r28)
+        return 0;
+    float x2 = x0, y2 = y0;
+    if (li != 0xff) {
+        x2 = x0 + g->lofs[2 * li];
+        y2 = y0 + g->lofs[2 * li + 1];
+    }
+    if (sp_abs((x2 + r1c) - g->camx) > r24 + g->Dx)
+        return 0;
+    if (sp_abs((y2 + r20) - g->camy) > g->Dy + r28)
+        return 0;
+    return 1;
+}
+/* cec / ec8: the camera with margins e0/e4, then A/B */
+static inline int sp_near_cam(uint8_t *gm_, uint64_t R, const SpRegion *g)
+{
+    const float x0 = ldfp(R + 0x10), y0 = ldfp(R + 0x14);
+    const uint32_t li = L8(R + 0x2c);
+    float x = x0, y = y0;
+    if (li != 0xff) {
+        x = x0 + g->lofs[2 * li];
+        y = y0 + g->lofs[2 * li + 1];
+    }
+    const float r1c = ldfp(R + 0x1c), r24 = ldfp(R + 0x24), r20 = ldfp(R + 0x20), r28 = ldfp(R + 0x28);
+    if (sp_abs((x + r1c) - g->camx) > r24 + g->e0)
+        return 0;
+    if (sp_abs((y + r20) - g->camy) > g->e4 + r28)
+        return 0;
+    float x2 = x0, y2 = y0;
+    if (li != 0xff) {
+        x2 = x0 + g->lofs[2 * li];
+        y2 = y0 + g->lofs[2 * li + 1];
+    }
+    if (sp_abs((x2 + r1c) - g->Ax) > r24 + g->Bx)
+        return 0;
+    if (sp_abs((y2 + r20) - g->Ay) > g->By + r28)
+        return 0;
+    return 1;
+}
+
+/* the kill path (7054) */
+static void sp_kill(Ctx *c, uint8_t *gm_, uint64_t R)
+{
+    rt_st32(GP(R + 0x38), 0);
+    if (!(L8(R + 0x2d) & 8))
+        return;
+    const uint64_t comp = L64(R + 0x30);
+    if (!comp)
+        return;
+    c->x[0] = comp;
+    SPCALL(SPC_KILL, f_9ae200_orig);
+    rt_st64(GP(R + 0x30), 0);
+}
+/* e78: ready -> spawn */
+static void sp_ready_spawn(Ctx *c, uint8_t *gm_, uint64_t R, uint64_t SPt, uint64_t SM, float dts)
+{
+    c->x[0] = R;
+    c->x[1] = SPt;
+    c->x[2] = L64(SM + 0x88);
+    memset(&c->v[0], 0, 16);
+    c->v[0].f[0] = dts;
+    SPCALL(SPC_READY, f_ac4b18_orig);
+    if (!(uint32_t)c->x[0])
+        return;
+    c->x[0] = SPt;
+    SPCALL(SPC_SPAWN, f_ac4f3c_orig);
+}
+/* 7230: the spawned entity takes the parent's value */
+static void sp_after_spawn(Ctx *c, uint8_t *gm_, uint64_t SPt, uint64_t x25)
+{
+    const uint64_t par = L64(SPt + 0x40);
+    if (!par)
+        return;
+    const uint32_t v = L32(par + 0xc8);
+    rt_st32(GP(x25 + 0x15c), v);
+    const uint64_t o = L64(x25 + 0xb0);
+    if (!o)
+        return;
+    c->x[0] = o;
+    c->x[1] = 0x9e39a155e35e877eull;
+    if (sp_mode == 2) {
+        sp_unverifiable = 1;
+        return;
+    }
+    rt_call(c, L64(L64(o) + 0x18));
+    if (!(uint32_t)c->x[0])
+        return;
+    const uint64_t o2 = L64(x25 + 0xb0);
+    if (!o2)
+        return;
+    rt_st32(GP(o2 + 0x1e8), v);
+    rt_st32(GP(L64(o2 + 0xf8) + 0x3c), v);
+}
+/* 7130 / 71ec: spawned at the parent's offset (the position put back after) */
+static void sp_spawn_offset(Ctx *c, uint8_t *gm_, uint64_t SPt, uint64_t par)
+{
+    const uint64_t r = L64(SPt + 0x30);
+    const float z = ldfp(r + 0x18);
+    const float nz = z + ldfp(par + 0x90);
+    const uint64_t xy = L64(r + 0x10);
+    float x, y;
+    memcpy(&x, &xy, 4);
+    memcpy(&y, (const uint8_t *)&xy + 4, 4);
+    stfp(r + 0x10, x + ldfp(par + 0x88));
+    stfp(r + 0x14, y + ldfp(par + 0x8c));
+    stfp(r + 0x18, nz);
+    c->x[0] = SPt;
+    SPCALL(SPC_SPAWN, f_ac4f3c_orig);
+    const uint64_t r2 = L64(SPt + 0x30);
+    rt_st64(GP(r2 + 0x10), xy);
+    stfp(r2 + 0x18, z);
+}
+
+static void sp_slot(Ctx *c, uint8_t *gm_, uint64_t R, uint64_t SPt, uint64_t SM, uint64_t mode, const SpRegion *g, float dts)
+{
+    const uint32_t st = L32(R);
+    const uint32_t kind = L8(R + 4);
+    if (st == 3) {
+        if (kind == 8)
+            goto zero;
+        if (L8(SPt + 0xbb) && kind == 7)
+            goto zero;
+        if (!(kind <= 9 && ((1u << (kind & 31)) & 0x261)))
+            return;
+        if (!sp_near_cam(gm_, R, g))
+            goto zero;
+        return;
+    }
+    if (st == 2) {
+        if (kind - 8 < 4 || kind == 6)
+            goto zero;
+        if (L8(SM + 0xfe)) {
+            if (kind - 3 < 3 || kind == 0)
+                goto ec8;
+            if (kind == 7)
+                goto zero;
+            goto fb0;
+        }
+        if (L8(SPt + 0xbb) && kind == 7)
+            goto zero;
+        if (kind > 5 || !((1u << kind) & 0x39))
+            goto fb0;
+    ec8:
+        if (!sp_near_cam(gm_, R, g))
+            goto zero;
+    fb0: {
+            const uint64_t par = L64(SPt + 0x40);
+            if (!par)
+                return;
+            const uint64_t pr = L64(par + 0x30);
+            if (!(L8(pr + 0x2d) & 1))
+                return;
+            if (L32(pr) == 1)
+                goto zero;
+            return;
+        }
+    }
+    if (st != 0)
+        return;
+    {
+        const uint64_t m = L64(R + 8);
+        if (m) {
+            const uint64_t x10 = m & ~mode;
+            const uint32_t pass = (x10 & ~1ull) == 0 ? !(m & 1) : (uint32_t)m;
+            if (!(pass & 1))
+                return;
+        }
+    }
+    switch (kind) {
+    case 1: case 2:
+        sp_ready_spawn(c, gm_, R, SPt, SM, dts);
+        return;
+    case 3: case 9:
+        if (!sp_in_area(gm_, R, g))
+            goto kill;
+        sp_ready_spawn(c, gm_, R, SPt, SM, dts);
+        return;
+    case 12: case 13:
+        return;
+    case 14: {
+        *(uint8_t *)GP(SPt + 0xb9) = 1;
+        rt_st32(GP(L64(SPt + 0x30)), 3);
+        rt_st64(GP(SPt + 0x38), 0);
+        return;
+    }
+    case 8: {
+        const uint64_t par = L64(SPt + 0x40);
+        if (!par)
+            goto kill;
+        const uint64_t R2 = L64(par + 0x30);
+        float x = ldfp(R2 + 0x10), y = ldfp(R2 + 0x14);
+        const uint32_t li = L8(R2 + 0x2c);
+        if (li != 0xff) {
+            x = x + g->lofs[2 * li];
+            y = y + g->lofs[2 * li + 1];
+        }
+        if (sp_abs((x + ldfp(R2 + 0x1c)) - g->Ax) > ldfp(R2 + 0x24) + g->Bx)
+            goto kill;
+        {
+            const float d = sp_abs((y + ldfp(R2 + 0x20)) - g->Ay), lim = g->By + ldfp(R2 + 0x28);
+            if (d > lim)                 /* (b.le: NaN goes on) */
+                goto kill;
+        }
+        const uint32_t t = L32(SPt + 0xa4);
+        if (t == 0x1f8 || t == 0x20a || t == 0x146 || t == 0x175 || t == 0xaa || t == 0x11f || t == 0x2f || t == 0x45) {
+            sp_ready_spawn(c, gm_, R, SPt, SM, dts);
+            return;
+        }
+        c->x[0] = SPt;
+        c->x[1] = 1;
+        SPCALL(SPC_PERMKILLED, f_ac52b8_orig);
+        if ((uint32_t)c->x[0] & 1)
+            goto kill;
+        sp_ready_spawn(c, gm_, R, SPt, SM, dts);
+        return;
+    }
+    case 7: {
+        const uint64_t par = L64(SPt + 0x40);
+        if (!par) {
+            c->x[0] = SPt;
+            SPCALL(SPC_SPAWN, f_ac4f3c_orig);
+            c->x[0] = SPt;
+            SPCALL(SPC_DISOWN, f_ac5a70_orig);
+            return;
+        }
+        int go710c = 0;
+        const uint64_t pr = L64(par + 0x30);
+        if (L32(pr) == 1) {
+            if (L8(pr + 0x2d) & 1) {
+                go710c = 1;
+            } else if (L32(par + 0xa4) == 0x16d) {
+                const uint32_t w = L32(SPt + 0xa4);
+                if (w == 0x30 || w == 0x2d) {
+                    go710c = 1;
+                } else if (w == 0x24) {
+                    uint64_t props = L64(SPt);
+                    if (props) {
+                        c->x[0] = props;
+                        c->x[1] = GUEST_IMAGE_BASE + 0xd03b10u;     /* "Buried" */
+                        SPCALL(SPC_PROP, f_615680_orig);
+                        if ((uint32_t)c->x[0] & 1) {
+                            go710c = 1;
+                        } else {
+                            props = L64(SPt);
+                            if (props) {
+                                c->x[0] = props;
+                                c->x[1] = GUEST_IMAGE_BASE + 0xd03b17u; /* "BuriedGlass" */
+                                SPCALL(SPC_PROP, f_615680_orig);
+                                go710c = (uint32_t)c->x[0] != 0;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (go710c) {
+            const uint64_t p2 = L64(SPt + 0x40);
+            if (L8(L64(p2 + 0x30) + 0x2d) & 0x10) {
+                sp_spawn_offset(c, gm_, SPt, p2);
+            } else {
+                c->x[0] = SPt;
+                SPCALL(SPC_SPAWN, f_ac4f3c_orig);
+            }
+            const uint64_t x25 = L64(SPt + 0x38);
+            if (x25)
+                sp_after_spawn(c, gm_, SPt, x25);
+            return;
+        }
+        {   /* 7130 */
+            const uint64_t p2 = L64(SPt + 0x40);
+            const uint64_t pr2 = L64(p2 + 0x30);
+            if (L32(pr2) != 3 || !(L8(pr2 + 0x2d) & 2))
+                return;
+            sp_spawn_offset(c, gm_, SPt, p2);
+            const uint64_t p3 = L64(SPt + 0x40);
+            if (!p3 || L8(p3 + 0xb9)) {
+                rt_st64(GP(SPt + 0x40), 0);
+                c->x[0] = SPt;
+                SPCALL(SPC_DISOWN, f_ac5a70_orig);
+            }
+            const uint64_t x25 = L64(SPt + 0x38);
+            if (x25)
+                sp_after_spawn(c, gm_, SPt, x25);
+            return;
+        }
+    }
+    default:        /* 0, 4, 5, 6, 10, 11 and anything above 14 */
+        if (!sp_visible_bd0(gm_, R, g))
+            goto kill;
+        sp_ready_spawn(c, gm_, R, SPt, SM, dts);
+        return;
+    }
+kill:
+    sp_kill(c, gm_, R);
+    return;
+zero:
+    rt_st32(GP(R), 0);
+}
+
+static void update_spawn_manager(Ctx *c)
+{
+    GM_BEGIN;
+    const uint64_t W = c->x[0], CTX = c->x[1];
+    const uint64_t saved_sp = c->sp;
+    c->sp = saved_sp - 0x930;
+    float *const lofs = GP(saved_sp - 0x930 + 0x88);
+    for (uint64_t nd = L64(W + 0xb0); nd; nd = L64(nd + 0x18)) {
+        const uint64_t comp = L64(nd + 8);
+        if (L32(comp + 0x370) != 5)
+            continue;
+        for (uint64_t n2 = L64(comp + 0x438); n2; n2 = L64(n2 + 0x18)) {
+            const uint64_t SM = L64(L64(n2 + 8) + 0x3a0);
+            if (!L8(SM + 0xfc))
+                continue;
+            const uint64_t WR = L64(SM + 0x88);
+            const uint64_t lt = L64(WR + 0x390);
+            if (lt) {
+                const uint64_t cnt = L64(L64(lt + 0x10) + 0x38) >> 34;
+                uint64_t src = L64(lt + 0x40) + 0x130;
+                for (uint64_t i = 0; i < cnt; i++, src += 0x1d8)
+                    rt_st64(GP(saved_sp - 0x930 + 0x88 + 8 * i), L64(src));
+            }
+            SpRegion g;
+            g.lofs = lofs;
+            sp_dbg_region = &g;
+            float dts = ldfp(CTX + 8);
+            const float scale = ldfp(L64(L64(SM + 0x108) + 0x10) + 0x68);
+            const uint64_t CAM = L64(L64(WR + 0x10) + 0x16c0);
+            const uint64_t CV = CAM + 0x6a24;
+            g.camx = ldfp(CV + 0x88);
+            const float cy0 = ldfp(CV + 0x8c), cz = ldfp(CV + 0x90);
+            g.camy = cy0 + (ldfp(CAM + 0x1bc) - ldfp(CAM + 0x1c0)) * 0.5f;
+            stfp(SM + 0xa4, g.camx);
+            stfp(SM + 0xa8, g.camy);
+            stfp(SM + 0xac, cz);
+            const float s0 = ldfp(SM + 0xdc) + ldfp(SM + 0xc4);
+            g.Dx = ldfp(SM + 0xd4) + ldfp(SM + 0xbc);
+            g.Dy = ldfp(SM + 0xd8) + ldfp(SM + 0xc0);
+            stfp(SM + 0xb0, g.Dx);
+            stfp(SM + 0xb4, g.Dy);
+            stfp(SM + 0xb8, s0);
+            if (L8(CV + 0xc)) {
+                g.Ax = ldfp(CAM + 0x6a18);
+                g.Ay = ldfp(CAM + 0x6a1c);
+                const float e4 = hexf(0x3ecccccdu);
+                g.Bx = (ldfp(CV) + e4) + ldfp(SM + 0xc8);
+                g.By = (ldfp(CV + 4) + e4) + ldfp(SM + 0xcc);
+                g.Z = (ldfp(CV + 8) + 0.0f) + ldfp(SM + 0xd0);
+            } else {
+                g.Ax = g.Ay = 0.0f;
+                g.Bx = g.By = g.Z = hexf(0xfe7fffffu);       /* mov w8, #-0x1800001 */
+            }
+            g.e0 = ldfp(SM + 0xe0);
+            g.e4 = ldfp(SM + 0xe4);
+            if (L8(SM + 0x101)) {
+                c->x[0] = SM;
+                SPCALL(SPC_PERSIST, f_ac3554_orig);
+                *(uint8_t *)GP(SM + 0x101) = 0;
+            }
+            c->x[0] = L64(GUEST_IMAGE_BASE + 0x5051910u);
+            c->x[1] = 0;
+            SPCALL(SPC_MODE, f_a7692c_orig);
+            const uint64_t mode = c->x[0];
+            const uint64_t pcnt = L64(SM + 0x20);
+            if (pcnt && L32(SM + 0x14)) {
+                dts = dts * scale;
+                const uint64_t arr = L64(SM + 0x18);
+                const uint64_t end = (uint32_t)(arr + pcnt * 8);
+                uint32_t w9 = 1;
+                for (uint64_t cur = (uint32_t)arr; cur != end; cur = (uint32_t)(cur + 8)) {
+                    if (!w9)
+                        continue;
+                    const uint64_t P = L64(cur);
+                    uint32_t w = 0, nw;
+                    for (;;) {
+                        const uint64_t bits = L64(P + (uint64_t)w * 8);
+                        if (bits != ~0ull) {
+                            const uint64_t R0 = P + 0x36080 + (uint64_t)w * 0x1000;
+                            const uint64_t S0 = P + 0x80 + (uint64_t)w * 0x3600;
+                            for (int hf = 0; hf < 2; hf++) {
+                                uint32_t live = ~(uint32_t)(bits >> (32 * hf));
+                                while (live) {
+                                    const uint32_t j = __builtin_ctz(live) + 32 * hf;
+                                    live &= live - 1;
+                                    sp_slot(c, gm_, (uint32_t)(R0 + j * 0x40), (uint32_t)(S0 + j * 0xd8), SM, mode, &g, dts);
+                                }
+                            }
+                        }
+                        w++;
+                        nw = L32(SM + 0x14);
+                        if (w == nw)
+                            break;
+                    }
+                    w9 = nw;
+                }
+            }
+            /* after: the area set up once both halves are not negative */
+            if (!(g.Bx < 0.0f) && !(g.By < 0.0f) && !(g.Z < 0.0f))
+                *(uint8_t *)GP(SM + 0x100) = 1;
+        }
+    }
+    c->sp = saved_sp;
+}
+
+/* MINA_VERIFY_SPAWN: the regions the function writes (managers' heads, pools) */
+typedef struct { uint64_t addr; uint32_t len; uint8_t *pre, *game; } SpSnap;
+static int sp_snap(uint8_t *gm_, uint64_t W, SpSnap *sn, int max)
+{
+    int n = 0;
+    for (uint64_t nd = L64(W + 0xb0); nd; nd = L64(nd + 0x18)) {
+        const uint64_t comp = L64(nd + 8);
+        if (L32(comp + 0x370) != 5)
+            continue;
+        for (uint64_t n2 = L64(comp + 0x438); n2; n2 = L64(n2 + 0x18)) {
+            const uint64_t SM = L64(L64(n2 + 8) + 0x3a0);
+            if (!L8(SM + 0xfc) || n >= max)
+                continue;
+            sn[n++] = (SpSnap){ SM, 0x110, NULL, NULL };
+            const uint64_t cnt = L64(SM + 0x20), arr = L64(SM + 0x18);
+            for (uint64_t k = 0; k < cnt && n < max; k++)
+                sn[n++] = (SpSnap){ L64(arr + 8 * k), 0x36080 + 0x10000, NULL, NULL };
+        }
+    }
+    return n;
+}
+void nat__ZN5World18UpdateSpawnManagerEP20ycUpdateQueueContext(Ctx *c)
+{
+    static int verify = -1;
+    if (verify < 0)
+        verify = getenv("MINA_VERIFY_SPAWN") != NULL;
+    if (!verify) {
+        update_spawn_manager(c);
+        return;
+    }
+    GM_BEGIN;
+    static uint32_t calls, bad, skipped;
+    SpSnap sn[16];
+    const int ns = sp_snap(gm_, c->x[0], sn, 16);
+    for (int i = 0; i < ns; i++) {
+        sn[i].pre = malloc(sn[i].len);
+        sn[i].game = malloc(sn[i].len);
+        memcpy(sn[i].pre, GP(sn[i].addr), sn[i].len);
+    }
+    const Ctx save = *c;
+    sp_n = 0;
+    sp_depth = 0;
+    sp_unverifiable = 0;
+    sp_mode = 1;
+    f_b66874_orig(c);
+    sp_mode = 0;
+    const Ctx after = *c;
+    for (int i = 0; i < ns; i++) {
+        memcpy(sn[i].game, GP(sn[i].addr), sn[i].len);
+        memcpy(GP(sn[i].addr), sn[i].pre, sn[i].len);
+    }
+    *c = save;
+    sp_pos = 0;
+    sp_bad = 0;
+    sp_mode = 2;
+    update_spawn_manager(c);
+    sp_mode = 0;
+    calls++;
+    if (sp_unverifiable && !sp_bad) {
+        skipped++;
+    } else {
+        int diff = sp_bad || sp_pos != sp_n;
+        for (int i = 0; i < ns && !diff; i++) {
+            const uint8_t *mine = GP(sn[i].addr);
+            for (uint32_t o = 0; o < sn[i].len; o++) {
+                if (mine[o] == sn[i].game[o])
+                    continue;
+                /* a byte of a record or spawn point handed to a call: the call's effects are not replayed */
+                const uint64_t a = sn[i].addr + o;
+                int called = 0;
+                for (int k = 0; k < sp_n && !called; k++) {
+                    const uint64_t t = sp_trace[k].a0;
+                    called = (a >= t && a < t + 0xd8) || (a >= (t & ~0x3full) && a < (t & ~0x3full) + 0x40);
+                }
+                if (called)
+                    continue;
+                if (bad < 20)
+                    rt_log("[verify] UpdateSpawnManager differs at %#llx (+%#x of %#llx): game %02x, mine %02x\n",
+                           (unsigned long long)a, o, (unsigned long long)sn[i].addr, sn[i].game[o], mine[o]);
+                diff = 1;
+                break;
+            }
+        }
+        if (diff && bad++ < 20)
+            rt_log("[verify] UpdateSpawnManager differs (%u of %u): %d calls replayed of %d\n", bad, calls, sp_pos, sp_n);
+    }
+    /* the game's outcome stays */
+    for (int i = 0; i < ns; i++) {
+        memcpy(GP(sn[i].addr), sn[i].game, sn[i].len);
+        free(sn[i].pre);
+        free(sn[i].game);
+    }
+    *c = after;
+    if ((calls & 0x3ff) == 0)
+        rt_log("[verify] UpdateSpawnManager: %u calls checked, %u differ, %u compared up to a call with effects\n", calls,
+               bad, skipped);
 }
