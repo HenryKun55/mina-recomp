@@ -2239,6 +2239,28 @@ void metal_present(uint64_t drawable)
                        g_depth_restarts / (double)frames);
                 g_composites = g_bounds = 0;
                 g_depth_fs_draws = g_depth_restarts = 0;
+#if defined(__vita__) && defined(MINA_VGL_DBG)
+                {
+                    extern uint32_t vgl_dbg_copies[4], vgl_dbg_bytes[4];
+                    rt_log("[vgl] per frame: vertex copies %u (%u KiB) / %u (%u KiB), uniform copies %u (%u KiB) / %u (%u KiB)\n",
+                           vgl_dbg_copies[0] / frames, vgl_dbg_bytes[0] / frames / 1024, vgl_dbg_copies[1] / frames,
+                           vgl_dbg_bytes[1] / frames / 1024, vgl_dbg_copies[2] / frames, vgl_dbg_bytes[2] / frames / 1024,
+                           vgl_dbg_copies[3] / frames, vgl_dbg_bytes[3] / frames / 1024);
+                    memset(vgl_dbg_copies, 0, sizeof vgl_dbg_copies);
+                    memset(vgl_dbg_bytes, 0, sizeof vgl_dbg_bytes);
+                }
+#endif
+                {
+                    extern uint64_t g_sem_wait_ns[32];
+                    char b[256];
+                    int n = 0;
+                    for (int i = 0; i < 32; i++)
+                        if (g_sem_wait_ns[i] / frames > 300000 && n < 200)
+                            n += snprintf(b + n, sizeof b - n, " t%d %.1f", i, g_sem_wait_ns[i] / 1e6 / frames);
+                    if (n)
+                        rt_log("[fps]   semaphore waits per frame (ms):%s\n", b);
+                    memset(g_sem_wait_ns, 0, sizeof g_sem_wait_ns);
+                }
                 {
                     extern uint32_t g_recalcs, g_recalc_same;
                     if (g_recalcs)

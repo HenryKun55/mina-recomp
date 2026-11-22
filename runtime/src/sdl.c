@@ -548,6 +548,19 @@ static void start_level(void)
     }
     rt_log("[levels] no level %s\n", want);
 }
+/* a level's index in the game's table (-1: none) */
+int mina_level_index(const char *want)
+{
+    const uint32_t tab = GUEST_IMAGE_BASE + 0x05044f68u;
+    const uint32_t base = (uint32_t)rt_ld64(G(tab));
+    const int count = (int)(int32_t)rt_ld64(G(tab + 8));
+    for (int i = 0; base && i < count; i++) {
+        const uint32_t name = (uint32_t)rt_ld64(G(base + 72u * (uint32_t)i + 0x30));
+        if (name && !strcmp((const char *)G(name), want))
+            return i;
+    }
+    return -1;
+}
 /* (the index of MINA_START_LEVEL, -1 none or not found yet) */
 int mina_start_level_index(void)
 {

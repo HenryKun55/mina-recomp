@@ -593,8 +593,24 @@ pthread_t g_present_thread;
 int g_present_thread_set;
 uint64_t g_present_sem_ns;
 static int hsem_wait_(HSem *s, uint64_t timeout);
+/* MINA_FPS: time each guest thread spends blocked in semaphores (by thread id) */
+uint64_t g_sem_wait_ns[32];
 static int hsem_wait(HSem *s, uint64_t timeout)
 {
+    {
+        Ctx *tc = tl_ctx;
+        const uint32_t id = tc ? tc->thread_id : 0;
+        if (id && id < 32) {
+            struct timespec a, b;
+            clock_gettime(CLOCK_MONOTONIC, &a);
+            int r = (!g_present_thread_set || !pthread_equal(pthread_self(), g_present_thread)) ? hsem_wait_(s, timeout) : -1;
+            if (r >= 0) {
+                clock_gettime(CLOCK_MONOTONIC, &b);
+                g_sem_wait_ns[id] += (uint64_t)(b.tv_sec - a.tv_sec) * 1000000000ull + (uint64_t)(b.tv_nsec - a.tv_nsec);
+                return r;
+            }
+        }
+    }
     if (!g_present_thread_set || !pthread_equal(pthread_self(), g_present_thread))
         return hsem_wait_(s, timeout);
     struct timespec a, b;

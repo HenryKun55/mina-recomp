@@ -71,8 +71,44 @@ int g_in_play;
 static uint32_t composites_total, recalcs_total;
 
 void f_99f430_orig(Ctx *c);
+void f_ae1690(Ctx *c);     /* StatusMenu::Warp(int level): the game's own warp (a transition to that level) */
+int mina_level_index(const char *name);
+/* (tests) a level named in ux0:data/mina/warp.txt (MINA_WARP_FILE on the Mac) is
+ * warped to by the game's StatusMenu::Warp, from the game thread, once per write */
+static void warp_requests(Ctx *c)
+{
+    static uint32_t tick;
+    if (++tick % 30)
+        return;
+#if defined(__vita__)
+    const char *path = "ux0:data/mina/warp.txt";
+#else
+    const char *path = getenv("MINA_WARP_FILE");
+    if (!path)
+        return;
+#endif
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return;
+    char name[128] = { 0 };
+    const int ok = fscanf(f, "%127s", name) == 1;
+    fclose(f);
+    remove(path);
+    if (!ok)
+        return;
+    const int idx = mina_level_index(name);
+    rt_log("[warp] %s -> level %d\n", name, idx);
+    if (idx <= 0)
+        return;
+    const Ctx save = *c;
+    c->x[0] = 0;
+    c->x[1] = (uint64_t)idx;
+    f_ae1690(c);
+    *c = save;
+}
 void nat__ZN4Game11FixedUpdateEv(Ctx *c)
 {
+    warp_requests(c);
     uint64_t t0 = now_us();
     uint32_t before = recalcs_total;
     g_fixed_updates++;
@@ -1754,6 +1790,11 @@ void nat__ZNK9SpawnBase17GetPropertyEqualsEPKcPS1_yi(Ctx *c)
 #endif
 static void pin_to_core(int core, const char *what)
 {
+    {
+        Ctx *thread_ctx(void);
+        Ctx *tc = thread_ctx();
+        rt_log("[thread] %s is guest thread %u\n", what, tc ? tc->thread_id : 0);
+    }
 #if defined(__vita__)
     static int off = -1;
     if (off < 0)
