@@ -270,7 +270,10 @@ static pthread_mutex_t lzc_lock = PTHREAD_MUTEX_INITIALIZER;
 static void lazy_pread(int bi, uint32_t off, uint8_t *dst, uint32_t n)
 {
     LazyBlob *b = &lazy[bi];
-    if (n >= LAZY_BLOCK) {                     /* a big read: straight from the card */
+    static int direct = -1;                    /* MINA_LAZY_DIRECT: every read straight from the card */
+    if (direct < 0)
+        direct = getenv("MINA_LAZY_DIRECT") != NULL;
+    if (direct || n >= LAZY_BLOCK) {           /* a big read: straight from the card */
         ssize_t r = pread(b->fd, dst, n, (off_t)off);
         if (r != (ssize_t)n)
             rt_log("[lazy] read of %u bytes at %u: %zd\n", n, off, r);
