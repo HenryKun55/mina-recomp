@@ -7,6 +7,23 @@ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 OUT=$1; shift
 pid=$(pgrep -f "MacOS/Vita3K -c .* -r MINA00001" | head -1)
 [ -n "$pid" ] || { echo "no Vita3K running" >&2; exit 1; }
+if [ -z "${VKEY_FOCUS:-}" ]; then
+    # Keys through the game itself (runtime: ux0:data/mina/input.txt): the
+    # emulator's window is never brought to the front (the user's desktop stays
+    # theirs). VKEY_FOCUS=1: macOS key events instead.
+    V3=${MINA_VITA3K:-$HOME/Documents/workspace/games/vita3k-mina}
+    D="$V3/fs/ux0/data/mina"
+    if [ $# -gt 0 ]; then
+        echo "$*" > "$D/input.tmp" && mv "$D/input.tmp" "$D/input.txt"
+        # as long as they take (each: its hold, then 0.1 s), plus the poll
+        secs=$(echo "$*" | awk '{ t = 0.4; for (i = 1; i <= NF; i++) { n = split($i, a, ":"); t += (n > 1 ? a[2] : 0.15) + 0.1 } print t }')
+        sleep "$secs"
+    fi
+    # the window as it is (behind others: fine; minimized: no picture)
+    id=$("$ROOT/build/winid" | /usr/bin/grep "MINA00001" | head -1 | cut -d' ' -f1)
+    [ -n "$id" ] && [ -n "$OUT" ] && screencapture -x -o -l "$id" "$OUT"
+    exit 0
+fi
 for k in "$@"; do
     name=${k%%:*}; hold=0.15
     case "$k" in *:*) hold=${k#*:};; esac

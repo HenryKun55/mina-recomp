@@ -867,7 +867,9 @@ void objc_refsites_report(void)
 }
 uint64_t objc_retain_obj(uint64_t a)
 {
-    Obj *o = objc_obj(a);
+    Obj *o = obj_tagged(a);              /* (a host object: the common case, inline) */
+    if (!o)
+        o = objc_obj(a);
     if (o) {
         __atomic_add_fetch(&o->refs, 1, __ATOMIC_SEQ_CST);
         o->rel[o->nrel++ % 12] = (uintptr_t)__builtin_return_address(0) | 1;
@@ -979,7 +981,9 @@ static void destroy(Ctx *c, uint64_t a)
 
 void objc_release_obj(uint64_t a)
 {
-    Obj *o = objc_obj(a);
+    Obj *o = a ? obj_tagged(a) : NULL;
+    if (!o)
+        o = objc_obj(a);
     if (!o)
         return;
     o->rel[o->nrel++ % 12] = (uintptr_t)__builtin_return_address(0) & ~(uintptr_t)1;

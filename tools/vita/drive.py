@@ -27,7 +27,8 @@ ACTIONS = {
 }
 
 def gray(path):
-    out = subprocess.run(["magick", path, "-crop", "+0+64", "+repage", "-resize", "48x27!", "-colorspace", "Gray",
+    crop = "+0+64"                     # (the window's title bar)
+    out = subprocess.run(["magick", path, "-crop", crop, "+repage", "-resize", "48x27!", "-colorspace", "Gray",
                           "-depth", "8", "gray:-"], capture_output=True).stdout
     return out
 

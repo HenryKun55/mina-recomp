@@ -20,12 +20,24 @@ shift
 URL="ftp://$IP:1337"
 [ $# -gt 0 ] || set -- vpk data
 
-put() {     # put LOCAL REMOTE
-    curl --disable-epsv -sS --ftp-create-dirs --connect-timeout 10 -T "$1" "$URL/$2"
-}
+# the size in its directory's listing (VitaShell answers a size query for a
+# file it did not keep: a send cut short looked whole)
 remote_size() {
-    curl --disable-epsv -sSI --connect-timeout 10 "$URL/$1" 2>/dev/null |
-        tr -d '\r' | awk '/^Content-Length:/ {print $2}'
+    dir=${1%/*}
+    name=${1##*/}
+    curl --disable-epsv -sS --connect-timeout 10 "$URL/$dir/" 2>/dev/null |
+        awk -v n="$name" '{ f = $0; sub(/^([^ ]+ +){8}/, "", f); if (f == n) print $5 }'
+}
+put() {     # put LOCAL REMOTE: sent again (3 tries) until the listing has it whole
+    want=$(stat -f %z "$1" 2>/dev/null || stat -c %s "$1")
+    for try in 1 2 3; do
+        curl --disable-epsv -sS --ftp-create-dirs --connect-timeout 10 -T "$1" "$URL/$2" || true
+        [ "$(remote_size "$2")" = "$want" ] && return 0
+        echo "  $2: not there whole (try $try)" >&2
+        sleep 2
+    done
+    echo "cannot send $1" >&2
+    exit 1
 }
 
 for what in "$@"; do

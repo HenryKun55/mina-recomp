@@ -64,7 +64,10 @@ static int shader_cache_seed(const char *from, const char *to)
         char src[256], dst[256];
         snprintf(src, sizeof src, "%s/%s", from, ent.d_name);
         snprintf(dst, sizeof dst, "%s/%s", to, ent.d_name);
-        if (SCE_S_ISDIR(ent.d_stat.st_mode)) {
+        /* a directory by its mode or by its attributes (the console fills
+         * the one, Vita3K the other: the first boot on the console copied
+         * nothing; opening a file as a directory kills Vita3K) */
+        if (SCE_S_ISDIR(ent.d_stat.st_mode) || (ent.d_stat.st_attr & SCE_SO_IFDIR)) {
             copied += shader_cache_seed(src, dst);
             continue;
         }

@@ -583,9 +583,78 @@ int mina_start_level_index(void)
     rt_log("[levels] no level %s\n", want);
     return idx = -1;
 }
+/* (tests) ux0:data/mina/input.txt: keys for the Vita's pad, read once per
+ * write and played in order ("x enter left:1 wait:3"; the names of
+ * tools/vita/vkey.sh, ":s" held that long, default 0.15): scripted runs drive
+ * the game without the emulator's window (no keyboard focus taken) */
+#if defined(__vita__)
+#include <psp2/io/stat.h>
+static void file_input(void)
+{
+    static struct { uint32_t bit; Uint32 ms; } q[64];
+    static int nq, qi, holding;
+    static Uint32 until, last_poll;
+    const Uint32 now = SDL_GetTicks();
+    if (qi < nq) {
+        if ((int32_t)(now - until) < 0)
+            return;
+        if (holding) {                      /* released, then a short gap */
+            script_buttons &= ~q[qi].bit;
+            holding = 0;
+            qi++;
+            until = now + 100;
+            return;
+        }
+        if (q[qi].bit)
+            script_buttons |= q[qi].bit;
+        holding = 1;
+        until = now + q[qi].ms;
+        return;
+    }
+    if (now - last_poll < 200)
+        return;
+    last_poll = now;
+    SceIoStat st;
+    if (sceIoGetstat("ux0:data/mina/input.txt", &st) < 0)
+        return;
+    FILE *f = fopen("ux0:data/mina/input.txt", "r");
+    char buf[512] = { 0 };
+    if (f) {
+        fread(buf, 1, sizeof buf - 1, f);
+        fclose(f);
+    }
+    remove("ux0:data/mina/input.txt");
+    static const struct { const char *n; uint32_t bit; } map[] = {
+        { "up", 0x10 }, { "down", 0x40 }, { "left", 0x80 }, { "right", 0x20 }, { "x", 0x4000 }, { "c", 0x2000 },
+        { "z", 0x8000 }, { "v", 0x1000 }, { "enter", 0x8 }, { "select", 0x1 }, { "l", 0x100 }, { "r", 0x200 },
+        { "wait", 0 },
+    };
+    nq = qi = holding = 0;
+    for (char *t = strtok(buf, " \t\r\n"); t && nq < 64; t = strtok(NULL, " \t\r\n")) {
+        char *colon = strchr(t, ':');
+        float secs = 0.15f;
+        if (colon) {
+            *colon = 0;
+            secs = (float)atof(colon + 1);
+        }
+        for (size_t k = 0; k < sizeof map / sizeof map[0]; k++)
+            if (!strcmp(t, map[k].n)) {
+                q[nq].bit = map[k].bit;
+                q[nq++].ms = (Uint32)(secs * 1000);
+                break;
+            }
+    }
+    rt_log("[input] %d keys from input.txt\n", nq);
+    until = now;
+}
+#else
+static void file_input(void) {}
+#endif
+
 static void scripted_input(void)
 {
     test_resize();
+    file_input();
     levels_dump();
     start_level();
     static Uint32 last_mem;

@@ -3769,6 +3769,7 @@ static void combat_tail(Ctx *c, uint8_t *gm_, uint64_t F, uint64_t A, uint64_t D
             c->x[5] = x5;
             c->x[6] = x6;
             c->x[7] = w7;
+            c->sp = F;                      /* (its stack arguments are at sp: a callee above left it lower) */
             f_5721dc_orig(c);
             if (!(uint32_t)c->x[0])
                 continue;
@@ -3786,6 +3787,7 @@ static void combat_tail(Ctx *c, uint8_t *gm_, uint64_t F, uint64_t A, uint64_t D
                 c->x[0] = o;
                 c->x[1] = dd;
                 c->x[2] = j;
+                c->sp = F;
                 f_98375c(c);
             } else {
                 rt_st32(GP(o + 0x204), (uint32_t)j);

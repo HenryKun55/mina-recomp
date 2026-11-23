@@ -60,13 +60,19 @@ alive
 cp "$ROOT/build-vita/vita3k-profile.txt" "$ROOT/build-vita/deck-end.txt"
 "$ROOT/tools/vita/vkey.sh" "$ROOT/build-vita/deck.png"
 # a frame that is (nearly) all black above the HUD: the scene is not drawn
-lum=$(magick "$ROOT/build-vita/deck.png" -alpha off -crop 1920x700+0+70 +repage -colorspace Gray -format "%[fx:mean]" info: 2>/dev/null)
+lum=$(magick "$ROOT/build-vita/deck.png" -alpha off -crop 100%x70%+0+64 +repage -colorspace Gray -format "%[fx:mean]" info: 2>/dev/null)
 if [ -n "$lum" ] && awk "BEGIN { exit !($lum < 0.04) }"; then
     echo "BLACK SCREEN (mean $lum): build-vita/deck.png" >&2
     st=1
 fi
 pkill -9 -f "Vita3K -c .* -r MINA00001"
 sleep 1
+# Vita3K logs a bad memory access and goes on; the console kills the game
+bad_mem=$(/usr/bin/grep -ac "Invalid read\|Invalid write" "$ROOT/build-vita/vita3k.log" 2>/dev/null)
+if [ "${bad_mem:-0}" -gt 0 ]; then
+    echo "INVALID MEMORY ACCESSES: $bad_mem (build-vita/vita3k.log; the console would crash)" >&2
+    st=1
+fi
 tail -n +"$n0" "$DATA/mina.log" | /usr/bin/grep -a "^\[fps\] [0-9]\|^\[fps\]   render\|^\[mem\] guest\|^\[mtl\]"
 # a level is up when its fixed updates do real work (a menu's or a logo's take ~1 ms)
 [ -n "${UNTIL:-}" ] || tail -n +"$n0" "$DATA/mina.log" | /usr/bin/grep -a "^\[fps\] [0-9]" | tail -1 \

@@ -425,7 +425,10 @@ pipeline_set:
                 SEND("setFragmentBuffer:offset:atIndex:", pass, buf, data - base, (uint64_t)i);
         }
         /* ---- textures ---- */
-        for (int i = 0; i < 12; i++) {
+        /* (only the indices the shader reads: an entry is sent for no other) */
+        const uint64_t tmask_v = L64(R + 0x8), tmask_f = L64(R + 0x18);
+        for (uint32_t bits = (uint32_t)((tmask_v | tmask_f) & 0xfff); bits; bits &= bits - 1) {
+            const int i = __builtin_ctz(bits);
             const uint32_t fl = L32(P + 0x100 + i * 16);
             if (!fl)
                 continue;
@@ -438,9 +441,9 @@ pipeline_set:
             case 3: tex = L64(o + 0x18); break;
             case 4: tex = L64(o + 0x8); break;
             }
-            if ((fl >> 8 & 1) && (L64(R + 0x8) >> i & 1) && !(re && renc_same_tex(re, 0, i, tex)))
+            if ((fl >> 8 & 1) && (tmask_v >> i & 1) && !(re && renc_same_tex(re, 0, i, tex)))
                 SEND("setVertexTexture:atIndex:", pass, tex, (uint64_t)i);
-            if ((fl >> 9 & 1) && (L64(R + 0x18) >> i & 1) && !(re && renc_same_tex(re, 1, i, tex)))
+            if ((fl >> 9 & 1) && (tmask_f >> i & 1) && !(re && renc_same_tex(re, 1, i, tex)))
                 SEND("setFragmentTexture:atIndex:", pass, tex, (uint64_t)i);
         }
         /* ---- samplers ---- */
