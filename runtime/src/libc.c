@@ -258,6 +258,66 @@ void lazy_fixup(void)
 
 int lazy_contains(uint32_t addr) { return addr >= LAZY_WINDOW_BASE && addr < LAZY_WINDOW_END; }
 
+/* Reads of the card ahead of the decoders: a stream is read in vorbisfile's
+ * small pieces (a pread each, milliseconds each on the console's card: the
+ * music decoded slower than it plays), so a bank is read 64 KiB at a time
+ * into a few blocks kept for the next pieces. */
+#define LAZY_BLOCK (64u << 10)
+#define LAZY_SLOTS 6
+static struct { int blob; uint32_t off, len, used; uint8_t *buf; } lzc[LAZY_SLOTS];
+static uint32_t lzc_tick;
+static pthread_mutex_t lzc_lock = PTHREAD_MUTEX_INITIALIZER;
+static void lazy_pread(int bi, uint32_t off, uint8_t *dst, uint32_t n)
+{
+    LazyBlob *b = &lazy[bi];
+    if (n >= LAZY_BLOCK) {                     /* a big read: straight from the card */
+        ssize_t r = pread(b->fd, dst, n, (off_t)off);
+        if (r != (ssize_t)n)
+            rt_log("[lazy] read of %u bytes at %u: %zd\n", n, off, r);
+        return;
+    }
+    pthread_mutex_lock(&lzc_lock);
+    while (n) {
+        const uint32_t blk = off & ~(LAZY_BLOCK - 1);
+        int k = -1, old = 0;
+        for (int j = 0; j < LAZY_SLOTS; j++) {
+            if (lzc[j].buf && lzc[j].blob == bi && lzc[j].off == blk) {
+                k = j;
+                break;
+            }
+            if (lzc[j].used < lzc[old].used)
+                old = j;
+        }
+        if (k < 0) {                           /* the least recently used block reads this one */
+            k = old;
+            if (!lzc[k].buf)
+                lzc[k].buf = malloc(LAZY_BLOCK);
+            const uint64_t left = b->size > blk ? b->size - blk : 0;
+            const uint32_t want = left < LAZY_BLOCK ? (uint32_t)left : LAZY_BLOCK;
+            const ssize_t r = pread(b->fd, lzc[k].buf, want, (off_t)blk);
+            lzc[k].blob = bi;
+            lzc[k].off = blk;
+            lzc[k].len = r > 0 ? (uint32_t)r : 0;
+            if (r != (ssize_t)want)
+                rt_log("[lazy] read of %u bytes at %u: %zd\n", want, blk, r);
+        }
+        lzc[k].used = ++lzc_tick;
+        const uint32_t in = off - blk;
+        uint32_t take = LAZY_BLOCK - in < n ? LAZY_BLOCK - in : n;
+        if (in >= lzc[k].len)
+            take = n, memset(dst, 0, n);       /* (past the file's end) */
+        else {
+            if (take > lzc[k].len - in)
+                take = lzc[k].len - in;
+            memcpy(dst, lzc[k].buf + in, take);
+        }
+        dst += take;
+        off += take;
+        n -= take;
+    }
+    pthread_mutex_unlock(&lzc_lock);
+}
+
 /* Guest Ogg reads: window address -> file */
 int lazy_read(uint32_t addr, void *dst, uint32_t n)
 {
@@ -266,9 +326,22 @@ int lazy_read(uint32_t addr, void *dst, uint32_t n)
     for (int i = 0; i < nlazy; i++) {
         LazyBlob *b = &lazy[i];
         if (addr >= b->win && addr < b->win + b->size) {
-            ssize_t r = pread(b->fd, dst, n, (off_t)(addr - b->win));
-            if (r != (ssize_t)n)
-                rt_log("[lazy] read of %u bytes at %u: %zd\n", n, addr - b->win, r);
+            lazy_pread(i, addr - b->win, dst, n);
+            static int check = -1;               /* MINA_LAZY_CHECK: each read compared with the file's bytes */
+            if (check < 0)
+                check = getenv("MINA_LAZY_CHECK") != NULL;
+            if (check) {
+                static uint32_t reads, bad;
+                uint8_t *t = malloc(n);
+                if (t) {
+                    const ssize_t r = pread(b->fd, t, n, (off_t)(addr - b->win));
+                    if (r == (ssize_t)n && memcmp(t, dst, n) && bad++ < 8)
+                        rt_log("[lazy] cached read of %u bytes at %u differs\n", n, addr - b->win);
+                    free(t);
+                }
+                if ((++reads & 1023) == 0)
+                    rt_log("[lazy] %u reads checked, %u differ\n", reads, bad);
+            }
             return 1;
         }
     }
