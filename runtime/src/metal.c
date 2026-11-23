@@ -170,6 +170,12 @@ static void warm_shaders(void)
     int linked = 0, variants = 0;
     for (int i = 0; i < g_shader_count; i++) {
         char fam[64], fam2[64];
+        /* (the MSAA outline: the compiler faults on it with this partner; it
+         * is compiled where the pause menu first draws it) */
+        if (strstr(g_shader_names[i], "_MSAA")) {
+            rt_log("[warm] %s: skipped\n", g_shader_names[i]);
+            continue;
+        }
         name_family(g_shader_names[i], fam, sizeof fam);
         const int vert = g_shaders[i].stage == 0;
         int best = -1;
