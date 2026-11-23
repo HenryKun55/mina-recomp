@@ -198,6 +198,7 @@ typedef struct ShaderSrc {
 } ShaderSrc;
 extern const ShaderSrc g_shaders[];
 extern const int g_shader_count;
+extern const char *const g_shader_names[];    /* "cutteranim_PALETTE.frag" (the pack's names) */
 
 /* Where the renderer is (a watchdog reports it when no frame comes for seconds):
  * cheap stores at the steps of a draw */

@@ -49,11 +49,15 @@ static void shark_log(const char *msg, shark_log_level level, int line)
 #include <psp2/io/stat.h>
 #include <psp2/io/dirent.h>
 #define SHADER_CACHE "ux0:data/mina_shader_cache"
+static int seed_errors;
 static int shader_cache_seed(const char *from, const char *to)
 {
     SceUID d = sceIoDopen(from);
-    if (d < 0)
+    if (d < 0) {
+        if (seed_errors++ < 4)
+            rt_log("[shader] cache: cannot open %s (%#x)\n", from, (unsigned)d);
         return 0;
+    }
     sceIoMkdir(to, 0777);
     int copied = 0;
     SceIoDirent ent;
@@ -76,6 +80,9 @@ static int shader_cache_seed(const char *from, const char *to)
             continue;
         SceUID in = sceIoOpen(src, SCE_O_RDONLY, 0);
         SceUID out = in >= 0 ? sceIoOpen(dst, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777) : -1;
+        if ((in < 0 || out < 0) && seed_errors++ < 4)
+            rt_log("[shader] cache: %s -> %s: %#x %#x (mode %#x attr %#x)\n", src, dst, (unsigned)in, (unsigned)out,
+                   (unsigned)ent.d_stat.st_mode, (unsigned)ent.d_stat.st_attr);
         int n;
         while (out >= 0 && (n = sceIoRead(in, buf, sizeof buf)) > 0)
             sceIoWrite(out, buf, n);
@@ -89,16 +96,138 @@ static int shader_cache_seed(const char *from, const char *to)
     return copied;
 }
 
+/* MINA_WARM_SHADERS=1 (a run in Vita3K, then tools/vita/pull_shader_cache.sh):
+ * every shader of the game compiled once, with a partner of its family
+ * ("cutteranim_PALETTE.frag" with "cutteranim.vert"), and each vertex
+ * shader's batching variant: the shader cache the VPK carries then holds
+ * them all, and no compile ever holds the renderer. */
+static void link_program(MPipeline *p);
+static char *batch_vsrc(const char *src, int *rows);
+static int name_family(const char *n, char *fam, size_t cap)
+{
+    size_t k = 0;
+    while (n[k] && n[k] != '_' && n[k] != '.' && k + 1 < cap) {
+        fam[k] = n[k];
+        k++;
+    }
+    fam[k] = 0;
+    return (int)k;
+}
+/* every _DEFINE of a (the part between the family and the extension) is in b */
+static int defines_within(const char *a, const char *b)
+{
+    char fa[64], fb[64];
+    const int la = name_family(a, fa, sizeof fa), lb = name_family(b, fb, sizeof fb);
+    const char *ea = strrchr(a, '.'), *eb = strrchr(b, '.');
+    if (!ea || !eb)
+        return 0;
+    for (const char *t = a + la; t < ea && *t == '_';) {
+        const char *u = strchr(t + 1, '_');
+        if (!u || u > ea)
+            u = ea;
+        char tok[64];
+        const size_t tl = (size_t)(u - t);
+        if (tl >= sizeof tok)
+            return 0;
+        memcpy(tok, t, tl);            /* "_PALETTE" */
+        tok[tl] = 0;
+        const char *hit = b + lb;
+        int found = 0;
+        while ((hit = strstr(hit, tok)) != NULL && hit < eb) {
+            if (hit[tl] == '_' || hit + tl == eb) {
+                found = 1;
+                break;
+            }
+            hit += tl;
+        }
+        if (!found)
+            return 0;
+        t = u;
+    }
+    return 1;
+}
+static void warm_link(int vs, int fs, const char *vsrc, int rows)
+{
+    MPipeline t;
+    memset(&t, 0, sizeof t);
+    t.vs = vs;
+    t.fs = fs;
+    t.vsrc_override = vsrc;
+    t.batch_rows = rows;
+    gpu_lock();
+    link_program(&t);
+    if (t.vao)
+        glDeleteVertexArrays(1, &t.vao);
+    gpu_unlock();
+}
+static void warm_shaders(void)
+{
+    if (!g_shader_names[0] || !g_shader_names[0][0]) {
+        rt_log("[warm] no shader names (air2glsl did not find them)\n");
+        return;
+    }
+    const uint64_t t0 = sceKernelGetProcessTimeWide();
+    int linked = 0, variants = 0;
+    for (int i = 0; i < g_shader_count; i++) {
+        char fam[64], fam2[64];
+        name_family(g_shader_names[i], fam, sizeof fam);
+        const int vert = g_shaders[i].stage == 0;
+        int best = -1;
+        size_t best_len = 0;
+        for (int j = 0; j < g_shader_count; j++) {
+            if (g_shaders[j].stage == g_shaders[i].stage)
+                continue;
+            name_family(g_shader_names[j], fam2, sizeof fam2);
+            if (strcmp(fam, fam2))
+                continue;
+            const char *v = vert ? g_shader_names[i] : g_shader_names[j], *f = vert ? g_shader_names[j] : g_shader_names[i];
+            const int fits = defines_within(v, f);
+            if (best < 0 || (fits && (vert ? best_len == 0 : strlen(v) > best_len))) {
+                best = j;
+                best_len = fits ? (vert ? 1 : strlen(v)) : 0;
+            }
+        }
+        if (best < 0) {
+            rt_log("[warm] %s: no partner\n", g_shader_names[i]);
+            continue;
+        }
+        const int vs = vert ? i : best, fs = vert ? best : i;
+        warm_link(vs, fs, NULL, 0);
+        linked++;
+        if (vert) {
+            int rows = 0;
+            char *src = batch_vsrc(g_shaders[vs].glsl, &rows);
+            if (src) {
+                warm_link(vs, fs, src, rows);
+                free(src);
+                variants++;
+            }
+        }
+        rt_log("[warm] %d/%d %s with %s\n", i + 1, g_shader_count, g_shader_names[vs], g_shader_names[fs]);
+    }
+    rt_log("[warm] %d pairs and %d batching variants linked in %.1f s\n", linked, variants,
+           (sceKernelGetProcessTimeWide() - t0) / 1e6);
+}
+
 void metal_vita_init(void)
 {
     void mem_free_report(void);
     mem_free_report();           /* before vitaGL takes its share */
-    rt_log("[shader] cache: %d compiled shaders copied from the VPK\n",
-           shader_cache_seed("app0:shader_cache", SHADER_CACHE));
-    vglSetShaderCachePath(SHADER_CACHE);
+    const int copied = shader_cache_seed("app0:shader_cache", SHADER_CACHE);
+    /* none on the card (the copy failed): vitaGL reads the VPK's own (app0:
+     * is read-only: a shader the VPK lacks is compiled each run) */
+    SceIoStat ast;
+    const int in_vpk = sceIoGetstat("app0:shader_cache/v2/v", &ast) >= 0;
+    const int failed = in_vpk && copied == 0 && seed_errors > 0;
+    const char *cache = failed ? "app0:shader_cache" : SHADER_CACHE;
+    rt_log("[shader] cache: %d compiled shaders copied from the VPK (%d errors, in the vpk %d): %s\n", copied,
+           seed_errors, in_vpk, cache);
+    vglSetShaderCachePath(cache);
     vglInitExtended(0x800000, 960, 544, 0x1000000, SCE_GXM_MULTISAMPLE_NONE);
     shark_install_log_cb(shark_log);
     shark_set_warnings_level(SHARK_WARN_HIGH);
+    if (getenv("MINA_WARM_SHADERS"))
+        warm_shaders();
     static const char *names[] = { "vram", "ram", "phycont", "cdlg", "newlib" };
     for (int k = 0; k < 5; k++)
         rt_log("[vgl] %s: %.1f of %.1f MiB free\n", names[k], vglMemFree((vglMemType)k) / 1048576.0,

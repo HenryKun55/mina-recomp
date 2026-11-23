@@ -1263,6 +1263,15 @@ def main():
             int(frag and depth)))
     lines.append("};")
     lines.append("const int g_shader_count = %d;" % len(entries))
+    # each one's name in the pack (shaders/msl/<name>.bin, in the metallibs' order):
+    # the runtime pairs a family's shaders by it (MINA_WARM_SHADERS)
+    names = [m.group(1).decode() for m in re.finditer(rb"shaders/msl/([A-Za-z0-9_.]+)\.bin", open(args.pak, "rb").read())]
+    if len(names) != len(libs):
+        names = []
+    lines.append("const char *const g_shader_names[] = {")
+    for h, stage, glsl, i, depth in entries:
+        lines.append('    "%s",' % (names[i] if names else ""))
+    lines.append("};")
     with open(args.out, "w") as f:
         f.write("\n".join(lines) + "\n")
     print("%d shaders translated, %d errors" % (len(entries), errors))
