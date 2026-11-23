@@ -2615,6 +2615,16 @@ static int watchdog_entry(SceSize args, void *argp)
             rt_log("[watchdog] no frame for %d s: renderer stage %d, pipeline %p (vs %d fs %d ntex %d, k %d), %u draws, "
                    "%u frames; game thread stage %d\n", still, g_rdbg.stage, g_rdbg.pipe, g_rdbg.vs, g_rdbg.fs,
                    g_rdbg.ntex, g_rdbg.k, g_rdbg.draws, n, g_game_stage);
+            {
+                extern volatile int vgl_swap_stage;
+                extern SceUID gc_mutex[2];
+                SceKernelSemaInfo a = { .size = sizeof a }, b = { .size = sizeof b };
+                sceKernelGetSemaInfo(gc_mutex[0], &a);
+                sceKernelGetSemaInfo(gc_mutex[1], &b);
+                rt_log("[watchdog]   vitaGL swap stage %d (1 display queue, 2 GC handshake, 3 out of GPU memory); "
+                       "GC push %d (%d waiting), pull %d (%d waiting)\n", vgl_swap_stage, a.currentCount,
+                       a.numWaitThreads, b.currentCount, b.numWaitThreads);
+            }
             if (g_rdbg.pipe) {
                 const MPipeline *p = g_rdbg.pipe;
                 rt_log("[watchdog]   pipeline now: vs %d fs %d ntex %d prog %u\n", p->vs, p->fs, p->ntex, p->prog);

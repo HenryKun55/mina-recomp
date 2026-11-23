@@ -1,0 +1,61 @@
+diff --git a/source/gxm.c b/source/gxm.c
+index 4cbb40b..72d3080 100644
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -111,6 +111,7 @@ int frame_elem_purge_idx = 0; // Index for currently populatable purge list elem
+ int frame_rt_purge_idx = 0; // Index for currently populatable purge list rendertarget
+ static int frame_purge_clean_idx = 1;
+ SceUID gc_mutex[2];
++volatile int vgl_swap_stage; // where vglSwapBuffers is (for a watchdog): 1 display queue, 2 GC handshake, 3 unsafe GPU alloc
+ static int gc_thread_priority = 0x10000100;
+ static int gc_thread_affinity = 0;
+ static uint8_t gxm_display_rt_size = 1; // Number of scenes per frame to use for the display rendertarget
+@@ -931,7 +932,9 @@ void vglSwapBuffers(GLboolean has_commondialog) {
+ #ifdef HAVE_PROFILING
+ 		tick = sceKernelGetProcessTimeLow();
+ #endif
++		vgl_swap_stage = 1;
+ 		sceGxmDisplayQueueAddEntry(gxm_sync_objects[gxm_front_buffer_index], gxm_sync_objects[gxm_back_buffer_index], &queue_cb_data);
++		vgl_swap_stage = 0;
+ #ifdef HAVE_PROFILING
+ 		gpu_stall_cnt += sceKernelGetProcessTimeLow() - tick;
+ #endif
+@@ -967,8 +970,10 @@ void vglSwapBuffers(GLboolean has_commondialog) {
+ #ifdef HAVE_SINGLE_THREADED_GC
+ 	garbage_collector(0, NULL);
+ #else
++	vgl_swap_stage = 2;
+ 	sceKernelWaitSema(gc_mutex[1], 1, NULL);
+ 	sceKernelSignalSema(gc_mutex[0], 1);
++	vgl_swap_stage = 0;
+ #endif
+ }
+ 
+diff --git a/source/utils/gpu_utils.c b/source/utils/gpu_utils.c
+index 4464db5..051eac8 100644
+--- a/source/utils/gpu_utils.c
++++ b/source/utils/gpu_utils.c
+@@ -153,6 +153,7 @@ static inline __attribute__((always_inline)) uint32_t vgl_cache_old_textures(siz
+ #endif
+ 
+ int unsafe_allocator_counter = 0;
++extern volatile int vgl_swap_stage;
+ void *gpu_alloc_mapped_aligned_unsafe_for_cpu(size_t alignment, size_t size) {
+ 	// Performing a garbage collection cycle prior to attempting to allocate the memory again
+ 	unsafe_allocator_counter++;
+@@ -162,6 +163,7 @@ void *gpu_alloc_mapped_aligned_unsafe_for_cpu(size_t alignment, size_t size) {
+ #if defined(HAVE_SINGLE_THREADED_GC) && !defined(HAVE_PTHREAD)
+ 	garbage_collector(0, NULL);
+ #else
++	vgl_swap_stage = 3;
+ 	sceKernelWaitSema(gc_mutex[1], 1, NULL);
+ 	sceKernelSignalSema(gc_mutex[0], 1);
+ 	sceKernelDelayThread(1000000);
+@@ -188,6 +190,7 @@ void *gpu_alloc_mapped_aligned_unsafe_for_gpu(size_t alignment, size_t size) {
+ #if defined(HAVE_SINGLE_THREADED_GC) && !defined(HAVE_PTHREAD)
+ 	garbage_collector(0, NULL);
+ #else
++	vgl_swap_stage = 3;
+ 	sceKernelWaitSema(gc_mutex[1], 1, NULL);
+ 	sceKernelSignalSema(gc_mutex[0], 1);
+ 	sceKernelDelayThread(1000000);
