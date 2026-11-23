@@ -5021,3 +5021,99 @@ void nat__ZN9ycTexture15AllocStagingBufEj(Ctx *c)
     rt_st64(GP(S + 24), 0);
     c->x[0] = S;
 }
+
+/* ---- ycPaletteTexture color lookups (linear searches, ~15% of the game thread on
+ * hub_overworld_south: recompiled, each color compare is four byte loads) ----
+ * A palette's colors: its own (+0x18, count +0x28), or with a source (+0, flag +0x3e)
+ * the source's (+0x10 -> +0x10 colors, +4 count). MINA_PAL_CHECK=1 runs the original
+ * too and reports differences. */
+void f_1b5f8c_orig(Ctx *c);
+void f_1b4758_orig(Ctx *c);
+static int pal_check = -1;
+static inline void pal_colors(uint8_t *gm_, uint64_t P, uint32_t *n, uint32_t *colors)
+{
+    const uint64_t src = L64(P);
+    if (src && L8(P + 0x3e)) {
+        const uint64_t d = L64(src + 0x10);
+        *n = L32(d + 4);
+        *colors = (uint32_t)L64(d + 0x10);
+    } else {
+        *n = L32(P + 0x28);
+        *colors = (uint32_t)L64(P + 0x18);
+    }
+}
+static uint32_t pal_find_from_base(uint8_t *gm_, uint64_t P, uint64_t color, uint64_t B)
+{
+    uint32_t n, cols, bn, bcols;
+    pal_colors(gm_, P, &n, &cols);
+    pal_colors(gm_, B, &bn, &bcols);
+    const uint32_t want = L32(color);
+    const uint8_t *bc = GP(bcols);
+    for (uint32_t i = 0; i < bn; i++) {
+        uint32_t v;
+        memcpy(&v, bc + 4 * i, 4);
+        if (v != want)
+            continue;
+        if (i < n)
+            return L32(cols + 4 * i);
+        /* past this palette's end: wrapped into 1..n-1 (udiv by 0 gives 0 on arm64) */
+        const uint32_t m = n - 1;
+        const uint32_t q = m ? i / m : 0;
+        return L32(cols + 4 * (i - q * m + 1));
+    }
+    return want;
+}
+static uint32_t pal_get_index(uint8_t *gm_, uint64_t P, uint32_t color, uint32_t fuzzy)
+{
+    uint32_t n, cols;
+    pal_colors(gm_, P, &n, &cols);
+    const uint8_t *pc = GP(cols);
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t v;
+        memcpy(&v, pc + 4 * i, 4);
+        if (v == color)
+            return i;
+    }
+    if (!fuzzy || (color >> 24) == 0xff)
+        return 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t v;
+        memcpy(&v, pc + 4 * i, 4);
+        if (((v ^ color) & 0xffffff) == 0)
+            return i;
+    }
+    return 0;
+}
+static void pal_report(const char *what, uint32_t got, uint32_t want)
+{
+    static unsigned calls, bad;
+    calls++;
+    if (got != want && bad++ < 16)
+        rt_log("[verify] %s: native %#x, original %#x\n", what, got, want);
+    if ((calls & 0xffff) == 0)
+        rt_log("[verify] palette lookups: %u checked, %u differ\n", calls, bad);
+}
+void nat__ZNK16ycPaletteTexture12FindFromBaseERK7ycColorPKS_(Ctx *c)
+{
+    GM_BEGIN;
+    const uint32_t r = pal_find_from_base(gm_, c->x[0], c->x[1], c->x[2]);
+    if (pal_check < 0)
+        pal_check = getenv("MINA_PAL_CHECK") != NULL;
+    if (pal_check) {
+        f_1b5f8c_orig(c);
+        pal_report("FindFromBase", r, (uint32_t)c->x[0]);
+    }
+    c->x[0] = r;
+}
+void nat__ZNK16ycPaletteTexture8GetIndexE7ycColorb(Ctx *c)
+{
+    GM_BEGIN;
+    const uint32_t r = pal_get_index(gm_, c->x[0], (uint32_t)c->x[1], (uint32_t)c->x[2]);
+    if (pal_check < 0)
+        pal_check = getenv("MINA_PAL_CHECK") != NULL;
+    if (pal_check) {
+        f_1b4758_orig(c);
+        pal_report("GetIndex", r, (uint32_t)c->x[0]);
+    }
+    c->x[0] = r;
+}
