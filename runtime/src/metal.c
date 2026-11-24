@@ -980,6 +980,11 @@ void metal_buffers_report(void)
 static uint32_t stage_pool[STAGE_POOL];
 static int nstage_pool;
 static pthread_mutex_t stage_lock = PTHREAD_MUTEX_INITIALIZER;
+/* the blocks stage_alloc made: only those go to the pool (a buffer's memory may
+ * be the game's own data, read-only on the console: zeroing it crashed there) */
+#define STAGE_KNOWN 64
+static uint32_t stage_known[STAGE_KNOWN];
+static int nstage_known;
 static uint32_t stage_alloc(uint32_t len)
 {
     if (len == TILE_STAGING_LEN) {
@@ -990,15 +995,30 @@ static uint32_t stage_alloc(uint32_t len)
             memset(G(a), 0, len);      /* whole: the game may write through an old pointer */
             return a;
         }
+        const uint32_t b = gcalloc(1, len);
+        if (b) {
+            pthread_mutex_lock(&stage_lock);
+            if (nstage_known < STAGE_KNOWN)
+                stage_known[nstage_known++] = b;
+            pthread_mutex_unlock(&stage_lock);
+        }
+        return b;
     }
     return gcalloc(1, len ? len : 16);
+}
+static int stage_is_known(uint32_t a)
+{
+    for (int i = 0; i < nstage_known; i++)
+        if (stage_known[i] == a)
+            return 1;
+    return 0;
 }
 /* used: the bytes up to the last nonzero one (the rest is zero already) */
 static void stage_free(uint32_t a, uint32_t len, uint32_t used)
 {
     if (len == TILE_STAGING_LEN) {
         pthread_mutex_lock(&stage_lock);
-        const int room = nstage_pool < STAGE_POOL;
+        const int room = nstage_pool < STAGE_POOL && stage_is_known(a);
         pthread_mutex_unlock(&stage_lock);
         if (room) {
             memset(G(a), 0, used);
