@@ -109,8 +109,45 @@ static void warp_requests(Ctx *c)
 static void phys_stats_tick(void);
 static int g_in_fixed;     /* in Game::FixedUpdate (MINA_RPU_STATS: where the passes update) */
 volatile int g_game_stage; /* the watchdog's view: 2 in Game::FixedUpdate, 1 in Game::Update */
+/* MINA_FPS: a game update longer than 40 ms logs where its time went: files
+ * (the last one opened), texture uploads, waiting for the GPU lock */
+extern uint64_t g_spk_io_us[32], g_spk_lock_us[32], g_spk_tex_us[32];
+extern uint32_t g_spk_io_n[32];
+extern char g_spk_io_file[32][64];
+typedef struct { uint64_t t, io, lock, tex; uint32_t n; } Spk;
+static int spk_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("MINA_FPS") != NULL;
+    return on;
+}
+static void spk_take(Ctx *c, Spk *k)
+{
+    const uint32_t id = c->thread_id < 32 ? c->thread_id : 0;
+    k->t = now_us();
+    k->io = g_spk_io_us[id];
+    k->n = g_spk_io_n[id];
+    k->lock = g_spk_lock_us[id];
+    k->tex = g_spk_tex_us[id];
+}
+static void spk_check(Ctx *c, const Spk *k, const char *what)
+{
+    const uint64_t dt = now_us() - k->t;
+    if (dt < 40000)
+        return;
+    const uint32_t id = c->thread_id < 32 ? c->thread_id : 0;
+    rt_log("[spike] %s %.1f ms: files %.1f ms (%u calls, last %s), texture uploads %.1f ms, GPU lock %.1f ms\n", what,
+           dt / 1000.0, (g_spk_io_us[id] - k->io) / 1000.0, g_spk_io_n[id] - k->n,
+           g_spk_io_n[id] != k->n ? g_spk_io_file[id] : "-", (g_spk_tex_us[id] - k->tex) / 1000.0,
+           (g_spk_lock_us[id] - k->lock) / 1000.0);
+}
 void nat__ZN4Game11FixedUpdateEv(Ctx *c)
 {
+    Spk spk;
+    const int spk_ = spk_on();
+    if (spk_)
+        spk_take(c, &spk);
     warp_requests(c);
     uint64_t t0 = now_us();
     uint32_t before = recalcs_total;
@@ -121,6 +158,8 @@ void nat__ZN4Game11FixedUpdateEv(Ctx *c)
     g_game_stage = 0;
     g_in_fixed = 0;
     g_fixed_us += now_us() - t0;
+    if (spk_)
+        spk_check(c, &spk, "fixed update");
     static int heavy;          /* consecutive fixed updates moving thousands of transforms */
     heavy = recalcs_total - before > 1500 ? heavy + 1 : 0;
     if (heavy == 20 && !g_in_play) {
@@ -134,11 +173,17 @@ void f_9a0638_orig(Ctx *c);
 void nat__ZN4Game6UpdateEf(Ctx *c)
 {
     uint64_t t0 = now_us();
+    Spk spk;
+    const int spk_ = spk_on();
+    if (spk_)
+        spk_take(c, &spk);
     g_updates++;
     g_game_stage = 1;
     f_9a0638_orig(c);
     g_game_stage = 0;
     g_update_us += now_us() - t0;
+    if (spk_)
+        spk_check(c, &spk, "update (frame, with its fixed updates)");
 }
 
 /* ---- ycTransform ----------------------------------------------------------------------

@@ -735,7 +735,41 @@ const char *host_path(const char *p, char *buf, size_t cap)
     return buf;
 }
 
+/* MINA_FPS: time each guest thread spends in file calls, and the last file it
+ * opened (the [spike] lines of long game updates) */
+uint64_t g_spk_io_us[32];
+uint32_t g_spk_io_n[32];
+char g_spk_io_file[32][64];
+static uint64_t io_now(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000u + (uint64_t)t.tv_nsec / 1000u;
+}
+static inline void io_note(Ctx *c, uint64_t t0, const char *path)
+{
+    const uint32_t id = c->thread_id;
+    if (id >= 32)
+        return;
+    g_spk_io_us[id] += io_now() - t0;
+    g_spk_io_n[id]++;
+    if (path) {
+        const size_t n = strlen(path);
+        snprintf(g_spk_io_file[id], sizeof g_spk_io_file[id], "%s", n > 63 ? path + n - 63 : path);
+    }
+}
+static void imp_fopen_(Ctx *c);
 static void imp_fopen(Ctx *c)
+{
+    const uint64_t t0 = io_now();
+    char pb[1024];
+    const char *path = host_path(gstr(A0), pb, sizeof pb);
+    char keep[256];
+    snprintf(keep, sizeof keep, "%s", path);
+    imp_fopen_(c);
+    io_note(c, t0, keep);
+}
+static void imp_fopen_(Ctx *c)
 {
     char pb[1024];
     const char *path = host_path(gstr(A0), pb, sizeof pb);
@@ -772,7 +806,14 @@ static void imp_fclose(Ctx *c)
     if (f) gfree((uint32_t)A0);
     RET((int64_t)r);
 }
+static void imp_fread_(Ctx *c);
 static void imp_fread(Ctx *c)
+{
+    const uint64_t t0 = io_now();
+    imp_fread_(c);
+    io_note(c, t0, NULL);
+}
+static void imp_fread_(Ctx *c)
 {
     FILE *f = host_file(A3);
     if (!f) {
@@ -848,7 +889,9 @@ static void imp_stat(Ctx *c)
 {
     struct stat st;
     char pb[1024];
+    const uint64_t t0 = io_now();
     int r = stat(host_path(gstr(A0), pb, sizeof pb), &st);
+    io_note(c, t0, pb);
     if (r == 0) put_stat((uint32_t)A1, &st);
     else set_errno(errno);
     RET((int64_t)r);

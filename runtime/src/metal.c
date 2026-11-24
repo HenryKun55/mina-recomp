@@ -242,9 +242,26 @@ void metal_vita_init(void)
 }
 #endif
 
+uint64_t g_spk_lock_us[32], g_spk_tex_us[32];
+static uint64_t spk_now(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000u + (uint64_t)t.tv_nsec / 1000u;
+}
+static inline uint32_t spk_tid(void)
+{
+    Ctx *thread_ctx(void);
+    Ctx *tc = thread_ctx();
+    return tc && tc->thread_id < 32 ? tc->thread_id : 0;
+}
 void gpu_lock(void)
 {
-    pthread_mutex_lock(&gpu_mutex);
+    if (pthread_mutex_trylock(&gpu_mutex) != 0) {
+        const uint64_t t0 = spk_now();
+        pthread_mutex_lock(&gpu_mutex);
+        g_spk_lock_us[spk_tid()] += spk_now() - t0;
+    }
 #if defined(__vita__)
 #if !defined(MINA_NULL_GL)
 #endif
@@ -2218,8 +2235,10 @@ static void t_replaceRegion(Ctx *c)
     MTexture *t = objc_host(SELF);
     uint64_t r = MARG(0);   /* MTLRegion: origin{x,y,z}, size{w,h,d} */
     gpu_lock();
+    const uint64_t t0 = spk_now();
     tex_upload(t, (uint32_t)rt_ld64(G(r)), (uint32_t)rt_ld64(G(r + 8)), (uint32_t)rt_ld64(G(r + 24)),
                (uint32_t)rt_ld64(G(r + 32)), (uint32_t)MARG(1), 0, G(MARG(2)), (uint32_t)MARG(3));
+    g_spk_tex_us[spk_tid()] += spk_now() - t0;
     gpu_unlock();
 }
 /* getBytes:bytesPerRow:fromRegion:mipmapLevel: */
