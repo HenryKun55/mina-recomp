@@ -14,6 +14,7 @@
 
 #include <SDL.h>
 #include <pthread.h>
+#include <malloc.h>
 #include <string.h>
 
 SDL_Window *sdl_main_window(void);
@@ -968,6 +969,58 @@ void metal_buffers_report(void)
 }
 #endif
 
+#define TILE_STAGING_LEN 0x13ffb0u   /* ycGpuBuffer of a tile level (WorldRegion::StartRunning) */
+/* The tile levels' staging buffers (1.25 MiB, given back after their upload
+ * and made again when asked for) went to newlib's heap and back all the time:
+ * with the heap ~90% used, its free space ended in thousands of pieces and a
+ * 1.25 MiB block could not be found (the console's crash: 23 MiB free in
+ * 20745 pieces). Their memory stays in a pool instead (up to STAGE_POOL
+ * blocks), all zero: only the written part is cleared on the way in. */
+#define STAGE_POOL 16
+static uint32_t stage_pool[STAGE_POOL];
+static int nstage_pool;
+static pthread_mutex_t stage_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t stage_alloc(uint32_t len)
+{
+    if (len == TILE_STAGING_LEN) {
+        pthread_mutex_lock(&stage_lock);
+        const uint32_t a = nstage_pool ? stage_pool[--nstage_pool] : 0;
+        pthread_mutex_unlock(&stage_lock);
+        if (a)
+            return a;
+    }
+    return gcalloc(1, len ? len : 16);
+}
+/* used: the bytes up to the last nonzero one (the rest is zero already) */
+static void stage_free(uint32_t a, uint32_t len, uint32_t used)
+{
+    if (len == TILE_STAGING_LEN) {
+        pthread_mutex_lock(&stage_lock);
+        const int room = nstage_pool < STAGE_POOL;
+        pthread_mutex_unlock(&stage_lock);
+        if (room) {
+            memset(G(a), 0, used);
+            pthread_mutex_lock(&stage_lock);
+            if (nstage_pool < STAGE_POOL) {
+                stage_pool[nstage_pool++] = a;
+                a = 0;
+            }
+            pthread_mutex_unlock(&stage_lock);
+            if (!a)
+                return;
+        }
+    }
+    gfree(a);
+}
+static uint32_t used_len(uint32_t a, uint32_t len)
+{
+    const uint8_t *m = G(a);
+    while (len >= 8 && rt_ld64((const void *)(m + len - 8)) == 0)
+        len -= 8;
+    while (len && m[len - 1] == 0)
+        len--;
+    return len;
+}
 static void buf_dealloc(void *h)
 {
     MBuffer *b = h;
@@ -979,10 +1032,10 @@ static void buf_dealloc(void *h)
     }
     free(b->shadow);
     free(b->saved);
-    if (!b->fresh && !b->gpu_only)
-        gfree(b->contents);
+    if (!b->fresh && !b->gpu_only && b->contents)
+        stage_free(b->contents, b->length,
+                   b->length == TILE_STAGING_LEN ? used_len(b->contents, b->length) : 0);
 }
-#define TILE_STAGING_LEN 0x13ffb0u   /* ycGpuBuffer of a tile level (WorldRegion::StartRunning) */
 static void d_newBufferWithLength(Ctx *c)
 {
     uint64_t o = objc_new_object(&cls_Buffer);
@@ -1037,7 +1090,7 @@ static void d_newBufferWithLength(Ctx *c)
         b->fresh = 1;
     } else
 #endif
-    b->contents = gcalloc(1, b->length ? b->length : 16);
+    b->contents = stage_alloc(b->length);
     buf_track(b, 1);
     RET(o);
 }
@@ -2092,7 +2145,7 @@ static void d_newRenderPipelineState(Ctx *c)
 uint32_t metal_buf_mem(MBuffer *b)
 {
     if (!b->contents && !b->gpu_only) {
-        b->contents = gcalloc(1, b->length ? b->length : 16);
+        b->contents = stage_alloc(b->length);
         if (!b->contents)
             rt_fatal("metal: no guest memory for a %u-byte buffer", b->length);
         if (b->saved)
@@ -2110,11 +2163,7 @@ void metal_buf_give_back(MBuffer *b)
     if (!b->contents || b->gpu_only || b->fresh || b->keep_contents)
         return;
     const uint8_t *m = G(b->contents);
-    uint32_t len = b->length;
-    while (len >= 8 && rt_ld64((const void *)(m + len - 8)) == 0)
-        len -= 8;
-    while (len && m[len - 1] == 0)
-        len--;
+    const uint32_t len = used_len(b->contents, b->length);
     if (getenv("MINA_STAGINGLOG")) {
         uint32_t first = 0;
         while (first < len && m[first] == 0)
@@ -2130,7 +2179,7 @@ void metal_buf_give_back(MBuffer *b)
     b->saved = keepb;
     b->saved_len = len;
     b->given_back = 1;
-    gfree(b->contents);
+    stage_free(b->contents, b->length, len);
     b->contents = 0;
 }
 
@@ -2870,6 +2919,16 @@ void metal_present(uint64_t drawable)
                     void mlock_report(int frames);
                     mlock_report(frames);
                 }
+#if defined(__vita__)
+                {   /* every 30 s: the guest heap (newlib's) and the staging pool */
+                    static int every;
+                    if (++every % 15 == 0) {
+                        struct mallinfo mi = mallinfo();
+                        rt_log("[mem] heap %.1f MiB, free %.1f MiB in %d pieces; %d staging blocks pooled\n",
+                               mi.arena / 1048576.0, mi.fordblks / 1048576.0, mi.ordblks, nstage_pool);
+                    }
+                }
+#endif
                 void rt_log_flush(void);
                 rt_log_flush();
                 g_draw_calls = 0;
