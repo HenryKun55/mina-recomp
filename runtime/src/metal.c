@@ -2163,8 +2163,39 @@ static void d_newRenderPipelineState(Ctx *c)
 
 /* ---- buffers, textures, others: properties ------------------------------------------------- */
 
+/* Staging memory changes hands under this lock: given back (by the game thread
+ * making the next staging buffer, or by the renderer after an upload), made
+ * again, read for an upload. The game builds its next frame while the renderer
+ * draws (the frame slack): a buffer given back in the middle of its upload sent
+ * the GPU zeros or another region's tiles (the console: "the map changed"). */
+static pthread_mutex_t give_lock;
+static pthread_once_t give_once = PTHREAD_ONCE_INIT;
+static void give_init(void)
+{
+    pthread_mutexattr_t a;
+    pthread_mutexattr_init(&a);
+    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&give_lock, &a);
+}
+void metal_staging_lock(void)
+{
+    pthread_once(&give_once, give_init);
+    pthread_mutex_lock(&give_lock);
+}
+void metal_staging_unlock(void) { pthread_mutex_unlock(&give_lock); }
+
 /* a staging buffer's memory, made again with the bytes it had when given back */
+uint32_t metal_buf_mem_(MBuffer *b);
 uint32_t metal_buf_mem(MBuffer *b)
+{
+    if (b->contents || b->gpu_only)
+        return b->contents;
+    metal_staging_lock();
+    const uint32_t r = metal_buf_mem_(b);
+    metal_staging_unlock();
+    return r;
+}
+uint32_t metal_buf_mem_(MBuffer *b)
 {
     if (!b->contents && !b->gpu_only) {
         b->contents = stage_alloc(b->length);
@@ -2180,7 +2211,14 @@ uint32_t metal_buf_mem(MBuffer *b)
     return b->contents;
 }
 
+static void metal_buf_give_back_(MBuffer *b);
 void metal_buf_give_back(MBuffer *b)
+{
+    metal_staging_lock();
+    metal_buf_give_back_(b);
+    metal_staging_unlock();
+}
+static void metal_buf_give_back_(MBuffer *b)
 {
     if (!b->contents || b->gpu_only || b->fresh || b->keep_contents)
         return;
@@ -2208,6 +2246,7 @@ void metal_buf_give_back(MBuffer *b)
 static void b_contents(Ctx *c)
 {
     MBuffer *b = objc_host(SELF);
+    metal_staging_lock();
     b->contents_asked++;
     if (!b->contents && !b->gpu_only) {
         /* the game writes through this pointer whenever: never given back again */
@@ -2220,7 +2259,9 @@ static void b_contents(Ctx *c)
         }
         b->keep_contents = 1;
     }
-    RET(metal_buf_mem(b));
+    const uint32_t r = metal_buf_mem(b);
+    metal_staging_unlock();
+    RET(r);
 }
 static void b_length(Ctx *c) { RET(((MBuffer *)objc_host(SELF))->length); }
 static void b_didModifyRange(Ctx *c) { (void)c; }

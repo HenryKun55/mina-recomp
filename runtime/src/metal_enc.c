@@ -2240,9 +2240,12 @@ static void be_copyBufferToTexture(Ctx *c)
     uint64_t sp = c->sp;
     uint32_t slice = (uint32_t)rt_ld64(G(sp)), level = (uint32_t)rt_ld64(G(sp + 8));
     uint64_t origin = rt_ld64(G(sp + 16));
+    void metal_staging_lock(void), metal_staging_unlock(void);
+    metal_staging_lock();       /* not given back while it is read */
     metal_tex_upload(t, (uint32_t)rt_ld64(G(origin)), (uint32_t)rt_ld64(G(origin + 8)), (uint32_t)rt_ld64(G(size)),
                      (uint32_t)rt_ld64(G(size + 8)), level, slice, G(metal_buf_mem(b) + (uint32_t)MARG(1)),
                      (uint32_t)MARG(2));
+    metal_staging_unlock();
 }
 
 /* copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toTexture:destinationSlice:
@@ -2413,6 +2416,7 @@ static void gpu_buffer_write(MBuffer *d, uint32_t off, const void *src, uint32_t
         memcpy(d->shadow + off, src, n);
 }
 
+static void be_copy_to_gpu(MBuffer *s, MBuffer *d, uint32_t so, uint32_t dof, uint32_t n);
 static void be_copyBuffer(Ctx *c)
 {
     MBuffer *s = objc_host(MARG(0)), *d = objc_host(MARG(2));
@@ -2426,6 +2430,17 @@ static void be_copyBuffer(Ctx *c)
         return;
     }
     if (d->gpu_only) {
+        void metal_staging_lock(void), metal_staging_unlock(void);
+        metal_staging_lock();
+        be_copy_to_gpu(s, d, so, dof, n);
+        metal_staging_unlock();
+    } else
+        memmove(G(metal_buf_mem(d) + dof), G(metal_buf_mem(s) + so), n);
+}
+/* (with the staging lock) */
+static void be_copy_to_gpu(MBuffer *s, MBuffer *d, uint32_t so, uint32_t dof, uint32_t n)
+{
+    {
         if (!s->contents && s->given_back) {
             /* given back: uploaded again from its saved bytes (ycGpuBuffer keeps
              * its staging buffers to fill its GPU buffer again) */
@@ -2447,8 +2462,7 @@ static void be_copyBuffer(Ctx *c)
             keep = getenv("MINA_KEEP_STAGING") != NULL;
         if (!keep && so == 0 && n == s->length && !s->fresh && !s->keep_contents)
             metal_buf_give_back(s);
-    } else
-        memmove(G(metal_buf_mem(d) + dof), G(metal_buf_mem(s) + so), n);
+    }
 }
 /* fillBuffer:range:value: (NSRange in x3/x4) */
 static void be_fillBuffer(Ctx *c)
