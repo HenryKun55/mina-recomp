@@ -5282,38 +5282,53 @@ static inline void pal_colors(uint8_t *gm_, uint64_t P, uint32_t *n, uint32_t *c
         *colors = (uint32_t)L64(P + 0x18);
     }
 }
+/* the first i < n with a[i] == x (n when none): 8 colors a step with NEON (the
+ * byte-wise compares of the recompiled code, then a word loop, were ~19% of the
+ * game thread on hub_overworld_south: palettes of ~85 colors, found after ~40) */
+static inline uint32_t find_u32(const uint8_t *a, uint32_t n, uint32_t x)
+{
+    uint32_t i = 0;
+    const uint32x4_t vx = vdupq_n_u32(x);
+    for (; i + 8 <= n; i += 8) {
+        const uint32x4_t e0 = vceqq_u32(vreinterpretq_u32_u8(vld1q_u8(a + 4 * i)), vx);
+        const uint32x4_t e1 = vceqq_u32(vreinterpretq_u32_u8(vld1q_u8(a + 4 * i + 16)), vx);
+        const uint32x4_t o = vorrq_u32(e0, e1);
+        const uint32x2_t r = vorr_u32(vget_low_u32(o), vget_high_u32(o));
+        if (vget_lane_u32(vpmax_u32(r, r), 0))
+            break;
+    }
+    for (; i < n; i++) {
+        uint32_t v;
+        memcpy(&v, a + 4 * i, 4);
+        if (v == x)
+            return i;
+    }
+    return n;
+}
 static uint32_t pal_find_from_base(uint8_t *gm_, uint64_t P, uint64_t color, uint64_t B)
 {
     uint32_t n, cols, bn, bcols;
     pal_colors(gm_, P, &n, &cols);
     pal_colors(gm_, B, &bn, &bcols);
     const uint32_t want = L32(color);
-    const uint8_t *bc = GP(bcols);
-    for (uint32_t i = 0; i < bn; i++) {
-        uint32_t v;
-        memcpy(&v, bc + 4 * i, 4);
-        if (v != want)
-            continue;
-        if (i < n)
-            return L32(cols + 4 * i);
-        /* past this palette's end: wrapped into 1..n-1 (udiv by 0 gives 0 on arm64) */
-        const uint32_t m = n - 1;
-        const uint32_t q = m ? i / m : 0;
-        return L32(cols + 4 * (i - q * m + 1));
-    }
-    return want;
+    const uint32_t i = find_u32(GP(bcols), bn, want);
+    if (i == bn)
+        return want;
+    if (i < n)
+        return L32(cols + 4 * i);
+    /* past this palette's end: wrapped into 1..n-1 (udiv by 0 gives 0 on arm64) */
+    const uint32_t m = n - 1;
+    const uint32_t q = m ? i / m : 0;
+    return L32(cols + 4 * (i - q * m + 1));
 }
 static uint32_t pal_get_index(uint8_t *gm_, uint64_t P, uint32_t color, uint32_t fuzzy)
 {
     uint32_t n, cols;
     pal_colors(gm_, P, &n, &cols);
     const uint8_t *pc = GP(cols);
-    for (uint32_t i = 0; i < n; i++) {
-        uint32_t v;
-        memcpy(&v, pc + 4 * i, 4);
-        if (v == color)
-            return i;
-    }
+    const uint32_t i = find_u32(pc, n, color);
+    if (i < n)
+        return i;
     if (!fuzzy || (color >> 24) == 0xff)
         return 0;
     for (uint32_t i = 0; i < n; i++) {
@@ -5336,6 +5351,10 @@ static void pal_report(const char *what, uint32_t got, uint32_t want)
 void nat__ZNK16ycPaletteTexture12FindFromBaseERK7ycColorPKS_(Ctx *c)
 {
     GM_BEGIN;
+    {
+        static CallerHist h = { .what = "ycPaletteTexture::FindFromBase" };
+        caller_count(&h, __builtin_return_address(0));
+    }
     const uint32_t r = pal_find_from_base(gm_, c->x[0], c->x[1], c->x[2]);
     if (pal_check < 0)
         pal_check = getenv("MINA_PAL_CHECK") != NULL;
@@ -5348,6 +5367,10 @@ void nat__ZNK16ycPaletteTexture12FindFromBaseERK7ycColorPKS_(Ctx *c)
 void nat__ZNK16ycPaletteTexture8GetIndexE7ycColorb(Ctx *c)
 {
     GM_BEGIN;
+    {
+        static CallerHist h = { .what = "ycPaletteTexture::GetIndex" };
+        caller_count(&h, __builtin_return_address(0));
+    }
     const uint32_t r = pal_get_index(gm_, c->x[0], (uint32_t)c->x[1], (uint32_t)c->x[2]);
     if (pal_check < 0)
         pal_check = getenv("MINA_PAL_CHECK") != NULL;
