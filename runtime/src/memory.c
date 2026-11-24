@@ -154,89 +154,10 @@ static void slow_note(const char *what, uint64_t t0, uint64_t size)
     rt_log("[slowheap] %s of %llu bytes: %.1f ms (thread %u)\n", what, (unsigned long long)size, dt / 1000.0,
            tc ? tc->thread_id : 0);
 }
-/* ---- small blocks (up to 1 KiB) -------------------------------------------
- * newlib's malloc has one lock for every thread: on the console, mallocs of
- * 64 bytes waited up to 38 ms in it (the audio decoders allocate all the time;
- * a thread losing its core while holding it stopped the game thread and the
- * renderer). Small blocks come from free lists by size class instead (a lock
- * per class, held for a pop or a push), carved from 64 KiB chunks taken from
- * newlib now and then and never given back. A block comes zeroed. A chunk's
- * class is found by its guest address (16 KiB pages: g_mem is that aligned).
- * MINA_SMALLOC=0: newlib for everything. */
-#define SA_MAX 1024u
-#define SA_CHUNK (64u << 10)
-#define SA_PAGE_SHIFT 14
-static const uint16_t sa_size[] = { 16, 32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256,
-                                    320, 384, 448, 512, 640, 768, 896, 1024 };
-#define SA_N ((int)(sizeof sa_size / sizeof sa_size[0]))
-static uint8_t sa_cls_of[SA_MAX / 16 + 1];          /* (size + 15) / 16 -> class */
-static uint8_t sa_page_cls[1u << (32 - SA_PAGE_SHIFT)];   /* guest page -> class + 1 (0: newlib's) */
-static uint32_t sa_free[SA_N];
-static pthread_mutex_t sa_lock[SA_N];
-static int sa_on = -1;
-static int sa_init(void)
-{
-    if (sa_on >= 0)
-        return sa_on;
-    const char *v = getenv("MINA_SMALLOC");
-    sa_on = !(v && *v == '0') && ((uintptr_t)g_mem & ((1u << SA_PAGE_SHIFT) - 1)) == 0;
-    int k = 0;
-    for (uint32_t i = 0; i <= SA_MAX / 16; i++) {
-        while (sa_size[k] < i * 16)
-            k++;
-        sa_cls_of[i] = (uint8_t)k;
-    }
-    for (int i = 0; i < SA_N; i++)
-        pthread_mutex_init(&sa_lock[i], NULL);
-    rt_log("[heap] small blocks by size class: %s\n", sa_on ? "on" : "off");
-    return sa_on;
-}
-static uint32_t sa_alloc(uint64_t size)
-{
-    const int k = sa_cls_of[(size + 15) / 16];
-    const uint32_t bs = sa_size[k];
-    pthread_mutex_lock(&sa_lock[k]);
-    uint32_t a = sa_free[k];
-    if (!a) {
-        void *p = memalign(1u << SA_PAGE_SHIFT, SA_CHUNK);
-        if (!p) {
-            pthread_mutex_unlock(&sa_lock[k]);
-            return 0;
-        }
-        const uint32_t g = guest_addr(p);
-        for (uint32_t pg = 0; pg < SA_CHUNK >> SA_PAGE_SHIFT; pg++)
-            sa_page_cls[(g >> SA_PAGE_SHIFT) + pg] = (uint8_t)(k + 1);
-        /* carved into a list (the chunk's end is lost when bs does not divide it) */
-        uint32_t head = 0;
-        for (uint32_t off = (SA_CHUNK / bs - 1) * bs;; off -= bs) {
-            rt_st32(G(g + off), head);
-            head = g + off;
-            if (!off)
-                break;
-        }
-        a = head;
-        heap_in_use += SA_CHUNK;
-    }
-    sa_free[k] = rt_ld32(G(a));
-    pthread_mutex_unlock(&sa_lock[k]);
-    memset(G(a), 0, bs);
-    return a;
-}
-static inline int sa_class_of_block(uint32_t a) { return sa_page_cls[a >> SA_PAGE_SHIFT] - 1; }
-static void sa_release(uint32_t a, int k)
-{
-    pthread_mutex_lock(&sa_lock[k]);
-    rt_st32(G(a), sa_free[k]);
-    sa_free[k] = a;
-    pthread_mutex_unlock(&sa_lock[k]);
-}
-
 uint32_t gmalloc(uint64_t size)
 {
     if (size > 0x20000000ull)
         return 0;
-    if (size <= SA_MAX && !heapcheck_on() && sa_init())
-        return sa_alloc(size ? size : 1);
     if (heapcheck_on()) {
         HcHdr *h = memalign(16, (size_t)size + 32);
         if (!h)
@@ -246,7 +167,9 @@ uint32_t gmalloc(uint64_t size)
         memset((uint8_t *)(h + 1) + size, HC_CANARY, 16);
         return guest_addr(h + 1);
     }
+    const uint64_t t0 = slow_now();
     void *p = memalign(16, size ? (size_t)size : 1);
+    slow_note("malloc", t0, size);
     if (!p) {
         rt_log("guest heap: %llu bytes not available\n", (unsigned long long)size);
         static int told;
@@ -280,13 +203,6 @@ void gfree(uint32_t a)
 {
     if (!a || not_heap(a, "free"))
         return;
-    if (sa_on > 0) {
-        const int k = sa_class_of_block(a);
-        if (k >= 0) {
-            sa_release(a, k);
-            return;
-        }
-    }
     HcHdr *h = heapcheck_on() ? hc_hdr(a) : NULL;
     if (h) {
         if (h->magic == HC_FREED) {
@@ -315,15 +231,12 @@ void gfree(uint32_t a)
         return;
     }
     heap_in_use -= malloc_usable_size(G(a));
+    const uint64_t t0 = slow_now();
     free(G(a));
+    slow_note("free", t0, 0);
 }
 uint64_t gmalloc_usable(uint32_t a)
 {
-    if (sa_on > 0) {
-        const int k = sa_class_of_block(a);
-        if (k >= 0)
-            return sa_size[k];
-    }
     HcHdr *h = heapcheck_on() ? hc_hdr(a) : NULL;
     return h ? h->size : malloc_usable_size(G(a));
 }
@@ -332,12 +245,10 @@ uint32_t gcalloc(uint64_t n, uint64_t size)
 {
     uint64_t total = n * size;
     uint32_t a = gmalloc(total);
-    if (a && !(sa_on > 0 && sa_class_of_block(a) >= 0)) {
-        const uint64_t t0 = total >= (64u << 10) ? slow_now() : 0;
+    const uint64_t t0 = slow_now();
+    if (a)
         memset(G(a), 0, (size_t)total);
-        if (t0)
-            slow_note("calloc's memset", t0, total);
-    }
+    slow_note("calloc's memset", t0, total);
     return a;
 }
 uint32_t grealloc(uint32_t a, uint64_t size)
