@@ -222,11 +222,13 @@ static int lazy_candidate(const char *path)
     const char *e = getenv("MINA_LAZY_BANKS");
     if (e && *e == '0')
         return 0;
-    /* big sound banks (music): sound effects stay in memory for latency */
+    /* big sound banks: the music's and the sound effects' (defaultsfx, 26 MiB:
+     * the console's 272 MiB heap ran out with it in memory, ~250 MiB in use);
+     * the small ones (default_load) stay in memory */
     size_t n = strlen(path);
     struct stat st;
     return n >= 10 && strcmp(path + n - 10, ".sndbnk.yc") == 0 && stat(path, &st) == 0 &&
-           st.st_size > (32 << 20);
+           st.st_size > (16 << 20);
 }
 
 /* Moves the bank's Ogg pointers into its window (after the engine parsed it). */
@@ -263,7 +265,7 @@ int lazy_contains(uint32_t addr) { return addr >= LAZY_WINDOW_BASE && addr < LAZ
  * music decoded slower than it plays), so a bank is read 64 KiB at a time
  * into a few blocks kept for the next pieces. */
 #define LAZY_BLOCK (64u << 10)
-#define LAZY_SLOTS 6
+#define LAZY_SLOTS 24      /* music and several sound effects at once */
 static struct { int blob; uint32_t off, len, used; uint8_t *buf; } lzc[LAZY_SLOTS];
 static uint32_t lzc_tick;
 static pthread_mutex_t lzc_lock = PTHREAD_MUTEX_INITIALIZER;
