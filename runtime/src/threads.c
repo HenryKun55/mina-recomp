@@ -243,25 +243,8 @@ void watchdog_start(void)
     pthread_attr_destroy(&ha);
 }
 
-/* Guest threads start on the third core (the audio's, mostly idle): the
- * game's workers (job queue, world regions, files, saves) were free to run on
- * the game thread's core and take it whenever it waited an instant (steps of
- * 40-60 ms instead of ~20 on the console, no file or lock time in them). The
- * game thread and the renderer move to their own cores when they start
- * (pin_to_core). MINA_NO_PIN: anywhere. */
-static void side_core(void)
-{
-#if defined(__vita__)
-    static int off = -1;
-    if (off < 0)
-        off = getenv("MINA_NO_PIN") != NULL;
-    if (!off)
-        sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), SCE_KERNEL_CPU_MASK_USER_2);
-#endif
-}
 static void *thread_main(void *p)
 {
-    side_core();
     GThread *t = p;
     if (tl_ctx)
         rt_log("[thread] new host thread already has a ctx %p (stale TLS)\n", (void *)tl_ctx);
@@ -288,7 +271,6 @@ typedef struct HostJob {
 
 static void *host_job_main(void *p)
 {
-    side_core();
     HostJob *j = p;
     if (tl_ctx)
         rt_log("[thread] new host thread already has a ctx %p (stale TLS)\n", (void *)tl_ctx);
@@ -748,7 +730,6 @@ void block_release(Ctx *c, uint64_t block);
 
 static void *async_main(void *p)
 {
-    side_core();
     AsyncJob *j = p;
     Ctx *c = new_ctx(512 * 1024);
     GThread *t = calloc(1, sizeof *t);
