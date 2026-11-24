@@ -154,6 +154,23 @@ static void slow_note(const char *what, uint64_t t0, uint64_t size)
     rt_log("[slowheap] %s of %llu bytes: %.1f ms (thread %u)\n", what, (unsigned long long)size, dt / 1000.0,
            tc ? tc->thread_id : 0);
 }
+/* MINA_BIGLOG: guest blocks of 256 KiB or more, made and freed */
+static int biglog = -1;
+static void big_note(void *p, uint64_t size, int made, const void *ra)
+{
+    if (biglog < 0)
+        biglog = getenv("MINA_BIGLOG") != NULL;
+    if (biglog && size >= (256u << 10))
+        rt_log("[big] %s %llu at %p\n", made ? "made" : "freed", (unsigned long long)size, p);
+    static int traced;
+    if (biglog && made && size == 524560 && traced++ < 3) {
+        char bt[1024];
+        guest_backtrace(bt, sizeof bt, 12);
+        Ctx *thread_ctx(void);
+        Ctx *tc = thread_ctx();
+        rt_log("[big] 524560 from host %p, thread %u: %s\n", ra, tc ? tc->thread_id : 0, bt);
+    }
+}
 uint32_t gmalloc(uint64_t size)
 {
     if (size > 0x20000000ull)
@@ -185,6 +202,7 @@ uint32_t gmalloc(uint64_t size)
         return 0;
     }
     heap_in_use += malloc_usable_size(p);
+    big_note(p, size, 1, __builtin_return_address(0));
     return guest_addr(p);
 }
 /* heap blocks are never below the end of the image (that is the runtime area,
@@ -231,6 +249,8 @@ void gfree(uint32_t a)
         return;
     }
     heap_in_use -= malloc_usable_size(G(a));
+    if (biglog > 0)
+        big_note(G(a), malloc_usable_size(G(a)), 0, __builtin_return_address(0));
     const uint64_t t0 = slow_now();
     free(G(a));
     slow_note("free", t0, 0);

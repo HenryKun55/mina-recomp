@@ -378,6 +378,16 @@ static void log_big(Ctx *c, const char *what, uint64_t n)
 }
 static void imp_malloc(Ctx *c)
 {
+#if defined(MINA_PROFILE)
+    {   /* MINA_BIGLOG: which recompiled function asks for 512 KiB blocks */
+        static int on = -1, told;
+        if (on < 0)
+            on = getenv("MINA_BIGLOG") != NULL;
+        if (on && A0 >= (256u << 10) && told++ < 40)
+            rt_log("[big] malloc %llu in %s\n", (unsigned long long)A0,
+                   c->cur_fn < g_guest_func_count ? g_guest_func_names[c->cur_fn] : "?");
+    }
+#endif
     if (lazy_pending >= 0 && A0 >= lazy[lazy_pending].size && A0 <= lazy[lazy_pending].size + 4096) {
         LazyBlob *b = &lazy[lazy_pending];
         lazy_pending = -1;

@@ -3,6 +3,7 @@
 #include "runtime.h"
 
 #include <arm_neon.h>
+#include <pthread.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -5791,4 +5792,63 @@ void nat__ZN21TileLevelRenderObject6RenderERKN14ycRenderObject9RenderCtxE(Ctx *c
         f_1df70c(c);
     }
     c->sp = saved_sp;
+}
+
+/* ---- ycSysAllocator::Alloc / Free ------------------------------------------------------------
+ * ycCutterAnimRenderObject::Render and ycDrawUtil::Render take 512 KiB of scratch
+ * (align 256) from the system allocator for each render and give it back: ~25 such
+ * blocks a second through newlib's heap, which cut its free space into thousands of
+ * pieces until a 1.25 MiB block could not be found (Vita3K, a tour of 12 levels at
+ * the console's speed; the console's crashes). Those blocks stay in a pool instead:
+ * up to SCRATCH_POOL of them, made by the game's Alloc (its header intact), handed
+ * out again by Alloc and taken back by Free. MINA_BIGLOG: blocks of 256 KiB or more. */
+void f_1e4b08_orig(Ctx *c);
+void f_1e4b5c_orig(Ctx *c);
+#define SCRATCH_POOL 16
+static uint32_t scratch_known[SCRATCH_POOL], scratch_free[SCRATCH_POOL];
+static int nscratch_known, nscratch_free;
+static pthread_mutex_t scratch_lock = PTHREAD_MUTEX_INITIALIZER;
+void nat__ZN14ycSysAllocator5AllocEyy11ycAllocInfoPKcjy(Ctx *c)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("MINA_BIGLOG") != NULL;
+    if (on && c->x[1] >= (256u << 10)) {
+        static int told;
+        if (told++ < 60)
+            rt_log("[big] ycSysAllocator::Alloc %llu align %llu\n", (unsigned long long)c->x[1],
+                   (unsigned long long)c->x[2]);
+    }
+    const int scratch = c->x[1] == 0x80000 && c->x[2] == 0x100;
+    if (scratch) {
+        pthread_mutex_lock(&scratch_lock);
+        const uint32_t a = nscratch_free ? scratch_free[--nscratch_free] : 0;
+        pthread_mutex_unlock(&scratch_lock);
+        if (a) {
+            c->x[0] = a;
+            return;
+        }
+    }
+    f_1e4b08_orig(c);
+    if (scratch && c->x[0]) {
+        pthread_mutex_lock(&scratch_lock);
+        if (nscratch_known < SCRATCH_POOL)
+            scratch_known[nscratch_known++] = (uint32_t)c->x[0];
+        pthread_mutex_unlock(&scratch_lock);
+    }
+}
+void nat__ZN14ycSysAllocator4FreeEPvy(Ctx *c)
+{
+    const uint32_t a = (uint32_t)c->x[1];
+    if (a) {
+        pthread_mutex_lock(&scratch_lock);
+        for (int i = 0; i < nscratch_known; i++)
+            if (scratch_known[i] == a) {
+                scratch_free[nscratch_free++] = a;
+                pthread_mutex_unlock(&scratch_lock);
+                return;
+            }
+        pthread_mutex_unlock(&scratch_lock);
+    }
+    f_1e4b5c_orig(c);
 }
