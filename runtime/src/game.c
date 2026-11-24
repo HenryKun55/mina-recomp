@@ -5390,6 +5390,9 @@ void nat__ZN13ycUpdateQueue6UpdateEf(Ctx *c)
     static int on = -1;
     if (on < 0)
         on = getenv("MINA_UQ_STATS") != NULL;
+    static int orig = -1;
+    if (orig < 0)
+        orig = rt_native_off("__ZN13ycUpdateQueue6UpdateEf");
     if (!on) {
         static int zdepth;
         if (zones_on() && !zdepth) {
@@ -5400,11 +5403,13 @@ void nat__ZN13ycUpdateQueue6UpdateEf(Ctx *c)
             zdepth = 0;
             return;
         }
-        f_1e5c84_orig(c);
-        return;
+        if (orig) {
+            f_1e5c84_orig(c);
+            return;
+        }
     }
     GM_BEGIN;
-    const uint64_t t0 = now_us();
+    const uint64_t t0 = on ? now_us() : 0;
     const uint64_t Q = c->x[0];
     float s8;
     memcpy(&s8, &c->v[0], 4);
@@ -5451,6 +5456,12 @@ void nat__ZN13ycUpdateQueue6UpdateEf(Ctx *c)
             c->x[1] = L64(Q + 0x38);
             c->x[8] = fn;
             c->sp = F;
+            if (!on) {
+                /* the callback through a cache of the last target per hash of its address */
+                static const GuestFunc *ic[256];
+                RT_CALL_IC(c, fn, ic[(uint32_t)fn >> 2 & 255]);
+                continue;
+            }
             const uint64_t t = now_us();
             uq_depth++;
             rt_call(c, fn);
@@ -5481,7 +5492,7 @@ void nat__ZN13ycUpdateQueue6UpdateEf(Ctx *c)
     c->sp = F;
     f_1e5e34(c);
     c->sp = saved_sp;
-    if (uq_depth == 0) {
+    if (on && uq_depth == 0) {
         uq_total_us += now_us() - t0;
         if (++uq_runs == 300)
             uq_report();
