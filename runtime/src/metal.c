@@ -2727,6 +2727,21 @@ void metal_present(uint64_t drawable)
                 rt_log("[fps]   per frame: %u Composite, %u UpdateBounds; %.1f depth-testing shader draws, %.1f scene restarts\n",
                        g_composites / frames, g_bounds / frames, g_depth_fs_draws / (double)frames,
                        g_depth_restarts / (double)frames);
+                {
+                    extern uint64_t g_zone_us[8];
+                    extern const char *const g_zone_name[8];
+                    extern int g_zones;
+                    if (g_zones > 0) {
+                        char zb[512];
+                        int zn = 0;
+                        for (int k = 0; k < 8 && g_zone_name[k]; k++) {
+                            zn += snprintf(zb + zn, sizeof zb - (size_t)zn, " %s %.2f", g_zone_name[k],
+                                           g_zone_us[k] / 1000.0 / frames);
+                            g_zone_us[k] = 0;
+                        }
+                        rt_log("[fps]   zones (ms per frame):%s\n", zb);
+                    }
+                }
                 g_composites = g_bounds = 0;
                 g_depth_fs_draws = g_depth_restarts = 0;
 #if defined(__vita__) && defined(MINA_VGL_DBG)

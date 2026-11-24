@@ -819,11 +819,22 @@ static void refresh_world_transform(Ctx *c)
     }
     c->sp = saved_sp;
 }
+extern uint64_t g_zone_us[8];
+static inline int zones_on(void);
 void nat__ZN8ycEntity21RefreshWorldTransformEb(Ctx *c)
 {
     static CallerHist h = { "ycEntity::RefreshWorldTransform" };
     caller_count(&h, __builtin_return_address(0));
+    static int depth;
+    if (depth || !zones_on()) {
+        refresh_world_transform(c);
+        return;
+    }
+    depth = 1;
+    const uint64_t t = now_us();
     refresh_world_transform(c);
+    g_zone_us[6] += now_us() - t;
+    depth = 0;
 }
 
 /* ---- IsoAnim::GetIsoDepth --------------------------------------------------------------------
@@ -1162,6 +1173,126 @@ static void rpu_sort(uint8_t *gm_, uint64_t RP, uint32_t v, uint32_t n)
         sm->n = n;
     }
 }
+
+/* ---- render pass memo (MINA_NO_RPU_MEMO=1: off): a pass whose inputs are byte for byte the
+ * ones of its last update gets that update's outputs again (about a third of the passes on
+ * the deck and on boneBeachA, frame after frame). The inputs: the pass's fields the scan
+ * reads, its cameras' matrices and direction, and for every page the object slots, boxes and
+ * flag blocks up to the last object. The outputs: per view the count, keys, objects and the
+ * two bounds. Passes whose sort calls the game (unknown key functions) or whose lists grew
+ * are not kept. */
+typedef struct RpuMemo {
+    uint32_t rp, in_len, in_cap, out_len, out_cap;
+    uint8_t *in, *out;
+} RpuMemo;
+static RpuMemo rpu_memo[64];
+static uint8_t *rpu_gbuf;
+static uint32_t rpu_gcap;
+static uint32_t rpu_hits, rpu_misses;
+static inline void rpu_put(uint32_t *len, const void *src, uint32_t n)
+{
+    if (*len + n > rpu_gcap) {
+        rpu_gcap = (*len + n) * 2 + 4096;
+        rpu_gbuf = realloc(rpu_gbuf, rpu_gcap);
+    }
+    memcpy(rpu_gbuf + *len, src, n);
+    *len += n;
+}
+static int rpu_known_sort(uint32_t f)
+{
+    return f == 0x11e2844u || f == 0x11e2894u || f == 0x11e28e0u || f == 0x11e0ae4u;
+}
+/* the inputs into rpu_gbuf; 0 when the pass cannot be kept */
+static uint32_t rpu_gather(uint8_t *gm_, uint64_t RP)
+{
+    uint32_t len = 0;
+    if (!rpu_known_sort((uint32_t)lp(RP + 0x128)))
+        return 0;
+    rpu_put(&len, GP(RP + 0x8), 2);                  /* layers, views that skip flag 8 */
+    rpu_put(&len, GP(RP + 0x10), 5 * 8);              /* cameras */
+    rpu_put(&len, GP(RP + 0x128), 0x28);              /* sort function, pages, page count, ..., capacity */
+    rpu_put(&len, GP(RP + 0x1f0), 0x50);              /* the key and object lists */
+    for (uint32_t v = 0; v < 5; v++) {
+        const uint64_t cam = lp(RP + 0x10 + 8 * v);
+        if (!cam)
+            continue;
+        rpu_put(&len, GP(cam), 0x80);
+        rpu_put(&len, GP(cam + 0x10c), 12);
+    }
+    const uint32_t pages = (uint32_t)lp(RP + 0x130), np = (uint32_t)lp(RP + 0x138);
+    for (uint32_t pg = 0; pg < np; pg++) {
+        uint32_t left = *(uint16_t *)GP(pages + 0x6660 + 2 * pg);
+        rpu_put(&len, &left, 4);
+        if (!left)
+            continue;
+        const uint32_t page = (uint32_t)lp(pages + 8 * pg);
+        rpu_put(&len, &page, 4);
+        uint32_t j = 0;
+        for (; left; j++)
+            if (lp(page + 8 * j))
+                left--;
+        rpu_put(&len, GP(page), 8 * j);
+        rpu_put(&len, GP(page + 0x4800), 0x18 * j);
+        rpu_put(&len, GP(page + 0x6000), 8 * j);
+    }
+    return len;
+}
+static RpuMemo *rpu_slot(uint64_t RP) { return &rpu_memo[((uint32_t)RP >> 4 ^ (uint32_t)RP >> 10) & 63]; }
+/* outputs: per active view n, keys, objects, both bounds */
+static void rpu_save(uint8_t *gm_, uint64_t RP, uint32_t in_len)
+{
+    RpuMemo *m = rpu_slot(RP);
+    if (m->in_cap < in_len) {
+        m->in_cap = in_len + 1024;
+        m->in = realloc(m->in, m->in_cap);
+    }
+    memcpy(m->in, rpu_gbuf, in_len);
+    m->in_len = in_len;
+    uint32_t len = 0;
+    for (uint32_t v = 0; v < 5; v++) {
+        if (!lp(RP + 0x10 + 8 * v))
+            continue;
+        const uint32_t n = (uint32_t)lp(RP + 0x1c8 + 8 * v);
+        len += 4 + 48 + 12 * n;
+    }
+    if (m->out_cap < len) {
+        m->out_cap = len + 1024;
+        m->out = realloc(m->out, m->out_cap);
+    }
+    uint8_t *o = m->out;
+    for (uint32_t v = 0; v < 5; v++) {
+        if (!lp(RP + 0x10 + 8 * v))
+            continue;
+        const uint32_t n = (uint32_t)lp(RP + 0x1c8 + 8 * v);
+        memcpy(o, &n, 4); o += 4;
+        memcpy(o, GP(RP + 0xb0 + 0x18 * v), 24); o += 24;
+        memcpy(o, GP(RP + 0x150 + 0x18 * v), 24); o += 24;
+        memcpy(o, GP(lp(RP + 0x1f0 + 8 * v)), 4 * n); o += 4 * n;
+        memcpy(o, GP(lp(RP + 0x218 + 8 * v)), 8 * n); o += 8 * n;
+    }
+    m->out_len = len;
+    m->rp = (uint32_t)RP;
+}
+static int rpu_restore(uint8_t *gm_, uint64_t RP, uint32_t in_len)
+{
+    RpuMemo *m = rpu_slot(RP);
+    if (m->rp != (uint32_t)RP || m->in_len != in_len || memcmp(m->in, rpu_gbuf, in_len))
+        return 0;
+    const uint8_t *o = m->out;
+    for (uint32_t v = 0; v < 5; v++) {
+        if (!lp(RP + 0x10 + 8 * v))
+            continue;
+        uint32_t n;
+        memcpy(&n, o, 4); o += 4;
+        memcpy(GP(RP + 0xb0 + 0x18 * v), o, 24); o += 24;
+        memcpy(GP(RP + 0x150 + 0x18 * v), o, 24); o += 24;
+        memcpy(GP(lp(RP + 0x1f0 + 8 * v)), o, 4 * n); o += 4 * n;
+        memcpy(GP(lp(RP + 0x218 + 8 * v)), o, 8 * n); o += 8 * n;
+        const uint64_t n64 = n;
+        memcpy(GP(RP + 0x1c8 + 8 * v), &n64, 8);
+    }
+    return 1;
+}
 static void render_pass_update(Ctx *c)
 {
     GM_BEGIN;
@@ -1176,6 +1307,67 @@ static void render_pass_update(Ctx *c)
     const uint64_t RP = c->x[0];
     if (!*(uint8_t *)GP(RP + 0x258))
         return;
+    if (stats) {   /* how many passes share their object pages and camera (per 600 calls) */
+        static uint32_t keys[600], nk, ndist;
+        const uint32_t k = (uint32_t)lp(RP + 0x130) * 31u ^ (uint32_t)lp(RP + 0x10);
+        int seen = 0;
+        for (uint32_t i = 0; i < nk; i++)
+            if (keys[i] == k) {
+                seen = 1;
+                break;
+            }
+        if (!seen && nk < 600)
+            keys[nk++] = k;
+        {   /* would last frame's result do? a hash of what the scan reads */
+            static struct { uint32_t rp, h; } last[64];
+            static uint32_t same, total;
+            uint32_t h = 2166136261u;
+            const uint32_t pages = (uint32_t)lp(RP + 0x130), np = (uint32_t)lp(RP + 0x138);
+            for (uint32_t pg = 0; pg < np; pg++) {
+                const uint32_t left = *(uint16_t *)GP(pages + 0x6660 + 2 * pg);
+                if (!left)
+                    continue;
+                const uint32_t page = (uint32_t)lp(pages + 8 * pg);
+                const uint32_t *a = GP(page), *b = GP(page + 0x4800), *f = GP(page + 0x6000);
+                for (uint32_t j = 0; j < 2 * left; j++)
+                    h = (h ^ a[j]) * 16777619u;
+                for (uint32_t j = 0; j < 6 * left; j++)
+                    h = (h ^ b[j]) * 16777619u;
+                for (uint32_t j = 0; j < 2 * left; j++)
+                    h = (h ^ f[j]) * 16777619u;
+            }
+            const float *cm = GP(lp(RP + 0x10));
+            const uint32_t *cmu = (const uint32_t *)cm;
+            for (int j = 0; j < 32; j++)
+                h = (h ^ cmu[j]) * 16777619u;
+            const uint32_t slot = ((uint32_t)RP >> 4) & 63;
+            total++;
+            if (last[slot].rp == (uint32_t)RP && last[slot].h == h)
+                same++;
+            last[slot].rp = (uint32_t)RP;
+            last[slot].h = h;
+            if (total == 600) {
+                rt_log("[rpu] %u of 600 passes read the same as last time\n", same);
+                same = total = 0;
+            }
+        }
+        if (rpu.calls % 600 == 0) {
+            ndist = nk;
+            rt_log("[rpu] %u distinct (pages, camera) in 600 calls; pages %#x mask %#x layer %#x\n", ndist,
+                   (uint32_t)lp(RP + 0x130), *(uint8_t *)GP(RP + 0x9), *(uint8_t *)GP(RP + 0x8));
+            nk = 0;
+        }
+    }
+    static int memo_off = -1;
+    if (memo_off < 0)
+        memo_off = getenv("MINA_NO_RPU_MEMO") != NULL;
+    const uint32_t in_len = memo_off ? 0 : rpu_gather(gm_, RP);
+    if (in_len && rpu_restore(gm_, RP, in_len)) {
+        rpu_hits++;
+        return;
+    }
+    rpu_misses++;
+    const uint64_t lists_before = lp(RP + 0x1f0) ^ lp(RP + 0x218) * 3u ^ lp(RP + 0x148) * 7u;
     const uint64_t saved_sp = c->sp, fr = saved_sp - 0x80;    /* campos +0, camdir +0x10, inverse +0x20 */
     c->sp = fr;
     for (uint32_t v = 0; v < 5; v++) {
@@ -1267,6 +1459,25 @@ static void render_pass_update(Ctx *c)
         uint32_t n = 0;
         const uint32_t sortfn = (uint32_t)lp(RP + 0x128);
         const uint32_t npages = (uint32_t)lp(RP + 0x138);
+        /* what the loop reads of the pass and the camera, in locals (with -fno-strict-aliasing
+         * every store to guest memory made GCC load them again): read again after the calls
+         * into the game (the list growing, a key function) */
+        uint32_t layers = *(uint8_t *)GP(RP + 0x8), cap = (uint32_t)lp(RP + 0x148);
+        uint32_t *keyl = GP(lp(RP + 0x1f0 + 8 * v));
+        uint8_t *objl = GP(lp(RP + 0x218 + 8 * v));
+        float cp0 = ((const float *)GP(fr))[0], cp1 = ((const float *)GP(fr))[1], cp2 = ((const float *)GP(fr))[2];
+        float cd0 = ((const float *)GP(fr + 0x10))[0], cd1 = ((const float *)GP(fr + 0x10))[1],
+              cd2 = ((const float *)GP(fr + 0x10))[2];
+#define RPU_RELOAD()                                                                                  \
+        do {                                                                                          \
+            layers = *(uint8_t *)GP(RP + 0x8);                                                        \
+            cap = (uint32_t)lp(RP + 0x148);                                                           \
+            keyl = GP(lp(RP + 0x1f0 + 8 * v));                                                        \
+            objl = GP(lp(RP + 0x218 + 8 * v));                                                        \
+            cp0 = ((const float *)GP(fr))[0], cp1 = ((const float *)GP(fr))[1], cp2 = ((const float *)GP(fr))[2]; \
+            cd0 = ((const float *)GP(fr + 0x10))[0], cd1 = ((const float *)GP(fr + 0x10))[1];                    \
+            cd2 = ((const float *)GP(fr + 0x10))[2];                                                  \
+        } while (0)
         for (uint32_t pg = 0; pg < npages; pg++) {
             const uint32_t pages = (uint32_t)lp(RP + 0x130);
             uint32_t left = *(uint16_t *)GP(pages + 0x6660 + 2 * pg);
@@ -1287,7 +1498,7 @@ static void render_pass_update(Ctx *c)
                 const float32x4_t bx = vld1q_f32(box), bex = vld1q_f32(box + 3);   /* (lane 3: the next float, unused) */
                 grow4(&abc, &abe, bx, bex);
                 const uint8_t layer = *(uint8_t *)GP(page + 8 * j + 0x6001);
-                if (!(*(uint8_t *)GP(RP + 0x8) & layer))
+                if (!(layers & layer))
                     continue;
                 const uint64_t fa = page + 8 * j + 0x6000;
                 uint8_t f = *(uint8_t *)GP(fa);
@@ -1323,11 +1534,12 @@ static void render_pass_update(Ctx *c)
                         continue;
                     }
                 }
-                if (n == lp(RP + 0x148)) {
+                if (n == cap) {
                     c->x[0] = RP;
                     c->x[1] = (uint64_t)n * 2;
                     f_1e0ca0(c);
                     f = *(uint8_t *)GP(fa);
+                    RPU_RELOAD();
                 }
                 uint32_t key;
                 if (f & 6) {
@@ -1344,9 +1556,8 @@ static void render_pass_update(Ctx *c)
                     if (sortfn == 0x11e28e0u) {
                         k = box[2] + 100.0f;
                     } else {
-                        const float *cp = GP(fr), *cd = GP(fr + 0x10);
-                        k = (box[0] - cp[0]) * cd[0];
-                        const float k1 = (box[1] - cp[1]) * cd[1], k2 = (box[2] - cp[2]) * cd[2];
+                        k = (box[0] - cp0) * cd0;
+                        const float k1 = (box[1] - cp1) * cd1, k2 = (box[2] - cp2) * cd2;
                         k = k + k1;
                         k = k + k2;
                         k = ldfp(fa + 4) + k;
@@ -1365,6 +1576,7 @@ static void render_pass_update(Ctx *c)
                     static const GuestFunc *ic;
                     RT_CALL_IC(c, lp(RP + 0x128), ic);
                     key = (uint32_t)c->x[0];
+                    RPU_RELOAD();
                     if (stats) {
                         rpu.keyed++;
                         static uint32_t seen[16];
@@ -1379,9 +1591,9 @@ static void render_pass_update(Ctx *c)
                     }
                 }
             keyed:
-                rt_st32(GP(lp(RP + 0x1f0 + 8 * v) + 4 * (uint64_t)n), key);
+                memcpy((uint8_t *)keyl + 4 * (size_t)n, &key, 4);
                 const uint64_t o64 = obj;
-                memcpy(GP(lp(RP + 0x218 + 8 * v) + 8 * (uint64_t)n), &o64, 8);
+                memcpy(objl + 8 * (size_t)n, &o64, 8);
                 n++;
                 grow4(&vcc, &vce, vld1q_f32(box), vld1q_f32(box + 3));   /* (read again, as the game does) */
             }
@@ -1421,6 +1633,13 @@ static void render_pass_update(Ctx *c)
         }
     }
     c->sp = saved_sp;
+    /* kept unless a list grew during the scan (the inputs gathered before no longer hold) */
+    if (in_len && (lp(RP + 0x1f0) ^ lp(RP + 0x218) * 3u ^ lp(RP + 0x148) * 7u) == lists_before)
+        rpu_save(gm_, RP, in_len);
+    if (stats && (rpu_hits + rpu_misses) >= 6000) {
+        rt_log("[rpu] memo: %u of %u passes from last time\n", rpu_hits, rpu_hits + rpu_misses);
+        rpu_hits = rpu_misses = 0;
+    }
     if (stats && rpu.calls % 600 == 0) {
         rt_log("[rpu] per call: %.0f objects, %.0f culled, %.0f keyed, %.0f sorted; %.1f us scan, %.1f us sort; %.0f slots, %.2f views, %.0f%% in fixed updates\n",
                rpu.objs / 600.0, rpu.culled / 600.0, rpu.keyed / 600.0, rpu.sorted / 600.0, rpu.scan_us / 600.0,
@@ -1475,7 +1694,7 @@ void nat__ZN12ycRenderPass6UpdateEv(Ctx *c)
             size_t i = 0;
             while (i < sizeof mine && mine[i] == ((uint8_t *)G(RP))[i])
                 i++;
-            rt_log("[verify] RenderPass::Update differs (%s, first byte %#zx)\n", diff == 2 ? "lists" : "pass", i);
+            rt_log("[verify] RenderPass::Update differs (%s, first byte %#x)\n", diff == 2 ? "lists" : "pass", (unsigned)i);
         }
         if ((checked & 0x3ff) == 0)
             rt_log("[verify] RenderPass::Update: %u calls checked, %u differ\n", checked, bad);
@@ -5116,4 +5335,354 @@ void nat__ZNK16ycPaletteTexture8GetIndexE7ycColorb(Ctx *c)
         pal_report("GetIndex", r, (uint32_t)c->x[0]);
     }
     c->x[0] = r;
+}
+
+/* ---- ycUpdateQueue::Update: MINA_UQ_STATS=1 times each update callback (by function), the
+ * game's loop redone here; otherwise the original runs. The queue's pages (+0x28, linked by
+ * +0x8, count +0x10) hold items of 0x28 bytes from +0x18: object, member function pointer
+ * (address or vtable offset), adjustment (bit 0: virtual), removed. The callbacks get the
+ * context the loop keeps in its frame (queue +0x38); removals they ask for are done after. */
+void f_1e5c84_orig(Ctx *c);
+extern uint64_t g_zone_us[8];
+static inline int zones_on(void);
+void f_1e5f8c(Ctx *c);
+void f_1e5e34(Ctx *c);
+typedef struct { uint32_t fn; uint32_t calls; uint64_t us; } UqStat;
+static int uq_depth;
+static UqStat uq_stat[256];
+static uint32_t uq_runs;
+static uint64_t uq_total_us;
+static void uq_note(uint32_t fn, uint64_t us)
+{
+    fn |= (uint32_t)(uq_depth > 3 ? 3 : uq_depth) << 30;      /* the nesting level in the top bits */
+    uint32_t h = (fn >> 2) * 2654435761u >> 24;
+    for (int k = 0; k < 256; k++, h = (h + 1) & 255) {
+        UqStat *s = &uq_stat[h];
+        if (s->fn == fn || !s->fn) {
+            s->fn = fn;
+            s->calls++;
+            s->us += us;
+            return;
+        }
+    }
+}
+static void uq_report(void)
+{
+    rt_log("[uq] %u outer updates, %.2f ms each; by callback (nesting level, ms and calls per outer update):\n",
+           uq_runs, uq_total_us / 1000.0 / uq_runs);
+    for (int r = 0; r < 30; r++) {
+        int best = -1;
+        for (int k = 0; k < 256; k++)
+            if (uq_stat[k].fn && (best < 0 || uq_stat[k].us > uq_stat[best].us))
+                best = k;
+        if (best < 0 || !uq_stat[best].us)
+            break;
+        rt_log("[uq]   %u 0x1%08x  %6.3f ms  %6.1f\n", uq_stat[best].fn >> 30, (uq_stat[best].fn & 0x3fffffffu) - 0x1000000u,
+               uq_stat[best].us / 1000.0 / uq_runs, (double)uq_stat[best].calls / uq_runs);
+        uq_stat[best].us = 0;
+    }
+    memset(uq_stat, 0, sizeof uq_stat);
+    uq_runs = 0;
+    uq_total_us = 0;
+}
+void nat__ZN13ycUpdateQueue6UpdateEf(Ctx *c)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("MINA_UQ_STATS") != NULL;
+    if (!on) {
+        static int zdepth;
+        if (zones_on() && !zdepth) {
+            zdepth = 1;
+            const uint64_t t = now_us();
+            f_1e5c84_orig(c);
+            g_zone_us[5] += now_us() - t;
+            zdepth = 0;
+            return;
+        }
+        f_1e5c84_orig(c);
+        return;
+    }
+    GM_BEGIN;
+    const uint64_t t0 = now_us();
+    const uint64_t Q = c->x[0];
+    float s8;
+    memcpy(&s8, &c->v[0], 4);
+    const uint64_t saved_sp = c->sp, F = saved_sp - 0xc0;
+    c->sp = F;
+    uint8_t *f = GP(F);
+    memset(f + 0x10, 0, 0x30);
+    const uint64_t g = L64(0x6053520);
+    memset(f + 0x40, 0, 16);
+    memset(f + 0x50, 0, 8);
+    memcpy(f + 0x58, &g, 8);
+    memset(f + 0x60, 0, 8);
+    memcpy(f + 0x68, &g, 8);
+    int stored = 1;
+    if (g) {
+        c->x[0] = g;
+        rt_call(c, L64(L64(g) + 0x28));
+        if ((uint32_t)c->x[0]) {
+            c->x[0] = g;
+            c->x[1] = g;
+            rt_call(c, L64(L64(g) + 0x38));
+            stored = 0;
+        }
+    }
+    if (stored)
+        memcpy(f + 0x58, &g, 8);
+    f = GP(F);
+    memcpy(f + 0x10, GP(0x1d4a0c0), 16);
+    memcpy(f + 0x20, GP(0x1d4a0e0), 16);
+    memcpy(f + 0x30, GP(0x1d4a0d0), 16);
+    memset(f + 0x60, 0, 8);
+    memcpy(f + 8, &s8, 4);
+    memcpy(f, &Q, 8);
+    memcpy(GP(Q + 0x38), &F, 8);
+    for (uint64_t page = L64(Q + 0x28); page; page = L64(page + 8)) {
+        for (uint64_t i = 0; i < L64(page + 0x10); i++) {
+            const uint64_t it = page + 0x18 + 0x28 * i;
+            if (L64(it + 0x18))
+                continue;
+            const uint64_t obj = L64(it), mp = L64(it + 8), adj = L64(it + 0x10);
+            const uint64_t x0 = obj + (uint64_t)((int64_t)adj >> 1);
+            const uint64_t fn = (adj & 1) ? L64(L64(x0) + (uint32_t)mp) : mp;
+            c->x[0] = x0;
+            c->x[1] = L64(Q + 0x38);
+            c->x[8] = fn;
+            c->sp = F;
+            const uint64_t t = now_us();
+            uq_depth++;
+            rt_call(c, fn);
+            uq_depth--;
+            uq_note((uint32_t)fn, now_us() - t);
+        }
+    }
+    c->sp = F;
+    for (uint64_t pi = 0, ii = 0;;) {
+        if (pi >= L64(F + 0x60))
+            break;
+        const uint64_t pages = L64(F + 0x40);
+        const uint64_t item = L64(pages + 8 * pi) + L64(F + 0x10) + L64(F + 0x18) * ii;
+        c->x[0] = Q;
+        c->x[1] = L64(item);
+        c->x[2] = L64(item + 8);
+        c->sp = F;
+        f_1e5f8c(c);
+        const uint64_t cnt = L64(L64(L64(F + 0x40) + 8 * pi));
+        if (ii + 1 == cnt) {
+            ii = 0;
+            pi++;
+        } else
+            ii++;
+    }
+    memset(GP(Q + 0x38), 0, 8);
+    c->x[0] = F + 0x10;
+    c->sp = F;
+    f_1e5e34(c);
+    c->sp = saved_sp;
+    if (uq_depth == 0) {
+        uq_total_us += now_us() - t0;
+        if (++uq_runs == 300)
+            uq_report();
+    }
+}
+
+/* ---- MINA_ZONES=1: time spent in a few of the game's functions (ms per frame in the [fps] lines) */
+uint64_t g_zone_us[8];
+const char *const g_zone_name[8] = { "ReapplyGroupPal", "SoundComponent", "SaveManager", "MessagePrompt",
+                                     "HUDCamera", "UpdateQueue", "RefreshWorldTransform", NULL };
+int g_zones = -1;
+static inline int zones_on(void)
+{
+    if (g_zones < 0)
+        g_zones = getenv("MINA_ZONES") != NULL;
+    return g_zones;
+}
+#define ZONE_NATIVE(nat, orig, k)                                                                        \
+    void orig(Ctx *c);                                                                                    \
+    void nat(Ctx *c)                                                                                      \
+    {                                                                                                     \
+        if (!zones_on()) {                                                                                \
+            orig(c);                                                                                      \
+            return;                                                                                       \
+        }                                                                                                 \
+        const uint64_t t = now_us();                                                                      \
+        orig(c);                                                                                          \
+        g_zone_us[k] += now_us() - t;                                                                     \
+    }
+ZONE_NATIVE(nat__ZN8Palettes15ReapplyGroupPalEi, f_964930_orig, 0)
+ZONE_NATIVE(nat__ZN14SoundComponent6UpdateEf, f_ab9e88_orig, 1)
+ZONE_NATIVE(nat__ZN11SaveManager6UpdateEf, f_a7f92c_orig, 2)
+ZONE_NATIVE(nat__ZN20MessagePromptManager6UpdateEf, f_439148_orig, 3)
+ZONE_NATIVE(nat__ZN9HUDCamera6UpdateEv, f_9b30f0_orig, 4)
+
+/* ---- TileLevelRenderObject::Render (x0 the object O, x1 the render context): a draw call
+ * on the guest stack, a copy of the context's template (+0xb0, 0x220 bytes); its pipeline
+ * from a table by a few flags (Jenkins' final mix, open addressing); 256 bytes of constants
+ * from the command list's allocator: the object's matrix (translation snapped to whole
+ * pixels), its color / 255, its depth range; the palette (SetOnDrawCall); then one draw per
+ * index range (+0xd0/+0xd8, +0xe0/+0xe8). */
+void f_1b5b10(Ctx *c);
+void f_1df70c(Ctx *c);
+void f_701d88_orig(Ctx *c);
+static inline uint32_t rol32(uint32_t v, int r) { return v << r | v >> (32 - r); }
+void nat__ZN21TileLevelRenderObject6RenderERKN14ycRenderObject9RenderCtxE(Ctx *c)
+{
+    GM_BEGIN;
+    const uint64_t O = c->x[0], T = c->x[1] + 0xb0;
+    if (!L8(O + 0xb4))
+        return;
+    {
+        const uint64_t s = L64(O + 0x28);
+        if (ldfp(s + 0xc) < 0.0f || ldfp(s + 0x10) < 0.0f || ldfp(s + 0x14) < 0.0f)
+            return;
+    }
+    const uint64_t list = L64(c->x[1] + 0x10);
+    const uint64_t saved_sp = c->sp, D = saved_sp - 0x270;
+    memcpy(GP(D), GP(T), 0x220);
+    /* the pipeline */
+    {
+        const uint64_t pal = L64(O + 0x98);
+        const int lt = L64(0x60210c0) == 0 || (int32_t)L32(pal + 0x30) < 0;
+        uint32_t key = lt ? 8 : 0x18;
+        if (!(L8(O + 0xb0) == 0xff && L8(O + 0xb1) == 0xff && L8(O + 0xb2) == 0xff && L8(O + 0xb3) == 0xff))
+            key |= 1;
+        if (ldfp(O + 0xc0) < ldfp(O + 0xc4))
+            key |= ldfp(O + 0xc8) > ldfp(O + 0xcc) ? 4 : 2;
+        uint32_t a = 0xdeadc42cu, b = 0x8ef4c855u;
+        uint32_t w11 = ((key + a) ^ b) + 0x59bd5389u;
+        uint32_t w9 = w11 ^ a;
+        uint32_t w12 = w9 - rol32(w11, 25);          /* ror 7 */
+        uint32_t w10 = (w12 ^ b) - rol32(w12, 16);
+        w11 = (w10 ^ w11) - rol32(w10, 4);           /* ror 28 */
+        w12 = w11 ^ w12;
+        w11 = w12 - rol32(w11, 14);                  /* ror 18 */
+        w10 = (w11 ^ w10) - (w11 >> 8);
+        const uint64_t tab = L64(0x60204b0);
+        uint64_t h = w10, idx;
+        int probes = 0;
+        do {
+            idx = h & 0xff;
+            h++;
+            if (++probes > 256) {
+                /* not in the table: the original would spin here */
+                static int told;
+                if (told++ < 8)
+                    rt_log("[tile] pipeline key %#x not in table %#llx (hash %#x, O %#llx, pal %#llx +0x30 %#x, "
+                           "50210c0 %#llx, color %#x, c0..cc %f %f %f %f)\n", key, (unsigned long long)tab, w10,
+                           (unsigned long long)O, (unsigned long long)pal, L32(pal + 0x30),
+                           (unsigned long long)L64(0x60210c0), L32(O + 0xb0), ldfp(O + 0xc0), ldfp(O + 0xc4),
+                           ldfp(O + 0xc8), ldfp(O + 0xcc));
+                c->x[0] = O;
+                c->x[1] = T - 0xb0;
+                f_701d88_orig(c);
+                return;
+            }
+        } while (L32(tab + idx * 8) != key);
+        const uint32_t pi = L32(tab + idx * 8 + 4);
+        const uint64_t pipe = L64(0x5ea1670 + 8 * (uint64_t)pi);
+        memcpy(GP(D), &pipe, 8);
+    }
+    /* 256 bytes of constants */
+    uint64_t al = L64(0x6039f88), blk = L64(al + 0x50), cur;
+    if (blk && (blk - L64(blk + 8)) + 0x80000 > 0xff) {
+        cur = L64(blk + 8);
+    } else {
+        const uint64_t heap = L64(0x6039f60);
+        c->x[0] = heap;
+        c->x[1] = 0x80000;
+        c->x[2] = 0x100;
+        c->x[3] = 0;
+        c->x[4] = 0;
+        c->x[5] = 0;
+        c->sp = D;
+        rt_call(c, L64(L64(heap)));
+        blk = c->x[0];
+        const uint64_t z = 0, end = blk + 0x100;
+        memcpy(GP(blk), &z, 8);
+        memcpy(GP(blk + 8), &end, 8);
+        memcpy(GP(blk + 0x10), &z, 8);
+        const uint64_t tail = L64(al + 0x50);
+        memcpy(GP(tail ? tail : al + 0x48), &blk, 8);
+        memcpy(GP(al + 0x50), &blk, 8);
+        cur = L64(blk + 8);
+        al = L64(0x6039f88);
+    }
+    {
+        const uint64_t nx = cur + 0x100, blk2 = L64(al + 0x50);
+        memcpy(GP(blk + 8), &nx, 8);
+        memcpy(GP(D + 0x50), &blk2, 8);
+        memcpy(GP(D + 0x58), &cur, 8);
+        memcpy(GP(D + 0x60), GP(0x1d4e160), 8);
+    }
+    {
+        float *k = GP(cur);
+        memcpy(k, GP(L64(O + 8)), 64);
+        const float s0 = ldfp(0x6039f5c), s1 = ldfp(0x6039f58);
+        k[12] = floorf(k[12] * s0 + 0.5f) * s1;
+        k[13] = floorf(k[13] * s0 + 0.5f) * s1;
+        for (int i = 0; i < 4; i++)
+            k[16 + i] = (float)L8(O + 0xb0 + i) / 255.0f;
+        memset(&k[20], 0, 16);
+        const float c0 = ldfp(O + 0xc0), c4 = ldfp(O + 0xc4);
+        if (c0 < c4) {
+            k[28] = c0;
+            k[29] = c4;
+            const float c8 = ldfp(O + 0xc8), cc = ldfp(O + 0xcc);
+            k[30] = c8 < cc ? c8 : cc;
+            k[31] = c8 > cc ? c8 : cc;
+        }
+    }
+    c->x[0] = L64(O + 0x98);
+    c->x[1] = D;
+    c->x[2] = cur + 0x60;
+    c->sp = D;
+    f_1b5b10(c);
+    uint8_t *d = GP(D);
+    d[0x1e9] = 0;
+    {
+        const uint64_t z = 0, a8 = L64(0x603a548), a9 = L64(O + 0xa8), a28 = L64(0x604dc38);
+        memcpy(d + 0x18, &z, 8);
+        memcpy(d + 0x20, &a8, 8);
+        memcpy(d + 0x8, &a9, 8);
+        memcpy(d + 0x10, &z, 8);
+        memcpy(d + 0x28, &a28, 8);
+    }
+    const uint8_t stencil = L8(O + 0xbc);
+    if (stencil) {
+        const uint16_t two = 2, ff = 0xffff;
+        d[0x206] = 1;
+        memcpy(d + 0x1fe, &two, 2);
+        memcpy(d + 0x202, &two, 2);
+        memcpy(d + 0x1f9, &ff, 2);
+        d[0x1fb] = stencil;
+    }
+    for (int r = 0; r < 2; r++) {
+        const uint64_t base = O + (r ? 0xe0 : 0xd0);
+        const uint32_t cnt = *(uint16_t *)GP(base + 8);
+        if (!cnt)
+            break;
+        d = GP(D);
+        const uint32_t w200 = 0x200, one = 1, first = *(uint16_t *)GP(base + 0xa);
+        const uint64_t idxbuf = L64(base);
+        const uint16_t h1 = 1;
+        memcpy(d + 0xf8, &w200, 4);
+        memcpy(d + 0x100, &idxbuf, 8);
+        d[0x1b8] = L8(O + 0xbd) ^ 1;
+        memcpy(d + 0x1b9, &h1, 2);
+        d[0x1bb] = 0x80;
+        memcpy(d + 0x210, &first, 4);
+        memcpy(d + 0x214, &cnt, 4);
+        memcpy(d + 0x218, &one, 4);
+        uint32_t fl;
+        memcpy(&fl, d + 0x21c, 4);
+        fl |= 1;
+        memcpy(d + 0x21c, &fl, 4);
+        c->x[0] = list;
+        c->x[1] = D;
+        c->sp = D;
+        f_1df70c(c);
+    }
+    c->sp = saved_sp;
 }
