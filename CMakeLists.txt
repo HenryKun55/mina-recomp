@@ -138,7 +138,7 @@ if(VITA)
     ScePower_stub SceAppMgr_stub SceAppUtil_stub SceIme_stub SceLibKernel_stub SceProcessmgr_stub
     SceIofilemgr_stub stdc++ pthread m c)
   # scripted pad input (MINA_INPUT "vita:<button>") joins the real pad's (runtime/src/sdl.c)
-  target_link_options(mina PRIVATE -Wl,--wrap=sceCtrlPeekBufferPositive2)
+  target_link_options(mina PRIVATE -Wl,--wrap=sceCtrlPeekBufferPositive2 -Wl,--wrap=__malloc_lock -Wl,--wrap=__malloc_unlock)
   if(MINA_LTO)
     target_link_options(mina PRIVATE -flto=auto ${MINA_ARCH_FLAGS} -ffp-contract=off -fno-strict-aliasing)
   endif()

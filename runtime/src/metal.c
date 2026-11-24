@@ -2866,6 +2866,10 @@ void metal_present(uint64_t drawable)
                     g_timed_calls[k] = 0;
                 }
                 rt_icall_report(frames);
+                {
+                    void mlock_report(int frames);
+                    mlock_report(frames);
+                }
                 void rt_log_flush(void);
                 rt_log_flush();
                 g_draw_calls = 0;

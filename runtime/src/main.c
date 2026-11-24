@@ -47,6 +47,10 @@ int main(int argc, char **argv)
 {
 #if defined(__vita__)
     load_env_file();
+    {
+        void mlock_configure(void);
+        mlock_configure();
+    }
     {   /* the fastest clocks an application may ask for (the defaults are lower:
          * CPU 333 MHz); MINA_CLOCKS=0 keeps them */
         int scePowerSetArmClockFrequency(int), scePowerSetBusClockFrequency(int);
