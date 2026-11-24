@@ -136,6 +136,24 @@ static void hc_leave(HcHdr *h)
     free(h);
 }
 
+/* MINA_FPS: heap calls over 2 ms (the console's play stalled in allocations) */
+#include <psp2/kernel/processmgr.h>
+static uint64_t slow_now(void) { return sceKernelGetProcessTimeWide(); }
+static void slow_note(const char *what, uint64_t t0, uint64_t size)
+{
+    const uint64_t dt = slow_now() - t0;
+    if (dt < 2000)
+        return;
+    static int on = -1;
+    if (on < 0)
+        on = getenv("MINA_FPS") != NULL;
+    if (!on)
+        return;
+    Ctx *thread_ctx(void);
+    Ctx *tc = thread_ctx();
+    rt_log("[slowheap] %s of %llu bytes: %.1f ms (thread %u)\n", what, (unsigned long long)size, dt / 1000.0,
+           tc ? tc->thread_id : 0);
+}
 uint32_t gmalloc(uint64_t size)
 {
     if (size > 0x20000000ull)
@@ -149,7 +167,9 @@ uint32_t gmalloc(uint64_t size)
         memset((uint8_t *)(h + 1) + size, HC_CANARY, 16);
         return guest_addr(h + 1);
     }
+    const uint64_t t0 = slow_now();
     void *p = memalign(16, size ? (size_t)size : 1);
+    slow_note("malloc", t0, size);
     if (!p) {
         rt_log("guest heap: %llu bytes not available\n", (unsigned long long)size);
         static int told;
@@ -211,7 +231,9 @@ void gfree(uint32_t a)
         return;
     }
     heap_in_use -= malloc_usable_size(G(a));
+    const uint64_t t0 = slow_now();
     free(G(a));
+    slow_note("free", t0, 0);
 }
 uint64_t gmalloc_usable(uint32_t a)
 {
@@ -223,8 +245,10 @@ uint32_t gcalloc(uint64_t n, uint64_t size)
 {
     uint64_t total = n * size;
     uint32_t a = gmalloc(total);
+    const uint64_t t0 = slow_now();
     if (a)
         memset(G(a), 0, (size_t)total);
+    slow_note("calloc's memset", t0, total);
     return a;
 }
 uint32_t grealloc(uint32_t a, uint64_t size)

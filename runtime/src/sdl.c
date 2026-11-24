@@ -374,7 +374,17 @@ void nat_SDL_GetMouseFocus(Ctx *c) { RET(window_guest(SDL_GetMouseFocus())); }
 void nat_SDL_GetRelativeMouseMode(Ctx *c) { RET(SDL_GetRelativeMouseMode()); }
 void nat_SDL_SetRelativeMouseMode(Ctx *c) { ON_MAIN(nat_SDL_SetRelativeMouseMode); RET((uint64_t)(int64_t)SDL_SetRelativeMouseMode((SDL_bool)(A0 & 1))); }
 void nat_SDL_WarpMouseGlobal(Ctx *c) { ON_MAIN(nat_SDL_WarpMouseGlobal); RET((uint64_t)(int64_t)SDL_WarpMouseGlobal((int)A0, (int)A1)); }
-void nat_SDL_ShowCursor(Ctx *c) { ON_MAIN(nat_SDL_ShowCursor); RET((uint64_t)(int64_t)SDL_ShowCursor((int)A0)); }
+void nat_SDL_ShowCursor(Ctx *c)
+{
+#if defined(__vita__)
+    /* no cursor: answered here (the game asks during play; through the main
+     * thread it waited for it, up to 100 ms on the console) */
+    RET(0);
+    return;
+#endif
+    ON_MAIN(nat_SDL_ShowCursor);
+    RET((uint64_t)(int64_t)SDL_ShowCursor((int)A0));
+}
 
 /* ---- events ----------------------------------------------------------------------------- */
 
