@@ -2192,6 +2192,27 @@ void f_1ced98_orig(Ctx *c);
 void nat__ZN12ycGameThread10ThreadMainEPv(Ctx *c)
 {
     pin_to_core(0, "game thread");
+    {
+        /* The frame semaphore (signalled when the renderer commits a frame,
+         * waited on by this loop before each one) starts at 1 on the Vita: the
+         * game builds its next frame while the renderer draws the last one,
+         * instead of game, renderer, game... in turn (the deck: 54-58 fps,
+         * frames with a world step 28 ms; 60.0, worst 21 ms). The command lists
+         * come from a pool; uploads to textures still drawn may show a frame
+         * early. MINA_FRAME_SLACK=n: n frames (0: the game's lockstep) */
+        const char *v = getenv("MINA_FRAME_SLACK");
+#if defined(__vita__)
+        const int n = v ? atoi(v) : 1;
+#else
+        const int n = v ? atoi(v) : 0;
+#endif
+        void rt_dispatch_semaphore_signal(uint64_t sem);
+        const uint64_t sem = rt_ld64(G(0x6033bf8));
+        for (int i = 0; i < n && sem; i++)
+            rt_dispatch_semaphore_signal(sem);
+        if (n)
+            rt_log("[thread] frame semaphore %#llx starts at %d\n", (unsigned long long)sem, n);
+    }
     f_1ced98_orig(c);
 }
 void f_1dfccc_orig(Ctx *c);

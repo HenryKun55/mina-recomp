@@ -633,6 +633,15 @@ static int hsem_wait_(HSem *s, uint64_t timeout)
         clock_gettime(CLOCK_MONOTONIC, &now);
         uint64_t now_ns = (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
         uint64_t wait_ns = timeout > now_ns ? timeout - now_ns : 0;
+        if (wait_ns == 0) {
+            /* a poll (DISPATCH_TIME_NOW, the game thread's every frame): no
+             * timed wait, which on the Vita sleeps ~1 ms even when already due */
+            const int got = s->count > 0;
+            if (got)
+                s->count--;
+            pthread_mutex_unlock(&s->m);
+            return !got;
+        }
         struct timespec dl;
         clock_gettime(CLOCK_REALTIME, &dl);
         uint64_t t = (uint64_t)dl.tv_sec * 1000000000ull + (uint64_t)dl.tv_nsec + wait_ns;
@@ -660,9 +669,41 @@ static uint32_t dobj_new(uint32_t kind, void *host)
 }
 static void *dobj_host(uint64_t a) { return (void *)(uintptr_t)rt_ld64(G(a + 8)); }
 
+/* the runtime signalling one of the game's dispatch semaphores (by its guest object) */
+void rt_dispatch_semaphore_signal(uint64_t sem) { hsem_signal(dobj_host(sem)); }
 static void imp_dispatch_semaphore_create(Ctx *c) { RET(dobj_new(DOBJ_SEM, hsem_new((long)A0))); }
 static void imp_dispatch_semaphore_signal(Ctx *c) { hsem_signal(dobj_host(A0)); RET(0); }
-static void imp_dispatch_semaphore_wait(Ctx *c) { RET(hsem_wait(dobj_host(A0), A1)); }
+/* MINA_SEMWHO: time waiting in semaphores, by thread and semaphore (ms per
+ * frame, in the [fps] lines) */
+uint32_t g_semwho_lr[16], g_semwho_tid[16];
+uint64_t g_semwho_ns[16];
+static void imp_dispatch_semaphore_wait(Ctx *c)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("MINA_SEMWHO") != NULL;
+    if (!on) {
+        RET(hsem_wait(dobj_host(A0), A1));
+        return;
+    }
+    const uint32_t lr = (uint32_t)A0, tid = c->thread_id;      /* the semaphore (the import's caller is not known) */
+    struct timespec a, b;
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    const int r = hsem_wait(dobj_host(A0), A1);
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    const uint64_t ns = (uint64_t)(b.tv_sec - a.tv_sec) * 1000000000ull + (uint64_t)(b.tv_nsec - a.tv_nsec);
+    for (int i = 0; i < 16; i++)
+        if (g_semwho_lr[i] == lr && g_semwho_tid[i] == tid) {
+            __atomic_fetch_add(&g_semwho_ns[i], ns, __ATOMIC_RELAXED);
+            break;
+        } else if (!g_semwho_lr[i]) {
+            g_semwho_tid[i] = tid;
+            g_semwho_ns[i] = ns;
+            __atomic_store_n(&g_semwho_lr[i], lr, __ATOMIC_RELEASE);
+            break;
+        }
+    RET(r);
+}
 
 static void imp_dispatch_time(Ctx *c)
 {

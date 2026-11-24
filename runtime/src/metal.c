@@ -2418,6 +2418,21 @@ static void cb_commit(Ctx *c)
     uint64_t self = SELF;
     MCmdBuf *cb = objc_host(self);
     cb->committed = 1;
+    /* The completed handlers release the game thread for its next frame
+     * (ycRenderWindow::Present's, the frame semaphore its ThreadMain waits on
+     * before each frame). Every draw of this buffer is already issued (vitaGL
+     * copies what it needs), so they run before the present: the game builds
+     * its next frame while this one is swapped (MINA_LATE_SIGNAL=1: after) */
+    static int late = -1;
+    if (late < 0)
+        late = getenv("MINA_LATE_SIGNAL") != NULL;
+    if (!late) {
+        for (int i = 0; i < cb->nhandlers; i++) {
+            block_call(c, cb->handlers[i], 1, self);
+            block_release(c, cb->handlers[i]);
+        }
+        cb->nhandlers = 0;
+    }
     if (cb->present) {
         metal_present(cb->present);
         objc_release_obj(cb->present);
@@ -2765,6 +2780,23 @@ void metal_present(uint64_t drawable)
                     if (n)
                         rt_log("[fps]   semaphore waits per frame (ms):%s\n", b);
                     memset(g_sem_wait_ns, 0, sizeof g_sem_wait_ns);
+                    extern uint32_t g_semwho_lr[16], g_semwho_tid[16];
+                    extern uint64_t g_semwho_ns[16];
+                    n = 0;
+                    for (int i = 0; i < 16 && g_semwho_lr[i]; i++) {
+                        if (g_semwho_ns[i] / frames > 100000 && n < 200)
+                            n += snprintf(b + n, sizeof b - n, " t%u@%x %.1f", g_semwho_tid[i], g_semwho_lr[i],
+                                          g_semwho_ns[i] / 1e6 / frames);
+                        g_semwho_ns[i] = 0;
+                    }
+                    if (n)
+                        rt_log("[fps]   semaphore waits by thread@semaphore (ms per frame):%s\n", b);
+                    {
+                        static int once;
+                        if (n && !once++)
+                            rt_log("[semwho] frame semaphores: 0x6033bf8 -> %#llx, 0x60336b8 -> %#llx\n",
+                                   (unsigned long long)rt_ld64(G(0x6033bf8)), (unsigned long long)rt_ld64(G(0x60336b8)));
+                    }
                 }
                 {
                     extern uint32_t g_recalcs, g_recalc_same;
