@@ -975,7 +975,7 @@ void metal_buffers_report(void)
  * with the heap ~90% used, its free space ended in thousands of pieces and a
  * 1.25 MiB block could not be found (the console's crash: 23 MiB free in
  * 20745 pieces). Their memory stays in a pool instead (up to STAGE_POOL
- * blocks), all zero: only the written part is cleared on the way in. */
+ * blocks), cleared when taken again. */
 #define STAGE_POOL 16
 static uint32_t stage_pool[STAGE_POOL];
 static int nstage_pool;
@@ -986,8 +986,10 @@ static uint32_t stage_alloc(uint32_t len)
         pthread_mutex_lock(&stage_lock);
         const uint32_t a = nstage_pool ? stage_pool[--nstage_pool] : 0;
         pthread_mutex_unlock(&stage_lock);
-        if (a)
+        if (a) {
+            memset(G(a), 0, len);      /* whole: the game may write through an old pointer */
             return a;
+        }
     }
     return gcalloc(1, len ? len : 16);
 }
@@ -2915,10 +2917,6 @@ void metal_present(uint64_t drawable)
                     g_timed_calls[k] = 0;
                 }
                 rt_icall_report(frames);
-                {
-                    void mlock_report(int frames);
-                    mlock_report(frames);
-                }
 #if defined(__vita__)
                 {   /* every 30 s: the guest heap (newlib's) and the staging pool */
                     static int every;
