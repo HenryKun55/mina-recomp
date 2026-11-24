@@ -214,10 +214,18 @@ void rt_bad_jump(Ctx *c, uint32_t pc, uint64_t target)
 /* No terminal on the Vita: the log goes to ux0:data/mina/mina.log (sceIo
  * directly, so it survives an abort). */
 #include <psp2/io/fcntl.h>
+#include <psp2/kernel/threadmgr.h>
+/* Writes to the memory card take tens of ms (each opens the file: what is
+ * written survives a crash). Lines starting with '[' (the periodic reports and
+ * diagnostics) wait in a buffer that a thread of the lowest priority writes
+ * every 100 ms: in the presenting thread (the [fps] report, every 2 s) they
+ * were a 70-120 ms hitch on the console. Any other line (errors, crash
+ * reports) is written at once, after what waits. */
 static SceUID log_fd = -1;
-static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
-static char log_hold[16384];
-static int log_held;
+static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;   /* the buffer */
+static pthread_mutex_t io_lock = PTHREAD_MUTEX_INITIALIZER;    /* the file (taken after log_lock) */
+static char log_hold[65536], log_out[65536];
+static int log_held, log_writer;
 static void log_put(const char *p, int n)
 {
     if (n <= 0)
@@ -230,6 +238,32 @@ static void log_put(const char *p, int n)
         log_fd = 1;
     }
 }
+/* with log_lock held: the buffer out to the file (io_lock taken, log_lock
+ * released, so new lines can wait meanwhile) */
+static void log_drain_locked(void)
+{
+    const int n = log_held;
+    memcpy(log_out, log_hold, (size_t)n);
+    log_held = 0;
+    pthread_mutex_lock(&io_lock);
+    pthread_mutex_unlock(&log_lock);
+    log_put(log_out, n);
+    pthread_mutex_unlock(&io_lock);
+}
+static int log_writer_entry(SceSize args, void *argp)
+{
+    (void)args;
+    (void)argp;
+    for (;;) {
+        sceKernelDelayThread(100000);
+        pthread_mutex_lock(&log_lock);
+        if (log_held)
+            log_drain_locked();
+        else
+            pthread_mutex_unlock(&log_lock);
+    }
+    return 0;
+}
 static void log_write(const char *fmt, va_list ap)
 {
     char buf[2048];
@@ -238,34 +272,32 @@ static void log_write(const char *fmt, va_list ap)
         return;
     if (n > (int)sizeof buf - 1)
         n = (int)sizeof buf - 1;
-    /* opened and closed every time: what is written survives a crash. The
-     * periodic reports ([fps], [prof]) wait in a buffer and go in one write
-     * (each open costs the memory card milliseconds); any other line writes
-     * them first. */
     pthread_mutex_lock(&log_lock);
-    const int report = !strncmp(buf, "[fps]", 5) || !strncmp(buf, "[prof]", 6);
-    if (report && log_held + n < (int)sizeof log_hold) {
+    if (!log_writer) {
+        log_writer = 1;
+        SceUID t = sceKernelCreateThread("mina_log", log_writer_entry, 191, 0x4000, 0, SCE_KERNEL_CPU_MASK_USER_2, NULL);   /* the audio core: never the game's or the renderer's */
+        if (t >= 0)
+            sceKernelStartThread(t, 0, NULL);
+        else
+            log_writer = -1;
+    }
+    const int later = buf[0] == '[' && log_writer > 0;
+    if (later && log_held + n <= (int)sizeof log_hold) {
         memcpy(log_hold + log_held, buf, (size_t)n);
         log_held += n;
-    } else {
-        log_put(log_hold, log_held);
-        log_held = 0;
-        if (report) {
-            memcpy(log_hold, buf, (size_t)n);
-            log_held = n;
-        } else {
-            log_put(buf, n);
-        }
+        pthread_mutex_unlock(&log_lock);
+        return;
     }
-    pthread_mutex_unlock(&log_lock);
-}
-void rt_log_flush(void)
-{
-    pthread_mutex_lock(&log_lock);
+    /* now: what waits first, then this line */
+    pthread_mutex_lock(&io_lock);
     log_put(log_hold, log_held);
     log_held = 0;
     pthread_mutex_unlock(&log_lock);
+    log_put(buf, n);
+    pthread_mutex_unlock(&io_lock);
 }
+/* the reports are done: the writer takes them (no write here) */
+void rt_log_flush(void) {}
 #else
 void rt_log_flush(void) {}
 #endif
