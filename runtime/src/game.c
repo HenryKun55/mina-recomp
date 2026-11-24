@@ -141,6 +141,8 @@ static void spk_check(Ctx *c, const Spk *k, const char *what)
            dt / 1000.0, (g_spk_io_us[id] - k->io) / 1000.0, g_spk_io_n[id] - k->n,
            g_spk_io_n[id] != k->n ? g_spk_io_file[id] : "-", (g_spk_tex_us[id] - k->tex) / 1000.0,
            (g_spk_lock_us[id] - k->lock) / 1000.0);
+    void rt_profile_spike(uint64_t t0, uint64_t t1);
+    rt_profile_spike(k->t, now_us());
 }
 void nat__ZN4Game11FixedUpdateEv(Ctx *c)
 {
@@ -2237,6 +2239,10 @@ void f_1ced98_orig(Ctx *c);
 void nat__ZN12ycGameThread10ThreadMainEPv(Ctx *c)
 {
     pin_to_core(0, "game thread");
+    {
+        extern uint32_t g_game_tid;
+        g_game_tid = c->thread_id;
+    }
     {
         /* The frame semaphore (signalled when the renderer commits a frame,
          * waited on by this loop before each one) starts at 1 on the Vita: the
