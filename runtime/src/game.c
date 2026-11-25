@@ -5675,7 +5675,7 @@ void nat__ZN13ycUpdateQueue6UpdateEf(Ctx *c)
 /* ---- MINA_ZONES=1: time spent in a few of the game's functions (ms per frame in the [fps] lines) */
 uint64_t g_zone_us[8];
 const char *const g_zone_name[8] = { "ReapplyGroupPal", "SoundComponent", "SaveManager", "MessagePrompt",
-                                     "HUDCamera", "UpdateQueue", "RefreshWorldTransform", NULL };
+                                     "HUDCamera", "UpdateQueue", "RefreshWorldTransform", "GameRender" };
 int g_zones = -1;
 static inline int zones_on(void)
 {
@@ -5700,6 +5700,7 @@ ZONE_NATIVE(nat__ZN14SoundComponent6UpdateEf, f_ab9e88_orig, 1)
 ZONE_NATIVE(nat__ZN11SaveManager6UpdateEf, f_a7f92c_orig, 2)
 ZONE_NATIVE(nat__ZN20MessagePromptManager6UpdateEf, f_439148_orig, 3)
 ZONE_NATIVE(nat__ZN9HUDCamera6UpdateEv, f_9b30f0_orig, 4)
+ZONE_NATIVE(nat__ZN4Game6RenderEv, f_9a0b2c_orig, 7)
 
 /* ---- TileLevelRenderObject::Render (x0 the object O, x1 the render context): a draw call
  * on the guest stack, a copy of the context's template (+0xb0, 0x220 bytes); its pipeline
@@ -6260,4 +6261,85 @@ void nat__ZN15DarknessManager8CalcTileEib(Ctx *c)
     }
     if ((checked & 0xffff) == 0)
         rt_log("[verify] CalcTile: %u checked, %u differ\n", checked, bad);
+}
+
+/* ---- hashlittle (Bob Jenkins' lookup3; the game's ignores its initval: 1337 built in) ------------
+ * Strings hashed everywhere (names of animations, properties, files): the byte-wise lookup3,
+ * which gives the word-wise result on a little-endian machine. MINA_VERIFY_HASH=1 compares. */
+void f_1b7b4c_orig(Ctx *c);
+#define HL_ROT(x, k) (((x) << (k)) | ((x) >> (32 - (k))))
+#define HL_MIX(a, b, c)                                                                                  \
+    {                                                                                                    \
+        a -= c; a ^= HL_ROT(c, 4); c += b;                                                               \
+        b -= a; b ^= HL_ROT(a, 6); a += c;                                                               \
+        c -= b; c ^= HL_ROT(b, 8); b += a;                                                               \
+        a -= c; a ^= HL_ROT(c, 16); c += b;                                                              \
+        b -= a; b ^= HL_ROT(a, 19); a += c;                                                              \
+        c -= b; c ^= HL_ROT(b, 4); b += a;                                                               \
+    }
+#define HL_FINAL(a, b, c)                                                                                \
+    {                                                                                                    \
+        c ^= b; c -= HL_ROT(b, 14);                                                                      \
+        a ^= c; a -= HL_ROT(c, 11);                                                                      \
+        b ^= a; b -= HL_ROT(a, 25);                                                                      \
+        c ^= b; c -= HL_ROT(b, 16);                                                                      \
+        a ^= c; a -= HL_ROT(c, 4);                                                                       \
+        b ^= a; b -= HL_ROT(a, 14);                                                                      \
+        c ^= b; c -= HL_ROT(b, 24);                                                                      \
+    }
+static uint32_t hash_little(const uint8_t *k, uint32_t length)
+{
+    uint32_t a, b, c;
+    a = b = c = 0xdeadbeefu + length + 1337u;
+    while (length > 12) {
+        uint32_t w[3];
+        memcpy(w, k, 12);
+        a += w[0];
+        b += w[1];
+        c += w[2];
+        HL_MIX(a, b, c);
+        length -= 12;
+        k += 12;
+    }
+    switch (length) {
+    case 12: c += (uint32_t)k[11] << 24; /* fall through */
+    case 11: c += (uint32_t)k[10] << 16; /* fall through */
+    case 10: c += (uint32_t)k[9] << 8;   /* fall through */
+    case 9: c += k[8];                   /* fall through */
+    case 8: b += (uint32_t)k[7] << 24;   /* fall through */
+    case 7: b += (uint32_t)k[6] << 16;   /* fall through */
+    case 6: b += (uint32_t)k[5] << 8;    /* fall through */
+    case 5: b += k[4];                   /* fall through */
+    case 4: a += (uint32_t)k[3] << 24;   /* fall through */
+    case 3: a += (uint32_t)k[2] << 16;   /* fall through */
+    case 2: a += (uint32_t)k[1] << 8;    /* fall through */
+    case 1: a += k[0]; break;
+    case 0: return c;
+    }
+    HL_FINAL(a, b, c);
+    return c;
+}
+void nat__Z10hashlittlePKvmj(Ctx *c)
+{
+    static int verify = -1, off = -1;
+    if (off < 0) {
+        off = rt_native_off("__Z10hashlittlePKvmj");
+        verify = getenv("MINA_VERIFY_HASH") != NULL;
+    }
+    if (off || c->x[1] >> 31) {
+        f_1b7b4c_orig(c);
+        return;
+    }
+    const uint32_t h = hash_little(G(c->x[0]), (uint32_t)c->x[1]);
+    if (verify) {
+        static uint32_t checked, bad;
+        f_1b7b4c_orig(c);
+        checked++;
+        if ((uint32_t)c->x[0] != h && bad++ < 10)
+            rt_log("[verify] hashlittle differs: %#x / %#x (length %u)\n", h, (uint32_t)c->x[0], (uint32_t)c->x[1]);
+        if ((checked & 0xffff) == 0)
+            rt_log("[verify] hashlittle: %u checked, %u differ\n", checked, bad);
+        return;
+    }
+    c->x[0] = h;
 }

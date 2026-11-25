@@ -144,3 +144,5 @@ __ZN11NewShopSign6UpdateEf
 __ZN15DarknessManager6UpdateEP20ycUpdateQueueContext
 __ZNK13DarknessLight6GetPosEv
 __ZN15DarknessManager8CalcTileEib
+__ZN4Game6RenderEv
+__Z10hashlittlePKvmj
