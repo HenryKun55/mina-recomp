@@ -5921,3 +5921,56 @@ void nat__ZN14ycSysAllocator4FreeEPvy(Ctx *c)
     }
     f_1e4b5c_orig(c);
 }
+
+/* ---- Shop::IsOutOfStock (x0 the ShopDef, x1 its OutInfo out, 0x18 bytes) --------------------
+ * NewShopSign::Update asks it every step for its shop (whether there is something new to buy):
+ * ~2 ms each at 240 MHz (every item through linear searches of the 361 item definitions and
+ * string hashes), 2 of the hub's 14 ms. For the signs the answer is kept per shop and asked
+ * again every 30 steps (half a second at 60); any other caller (shop menus, merchants, buying)
+ * gets the game's answer and drops the kept ones. MINA_NO_NATIVES=IsOutOfStock: always asked. */
+void f_aa0ec4_orig(Ctx *c);
+void f_39277c_orig(Ctx *c);
+static int in_shop_sign;
+typedef struct { uint64_t def, ret; uint8_t out[0x18]; uint32_t age; } ShopMemo;
+static ShopMemo shop_memo[8];
+static int shop_memo_n;
+void nat__ZN11NewShopSign6UpdateEf(Ctx *c)
+{
+    in_shop_sign++;
+    f_39277c_orig(c);
+    in_shop_sign--;
+}
+void nat__ZN4Shop12IsOutOfStockEPK7ShopDefRNS_7OutInfoE(Ctx *c)
+{
+    static int off = -1;
+    if (off < 0)
+        off = rt_native_off("__ZN4Shop12IsOutOfStockEPK7ShopDefRNS_7OutInfoE");
+    if (off || !in_shop_sign) {
+        shop_memo_n = 0;
+        f_aa0ec4_orig(c);
+        return;
+    }
+    const uint64_t def = c->x[0], out = c->x[1];
+    for (int i = 0; i < shop_memo_n; i++) {
+        ShopMemo *m = &shop_memo[i];
+        if (m->def == def && ++m->age < 30) {
+            memcpy(G(out), m->out, sizeof m->out);
+            c->x[0] = m->ret;
+            return;
+        }
+    }
+    f_aa0ec4_orig(c);
+    int i = 0;
+    while (i < shop_memo_n && shop_memo[i].def != def)
+        i++;
+    if (i == shop_memo_n) {
+        if (shop_memo_n == 8)
+            i = 0;
+        else
+            shop_memo_n++;
+    }
+    shop_memo[i].def = def;
+    shop_memo[i].ret = (uint32_t)c->x[0];
+    shop_memo[i].age = 0;
+    memcpy(shop_memo[i].out, G(out), sizeof shop_memo[i].out);
+}
