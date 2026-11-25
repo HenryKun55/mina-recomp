@@ -6409,6 +6409,43 @@ static void dk_calc(Ctx *c, uint64_t M, uint32_t i, uint32_t force)
     c->x[2] = force;
     nat__ZN15DarknessManager8CalcTileEib(c);
 }
+/* the inputs of every CalcTile of M (see darkness_update); 0 when they don't fit or a light's
+ * mode makes CalcTile write whatever it finds */
+static int dk_sig(uint8_t *gm_, uint64_t M, uint64_t E, uint8_t *buf, uint32_t *len)
+{
+    uint32_t n = 0;
+    int ok = 1;
+    uint32_t w23 = 0, w24 = 0;
+#define DK_SIG(addr, l) do { if (n + (l) > 4096) ok = 0; else { memcpy(buf + n, GP(addr), (l)); n += (l); } } while (0)
+    DK_SIG(M + 0x170, 0x40);                 /* grid, sprites, lists, 0x198 values, W, H, count */
+    DK_SIG(E + 0xdc, 12);
+    for (uint64_t node = lp(M + 0x180); node && ok; node = lp(node + 0x18)) {
+        const uint64_t L = lp(node + 8);
+        DK_SIG(node + 8, 4);
+        DK_SIG(L + 0x58, 0x48);              /* owner, offsets, flags, boxes, 0x98/0x9c */
+        if (*(uint8_t *)GP(L + 0x98)) {
+            w23 = 1;
+            w24 = rt_ld32(GP(L + 0x9c));
+        }
+        const uint64_t o = lp(L + 0x58);
+        DK_SIG(o + 0x144, 4);
+        DK_SIG(lp(o + 0x10) + 0xdc, 12);
+    }
+    const uint64_t E50 = lp(E + 0x50);
+    DK_SIG(E50 + 0x778, 4);
+    for (uint64_t an = lp(E50 + 0x778); an && ok; an = lp(an + 0x18)) {
+        const uint64_t A = lp(an + 8);
+        DK_SIG(an + 8, 4);
+        if (!A)
+            continue;
+        DK_SIG(A + 0x170, 0x38);             /* flags, values, its box and the position it is for */
+        DK_SIG(lp(A + 0x10) + 0xd0, 0x18);
+    }
+    DK_SIG(0x1e14e28, 4);
+#undef DK_SIG
+    *len = n;
+    return ok && !(w23 && (w24 == 1 || w24 == 2));
+}
 static void darkness_update(Ctx *c)
 {
     GM_BEGIN;
@@ -6462,8 +6499,44 @@ static void darkness_update(Ctx *c)
             dk_calc(c, M, i, 1);
         *(uint8_t *)GP(M + 0x1b5) = 1;
     } else {
-        for (uint32_t i = 0; (int32_t)i < (int32_t)rt_ld32(GP(M + 0x1ac)); i++)
-            dk_calc(c, M, i, 0);
+        /* what every CalcTile(i, false) reads: when it's all as at the last Update and the
+         * grid's levels are the ones they wrote, they would write nothing */
+        /* what every CalcTile(i, false) reads: when it's all as after the last Update's and the
+         * grid's levels are the ones they wrote, they would write nothing (unless a light's mode
+         * makes them write anyway: w23 with w24 1 or 2) */
+        static uint8_t sig_old[4096], sig_cur[4096], lvl[4096];
+        static uint32_t siglen, lvl_n;
+        static uint64_t sigM;
+        static int have;
+        uint32_t n = 0;
+        int ok = dk_sig(gm_, M, E, sig_cur, &n);
+        const uint32_t cnt = rt_ld32(GP(M + 0x1ac));
+        const uint64_t T = lp(M + 0x170);
+        int same = ok && have && sigM == M && siglen == n && lvl_n == cnt && !memcmp(sig_cur, sig_old, n);
+        for (uint32_t i = 0; same && i < cnt; i++)
+            same = rt_ld32(GP(T + (uint64_t)i * 12 + 4)) == lvl[i];
+        static int noskip = -1;
+        if (noskip < 0)
+            noskip = getenv("MINA_DARK_NOSKIP") != NULL;
+        if (!same || noskip) {
+            for (uint32_t i = 0; (int32_t)i < (int32_t)rt_ld32(GP(M + 0x1ac)); i++)
+                dk_calc(c, M, i, 0);
+            have = 0;
+            const uint32_t cnt2 = rt_ld32(GP(M + 0x1ac));
+            const uint64_t T2 = lp(M + 0x170);
+            uint32_t m = 0;
+            if (cnt2 <= sizeof lvl && dk_sig(gm_, M, E, sig_old, &m)) {
+                for (uint32_t i = 0; i < cnt2; i++)
+                    lvl[i] = (uint8_t)rt_ld32(GP(T2 + (uint64_t)i * 12 + 4));
+                int fits = 1;
+                for (uint32_t i = 0; i < cnt2; i++)
+                    fits &= rt_ld32(GP(T2 + (uint64_t)i * 12 + 4)) == lvl[i];
+                siglen = m;
+                sigM = M;
+                lvl_n = cnt2;
+                have = fits;
+            }
+        }
     }
     /* each tile's fade and sprite */
     static uint32_t hname[4];
