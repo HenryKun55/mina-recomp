@@ -5434,13 +5434,64 @@ static inline uint32_t find_u32(const uint8_t *a, uint32_t n, uint32_t x)
     }
     return n;
 }
+/* Inside a ycPaletteComponent::Update (pal_scope) the palettes searched (a group's, a base) don't
+ * change: only the component's own palette (pal_avoid, its colors) is written. There a palette
+ * searched again and again (per color of an animation) gets a table of the first index of each
+ * of its colors, built at its third search in the scope; outside, or for the component's own
+ * palette, the scan. */
+static int pal_scope;
+static uint32_t pal_gen;
+static uint32_t pal_avoid;
+typedef struct { uint32_t cols, n, gen, calls, stamp; } PalHash;
+static PalHash pal_h[4];
+static uint32_t pal_hk[4][512], pal_hv[4][512], pal_hs[4][512], pal_stamp;
+static inline uint32_t pal_hash(uint32_t x) { return (x * 2654435761u) >> 23; }
+static uint32_t find_first(uint8_t *gm_, uint32_t cols, uint32_t n, uint32_t x)
+{
+    const uint8_t *a = GP(cols);
+    if (!pal_scope || n < 16 || n > 256 || cols == pal_avoid)
+        return find_u32(a, n, x);
+    int k = 0;
+    while (k < 4 && !(pal_h[k].cols == cols && pal_h[k].n == n && pal_h[k].gen == pal_gen))
+        k++;
+    if (k == 4) {
+        k = (int)((cols >> 4) & 3);
+        pal_h[k].cols = cols;
+        pal_h[k].n = n;
+        pal_h[k].gen = pal_gen;
+        pal_h[k].calls = 0;
+        pal_h[k].stamp = 0;
+    }
+    PalHash *h = &pal_h[k];
+    if (!h->stamp) {
+        if (++h->calls < 3)
+            return find_u32(a, n, x);
+        h->stamp = ++pal_stamp;
+        for (uint32_t j = 0; j < n; j++) {
+            uint32_t v;
+            memcpy(&v, a + 4 * j, 4);
+            uint32_t i = pal_hash(v);
+            while (pal_hs[k][i] == h->stamp && pal_hk[k][i] != v)
+                i = (i + 1) & 511;
+            if (pal_hs[k][i] != h->stamp) {
+                pal_hs[k][i] = h->stamp;
+                pal_hk[k][i] = v;
+                pal_hv[k][i] = j;
+            }
+        }
+    }
+    uint32_t i = pal_hash(x);
+    while (pal_hs[k][i] == h->stamp && pal_hk[k][i] != x)
+        i = (i + 1) & 511;
+    return pal_hs[k][i] == h->stamp ? pal_hv[k][i] : n;
+}
 static uint32_t pal_find_from_base(uint8_t *gm_, uint64_t P, uint64_t color, uint64_t B)
 {
     uint32_t n, cols, bn, bcols;
     pal_colors(gm_, P, &n, &cols);
     pal_colors(gm_, B, &bn, &bcols);
     const uint32_t want = L32(color);
-    const uint32_t i = find_u32(GP(bcols), bn, want);
+    const uint32_t i = find_first(gm_, bcols, bn, want);
     if (i == bn)
         return want;
     if (i < n)
@@ -5455,7 +5506,7 @@ static uint32_t pal_get_index(uint8_t *gm_, uint64_t P, uint32_t color, uint32_t
     uint32_t n, cols;
     pal_colors(gm_, P, &n, &cols);
     const uint8_t *pc = GP(cols);
-    const uint32_t i = find_u32(pc, n, color);
+    const uint32_t i = find_first(gm_, cols, n, color);
     if (i < n)
         return i;
     if (!fuzzy || (color >> 24) == 0xff)
@@ -5674,7 +5725,7 @@ void nat__ZN13ycUpdateQueue6UpdateEf(Ctx *c)
 
 /* ---- MINA_ZONES=1: time spent in a few of the game's functions (ms per frame in the [fps] lines) */
 uint64_t g_zone_us[8];
-const char *const g_zone_name[8] = { "ReapplyGroupPal", "SoundComponent", "SaveManager", "MessagePrompt",
+const char *const g_zone_name[8] = { "PaletteComp", "LayerTransform", "TileRenderObj", "MessagePrompt",
                                      "HUDCamera", "UpdateQueue", "RefreshWorldTransform", "GameRender" };
 int g_zones = -1;
 static inline int zones_on(void)
@@ -5695,9 +5746,30 @@ static inline int zones_on(void)
         orig(c);                                                                                          \
         g_zone_us[k] += now_us() - t;                                                                     \
     }
-ZONE_NATIVE(nat__ZN8Palettes15ReapplyGroupPalEi, f_964930_orig, 0)
-ZONE_NATIVE(nat__ZN14SoundComponent6UpdateEf, f_ab9e88_orig, 1)
-ZONE_NATIVE(nat__ZN11SaveManager6UpdateEf, f_a7f92c_orig, 2)
+void f_1b156c_orig(Ctx *c);
+void nat__ZN18ycPaletteComponent6UpdateEf(Ctx *c)
+{
+    static int off = -1;
+    if (off < 0)
+        off = rt_native_off("PaletteScope");
+    const uint64_t t = zones_on() ? now_us() : 0;
+    const int was = pal_scope;
+    const uint32_t avoid = pal_avoid;
+    if (!off) {
+        GM_BEGIN;
+        pal_scope = 1;
+        pal_gen++;
+        pal_avoid = (uint32_t)lp(lp(c->x[0] + 0x88) + 0x18);
+    }
+    f_1b156c_orig(c);
+    pal_scope = was;
+    pal_avoid = avoid;
+    pal_gen++;
+    if (t)
+        g_zone_us[0] += now_us() - t;
+}
+ZONE_NATIVE(nat__ZN18TileLevelComponent20UpdateLayerTransformEj, f_7beff4_orig, 1)
+ZONE_NATIVE(nat__ZN18TileLevelComponent27UpdateTileLevelRenderObjectEj, f_7bf3b8_orig, 2)
 ZONE_NATIVE(nat__ZN20MessagePromptManager6UpdateEf, f_439148_orig, 3)
 ZONE_NATIVE(nat__ZN9HUDCamera6UpdateEv, f_9b30f0_orig, 4)
 ZONE_NATIVE(nat__ZN4Game6RenderEv, f_9a0b2c_orig, 7)
@@ -6597,4 +6669,200 @@ static void darkness_update(Ctx *c)
         }
         *(uint8_t *)GP(A + 0x155) = vis;
     }
+}
+
+/* ---- ycPaletteTexture::WriteFromBase (x0 P, x1 the source S, x2 the base B or null: P's group's) ---
+ * P's colors from S by way of B: each of P's colors found in B (first match) takes S's color at
+ * that index (wrapped into 1..n-1 past S's end); or, when B is P's group palette, by P's index
+ * bytes; or, when S and B share P's source resource, P's own colors from it. Changed colors are
+ * marked dirty and the texture queued for upload (once); then the dirty ones get their group
+ * index (GetIndex). The game's order of reads and writes; the base's first-match search through a
+ * small hash table instead of a scan per color (palettes of ~85 colors on hub_overworld_south:
+ * ~3 ms a step). MINA_VERIFY_PAL=1 compares P's arrays and header with the game's. */
+void f_1b5590_orig(Ctx *c);
+void f_1b4d58(Ctx *c);           /* ycPaletteTexture::WriteSetup */
+void f_a5580(Ctx *c);            /* ycRenderUpdateQueue::Add */
+static inline uint32_t pal_count(uint8_t *gm_, uint64_t X)
+{
+    const uint64_t r = lp(X);
+    if (r && *(uint8_t *)GP(X + 0x3e))
+        return rt_ld32(GP(lp(r + 0x10) + 4));
+    return rt_ld32(GP(X + 0x28));
+}
+static inline uint64_t pal_cols(uint8_t *gm_, uint64_t X)
+{
+    const uint64_t r = lp(X);
+    if (r && *(uint8_t *)GP(X + 0x3e))
+        return lp(lp(r + 0x10) + 0x10);
+    return lp(X + 0x18);
+}
+static void pal_set(Ctx *c, uint8_t *gm_, uint64_t P, uint32_t i, uint32_t color)
+{
+    const uint64_t at = lp(P + 0x18) + (uint64_t)(int64_t)(int32_t)i * 4;
+    if (rt_ld32(GP(at)) == color)
+        return;
+    *(uint8_t *)GP(lp(P + 0x20) + (uint64_t)(int64_t)(int32_t)i) = 1;
+    rt_st32(GP(at), color);
+    if (!*(uint8_t *)GP(P + 0x3c)) {
+        *(uint8_t *)GP(P + 0x3c) = 1;
+        const uint64_t saved_sp = c->sp, fr = saved_sp - 0x90;
+        uint8_t *f = GP(fr);
+        memcpy(f + 8, &P, 8);
+        const uint64_t fn = 0x11b463c;
+        memcpy(f + 0x10, &fn, 8);
+        memset(f + 0x18, 0, 16);
+        rt_st32(f + 0x28, 0x40);
+        c->sp = fr;
+        c->x[0] = fr + 8;
+        f_a5580(c);
+        c->sp = saved_sp;
+    }
+    *(uint8_t *)GP(P + 0x3d) = 1;
+}
+static void write_from_base(Ctx *c)
+{
+    GM_BEGIN;
+    const uint64_t P = c->x[0], S = c->x[1];
+    uint64_t B = c->x[2];
+    const uint64_t tab = lp(0x60210b8);
+    if (!B) {
+        const int32_t g = (int32_t)rt_ld32(GP(P + 0x30));
+        B = g < 0 ? 0 : tab + (uint64_t)(int64_t)g * 64;
+    }
+    c->x[0] = P;
+    f_1b4d58(c);
+    uint32_t nP = pal_count(gm_, P);
+    const uint32_t nS = pal_count(gm_, S), nB = pal_count(gm_, B);
+    const uint64_t cP = pal_cols(gm_, P), cB = pal_cols(gm_, B), cS = pal_cols(gm_, S);
+    const uint64_t rS = lp(S), rB = lp(B);
+    if (rS && *(uint8_t *)GP(S + 0x3e) && *(uint8_t *)GP(B + 0x3e) && rB == rS) {
+        if ((int32_t)nP < 0)
+            nP = rt_ld32(GP(lp(lp(P) + 0x10) + 4));
+        for (uint32_t i = 0; (int32_t)i < (int32_t)nP; i++)
+            pal_set(c, gm_, P, i, rt_ld32(GP(cP + (uint64_t)i * 4)));
+    } else {
+        const int32_t g = (int32_t)rt_ld32(GP(P + 0x30));
+        const uint64_t T = g < 0 ? 0 : lp(0x60210b8) + (uint64_t)(int64_t)g * 64;
+        if (B == T) {
+            uint64_t ib = lp(P + 0x10);
+            if (lp(P) && *(uint8_t *)GP(P + 0x3e))
+                ib = lp(lp(lp(P) + 0x10) + 0x20);
+            for (uint32_t i = 0; i != nP; i++) {
+                const uint32_t k = *(uint8_t *)GP(ib + i);
+                const uint32_t m = nS - 1;
+                const uint32_t idx = nS > k ? k : (m ? k % m : k) + 1;
+                pal_set(c, gm_, P, i, rt_ld32(GP(cS + (uint64_t)idx * 4)));
+            }
+        } else if (nP) {
+            /* B's colors: the first index of each */
+            static uint32_t hk[1024], hv[1024], hgen[1024], gen;
+            const int hashed = nB <= 512;
+            if (hashed) {
+                gen++;
+                for (uint32_t j = 0; j < nB; j++) {
+                    const uint32_t col = rt_ld32(GP(cB + (uint64_t)j * 4));
+                    uint32_t h = (col * 2654435761u) >> 22;
+                    while (hgen[h] == gen && hk[h] != col)
+                        h = (h + 1) & 1023;
+                    if (hgen[h] != gen) {
+                        hgen[h] = gen;
+                        hk[h] = col;
+                        hv[h] = j;
+                    }
+                }
+            }
+            for (uint32_t i = 0; i != nP; i++) {
+                uint32_t col = rt_ld32(GP(cP + (uint64_t)i * 4));
+                uint32_t j = nB;
+                if (hashed) {
+                    uint32_t h = (col * 2654435761u) >> 22;
+                    while (hgen[h] == gen && hk[h] != col)
+                        h = (h + 1) & 1023;
+                    if (hgen[h] == gen)
+                        j = hv[h];
+                } else {
+                    j = find_u32(GP(cB), nB, col);
+                }
+                if (j < nB) {
+                    const uint32_t m = nS - 1;
+                    const uint32_t idx = nS > j ? j : (m ? j % m : j) + 1;
+                    col = rt_ld32(GP(cS + (uint64_t)idx * 4));
+                }
+                pal_set(c, gm_, P, i, col);
+            }
+        }
+    }
+    *(uint8_t *)GP(P + 0x3d) = 1;
+    if (*(uint8_t *)GP(P + 0x3f))
+        return;
+    if ((int32_t)rt_ld32(GP(P + 0x30)) >= 0 && lp(0x60210c0)) {
+        *(uint8_t *)GP(P + 0x3d) = 0;
+        if (lp(P + 0x10)) {
+            uint32_t n = rt_ld32(GP(P + 0x28));
+            const uint64_t dirty = lp(P + 0x20);
+            for (uint64_t i = 0; i < n; i++) {
+                if (!*(uint8_t *)GP(dirty + i))
+                    continue;
+                const int32_t g = (int32_t)rt_ld32(GP(P + 0x30));
+                const uint64_t G2 = g < 0 ? 0 : lp(0x60210b8) + (uint64_t)(int64_t)g * 64;
+                const uint32_t col = rt_ld32(GP(lp(P + 0x18) + i * 4));
+                const uint32_t r = pal_get_index(gm_, G2, col, 0);
+                const uint8_t v = ((col >> 24) == 0 && (int32_t)r < 0) ? 0 : (uint8_t)r;
+                *(uint8_t *)GP(lp(P + 0x10) + i) = v;
+                *(uint8_t *)GP(lp(P + 0x20) + i) = 0;
+                n = rt_ld32(GP(P + 0x28));
+            }
+        }
+    }
+    *(uint8_t *)GP(P + 0x3f) = 1;
+}
+void nat__ZN16ycPaletteTexture13WriteFromBaseEPKS_S1_(Ctx *c)
+{
+    static int off = -1, verify = -1;
+    if (off < 0) {
+        off = rt_native_off("__ZN16ycPaletteTexture13WriteFromBaseEPKS_S1_");
+        verify = getenv("MINA_VERIFY_PAL") != NULL;
+    }
+    if (off) {
+        f_1b5590_orig(c);
+        return;
+    }
+    if (!verify) {
+        write_from_base(c);
+        return;
+    }
+    GM_BEGIN;
+    static uint32_t checked, bad;
+    const uint64_t P = c->x[0];
+    const uint32_t n = rt_ld32(GP(P + 0x28)) & 0xfff;
+    static uint8_t b0[0x40 + 6 * 4096], b1[0x40 + 6 * 4096];
+#define PV_TAKE(b) do { memcpy(b, GP(P), 0x40); if (lp(P + 0x18)) memcpy(b + 0x40, GP(lp(P + 0x18)), n * 4); \
+        if (lp(P + 0x20)) memcpy(b + 0x40 + 4 * 4096, GP(lp(P + 0x20)), n); \
+        if (lp(P + 0x10)) memcpy(b + 0x40 + 5 * 4096, GP(lp(P + 0x10)), n); } while (0)
+#define PV_PUT(b) do { memcpy(GP(P), b, 0x40); if (lp(P + 0x18)) memcpy(GP(lp(P + 0x18)), b + 0x40, n * 4); \
+        if (lp(P + 0x20)) memcpy(GP(lp(P + 0x20)), b + 0x40 + 4 * 4096, n); \
+        if (lp(P + 0x10)) memcpy(GP(lp(P + 0x10)), b + 0x40 + 5 * 4096, n); } while (0)
+    memset(b0, 0, sizeof b0);
+    memset(b1, 0, sizeof b1);
+    PV_TAKE(b0);
+    const Ctx save = *c;
+    write_from_base(c);
+    static uint8_t mine[sizeof b0];
+    memset(mine, 0, sizeof mine);
+    PV_TAKE(mine);
+    PV_PUT(b0);
+    *c = save;
+    f_1b5590_orig(c);
+    PV_TAKE(b1);
+    /* P+8..0x27: WriteSetup's buffers (it ran in both: new ones); their contents are compared */
+    memset(mine + 8, 0, 0x20);
+    memset(b1 + 8, 0, 0x20);
+    checked++;
+    if (memcmp(mine, b1, sizeof b1) && bad++ < 10) {
+        size_t i = 0;
+        while (mine[i] == b1[i]) i++;
+        rt_log("[verify] WriteFromBase differs at %u (%u colors): %02x / %02x\n", (unsigned)i, n, mine[i], b1[i]);
+    }
+    if ((checked & 0xff) == 0)
+        rt_log("[verify] WriteFromBase: %u checked, %u differ\n", checked, bad);
 }
