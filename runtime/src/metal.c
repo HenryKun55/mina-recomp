@@ -887,8 +887,31 @@ static void d_maxBufferLength(Ctx *c) { RET(256u << 20); }
 static MBuffer *live_bufs[8192];
 static int nlive_bufs;
 static pthread_mutex_t bufs_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t bufage_frame;
+static int bufage = -1;
 static void buf_track(MBuffer *b, int add)
 {
+    if (add) {
+        if (bufage < 0)
+            bufage = getenv("MINA_BUFAGE") != NULL;
+        b->born = bufage_frame;
+        if (bufage) {      /* the first recompiled function on the host stack */
+            const char *guest_func_at_host(const void *pc);
+            const uintptr_t lo = (uintptr_t)&buf_track - 0x3000000u, hi = (uintptr_t)&buf_track + 0x3000000u;
+            const uint32_t *st = (const uint32_t *)__builtin_frame_address(0);
+            b->maker_fn = "?";
+            for (int i = 0; i < 512; i++) {
+                const uintptr_t w = st[i];
+                if (!(w & 1) || w < lo || w > hi)
+                    continue;
+                const char *f = guest_func_at_host((const void *)w);
+                if (f && f[0] != '?' && !strstr(f, "objc_msgSend")) {
+                    b->maker_fn = f;
+                    break;
+                }
+            }
+        }
+    }
     pthread_mutex_lock(&bufs_lock);
     if (add) {
         if (nlive_bufs < 8192)
@@ -2933,6 +2956,10 @@ void metal_present(uint64_t drawable)
     GL_DIRTY();
     objc_frame_end();         /* GPU resources released 3 frames ago are freed */
     {
+        void metal_bufage_report(void);
+        metal_bufage_report();
+    }
+    {
         extern int g_framelog;
         static int frames, every = -1;
         if (every < 0) {
@@ -3295,3 +3322,33 @@ const ImportImpl g_impl_metal[] = {
     { "_MTLCreateSystemDefaultDevice", imp_MTLCreateSystemDefaultDevice, 0, NULL },
     { NULL, NULL, 0, NULL },
 };
+
+/* (MINA_BUFAGE) every 30 s: the buffers alive for over 10 s, by maker and length */
+void metal_bufage_report(void)
+{
+    bufage_frame++;
+    if (bufage <= 0 || bufage_frame % 1800)
+        return;
+    struct { const char *fn; uint32_t len; int n; } g[16];
+    int ng = 0;
+    pthread_mutex_lock(&bufs_lock);
+    for (int i = 0; i < nlive_bufs; i++) {
+        const MBuffer *b = live_bufs[i];
+        if (bufage_frame - b->born < 600)
+            continue;
+        int k = 0;
+        while (k < ng && !(g[k].fn == b->maker_fn && g[k].len == b->length))
+            k++;
+        if (k == ng && ng < 16)
+            g[ng++] = (typeof(g[0])){ b->maker_fn, b->length, 0 };
+        if (k < 16)
+            g[k].n++;
+    }
+    const int all = nlive_bufs;
+    pthread_mutex_unlock(&bufs_lock);
+    rt_log("[bufage] %d buffers alive\n", all);
+    for (int k = 0; k < ng; k++)
+        if (g[k].n > 4)
+            rt_log("[bufage] %d buffers of %u bytes over 10 s old, made by %s\n", g[k].n, g[k].len,
+                   g[k].fn ? g[k].fn : "-");
+}

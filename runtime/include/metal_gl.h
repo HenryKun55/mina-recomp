@@ -70,6 +70,8 @@ typedef struct MBuffer {
     const void *maker;       /* the thread (Ctx) that made it */
     uint32_t gl_size;        /* private: bytes of its GL buffer (big ones hold their data, not all their length) */
     uint32_t gl_used;        /* private: bytes up to the last nonzero one written whole */
+    uint32_t born;           /* (MINA_BUFAGE) the frame it was made in */
+    const char *maker_fn;    /* (MINA_BUFAGE) the recompiled function that made it */
 } MBuffer;
 
 /* guest memory of a shared buffer (given back after a whole-buffer upload: made again on use) */

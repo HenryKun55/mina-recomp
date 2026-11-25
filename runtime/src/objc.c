@@ -644,32 +644,47 @@ static Class *host_ancestor(Class *k)
     return k;
 }
 
-/* MINA_NEWSTATS: objects made per second, by class */
+/* MINA_NEWSTATS: objects made per second, by class, and those alive */
+static Class *ns_ks[128];
+static uint32_t ns_n[128], ns_nk;
+static int32_t ns_live[128];
+static void live_stats(Class *k, int d)
+{
+    for (uint32_t i = 0; i < ns_nk; i++)
+        if (ns_ks[i] == k) {
+            __atomic_add_fetch(&ns_live[i], d, __ATOMIC_RELAXED);
+            return;
+        }
+}
 static void new_stats(Class *k)
 {
     static int on = -1;
-    static Class *ks[128];
-    static uint32_t n[128], nk;
+    Class **ks = ns_ks;
+    uint32_t *n = ns_n;
     static time_t t0;
     if (on < 0)
         on = getenv("MINA_NEWSTATS") != NULL;
     if (!on)
         return;
     uint32_t i = 0;
-    while (i < nk && ks[i] != k)
+    while (i < ns_nk && ks[i] != k)
         i++;
-    if (i == nk && nk < 128)
-        ks[nk++] = k;
-    if (i < 128)
+    if (i == ns_nk && ns_nk < 128)
+        ks[ns_nk++] = k;
+    if (i < 128) {
         n[i]++;
+        __atomic_add_fetch(&ns_live[i], 1, __ATOMIC_RELAXED);
+    }
+    const uint32_t nk = ns_nk;
     time_t t = time(NULL);
     if (!t0)
         t0 = t;
     if (t - t0 >= 4) {
         for (uint32_t j = 0; j < nk; j++)
             if (n[j])
-                rt_log("[new] %s: %u per s (host %u bytes)\n", ks[j]->name, n[j] / (uint32_t)(t - t0), ks[j]->host_size);
-        memset(n, 0, sizeof n);
+                rt_log("[new] %s: %u per s (host %u bytes), %d alive\n", ks[j]->name, n[j] / (uint32_t)(t - t0),
+                       ks[j]->host_size, ns_live[j]);
+        memset(ns_n, 0, sizeof ns_n);
         t0 = t;
     }
 }
@@ -1044,6 +1059,7 @@ static void m_dealloc(Ctx *c)
     }
     if (o->traced)
         objc_trace_ref(o, "dealloc");
+    live_stats(o->cls, -1);
     for (Class *k = o->cls; k; k = k->super)
         if (!k->guest && k->dealloc && o->host)
             k->dealloc(o->host);
@@ -1094,6 +1110,12 @@ uint64_t objc_autorelease_obj(uint64_t a)
     if (pool_n == pool_cap) {
         pool_cap = pool_cap ? pool_cap * 2 : 256;
         pool = realloc(pool, pool_cap * sizeof *pool);
+        if (pool_cap >= 4096) {
+            Ctx *thread_ctx(void);
+            Ctx *tc = thread_ctx();
+            rt_log("[objc] guest thread %u: %u objects waiting in its autorelease pool (last %s)\n",
+                   tc ? tc->thread_id : 0, pool_n, to && to->cls ? to->cls->name : "?");
+        }
     }
     pool[pool_n++] = a;
     return a;

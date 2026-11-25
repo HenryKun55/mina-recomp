@@ -5369,9 +5369,12 @@ void nat__ZN5World18UpdateSpawnManagerEP20ycUpdateQueueContext(Ctx *c)
 void f_ca5c80(Ctx *c);    /* _objc_msgSend$newBufferWithLength:options: */
 void f_ca4860(Ctx *c);    /* _objc_msgSend$contents */
 void f_1e4bcc(Ctx *c);    /* ycTexture::CalcLinearMipChainSize */
+extern uint32_t g_stage_made, g_stage_kept, g_stage_gone;
 void nat__ZN9ycTexture15AllocStagingBufEj(Ctx *c)
 {
     GM_BEGIN;
+    if (getenv("MINA_STAGE_STATS") && (__atomic_add_fetch(&g_stage_made, 1, __ATOMIC_RELAXED) % 600) == 0)
+        rt_log("[stage] records made %u, kept for reuse %u, let go %u\n", g_stage_made, g_stage_kept, g_stage_gone);
     const uint64_t T = c->x[0];
     const uint32_t mip = (uint32_t)c->x[1];
     const uint64_t heap = L64(0x6039f60);              /* the game's allocator */
@@ -7381,3 +7384,11 @@ void nat__ZN24OptionsMenuLanguagePopup11UpdateStateEv(Ctx *c)
     f_77c45c_orig(c);
 }
 void cjk_fonts_load_test(Ctx *c) { cjk_fonts_load(c, "test"); }
+
+/* (MINA_STAGE_STATS) a texture upload's staging record: made (AllocStagingBuf), kept for
+ * reuse by its texture ($_0) or let go ($_1) after the upload, on the render GC thread */
+uint32_t g_stage_made, g_stage_kept, g_stage_gone;
+void f_1eccbc_orig(Ctx *c);
+void f_1ecd38_orig(Ctx *c);
+void nat__ZZN9ycTexture6UploadEPvEN3__08__invokeES0_S0_(Ctx *c) { __atomic_add_fetch(&g_stage_kept, 1, __ATOMIC_RELAXED); f_1eccbc_orig(c); }
+void nat__ZZN9ycTexture6UploadEPvEN3__18__invokeES0_S0_(Ctx *c) { __atomic_add_fetch(&g_stage_gone, 1, __ATOMIC_RELAXED); f_1ecd38_orig(c); }
