@@ -181,8 +181,15 @@ static void big_note(void *p, uint64_t size, int made, const void *ra)
  * cut its free space into pieces, and theirs never walk a list. Pages are never given
  * back (a size's pages serve only that size). MINA_SLAB=0: newlib for all. */
 #include <psp2/kernel/threadmgr.h>
-#define SLAB_MAX 512u
-#define SLAB_NCLS (SLAB_MAX / 16)
+#define SLAB_MAX 2048u
+#define SLAB_NCLS (32 + 24)          /* 16-byte steps to 512, then 64-byte steps to 2048 */
+static inline int slab_cls_of(uint64_t size)
+{
+    if (size <= 512)
+        return size ? (int)((size - 1) >> 4) : 0;
+    return 32 + (int)((size - 513) >> 6);
+}
+static inline uint32_t slab_size_of(int k) { return k < 32 ? (uint32_t)(k + 1) << 4 : 512u + (uint32_t)(k - 31) * 64u; }
 #define SLAB_PAGE 0x10000u
 #define SLAB_CHUNK 0x100000u
 #define SLAB_LIMIT (112u << 20)       /* past this, newlib again */
@@ -227,9 +234,9 @@ static uint8_t *slab_page(int k)
 }
 static void *slab_alloc(uint64_t size)
 {
-    const int k = size ? (int)((size - 1) >> 4) : 0;
+    const int k = slab_cls_of(size);
     SlabCls *s = &slab[k];
-    const uint32_t sz = (uint32_t)(k + 1) << 4;
+    const uint32_t sz = slab_size_of(k);
     sceKernelLockLwMutex(&s->mtx, 1, NULL);
     uint8_t *p = s->free_list;
     if (p)
@@ -266,7 +273,7 @@ void slab_report(char *out, size_t n)
 {
     uint64_t live = 0;
     for (int i = 0; i < SLAB_NCLS; i++)
-        live += (uint64_t)slab[i].live * ((i + 1) << 4);
+        live += (uint64_t)slab[i].live * slab_size_of(i);
     snprintf(out, n, "small blocks %.1f MiB in %.1f MiB of slabs", live / 1048576.0, slab_bytes / 1048576.0);
 }
 
@@ -389,8 +396,9 @@ uint32_t gmalloc(uint64_t size)
     if (slab_on && size <= SLAB_MAX) {
         void *q = slab_alloc(size);
         if (q) {
-            heap_in_use += ((size ? size - 1 : 0) | 15) + 1;
-            hs_note(q, (uint32_t)(((size ? size - 1 : 0) | 15) + 1), 1);
+            const uint32_t sz = slab_size_of(slab_cls_of(size));
+            heap_in_use += sz;
+            hs_note(q, sz, 1);
             return guest_addr(q);
         }
     }
@@ -472,8 +480,8 @@ void gfree(uint32_t a)
     if (slab_on) {
         const int k = slab_class(G(a));
         if (k >= 0) {
-            heap_in_use -= (uint32_t)(k + 1) << 4;
-            hs_note(G(a), (uint32_t)(k + 1) << 4, 0);
+            heap_in_use -= slab_size_of(k);
+            hs_note(G(a), slab_size_of(k), 0);
             slab_free(G(a), k);
             return;
         }
@@ -496,7 +504,7 @@ uint64_t gmalloc_usable(uint32_t a)
     if (slab_on) {
         const int k = slab_class(G(a));
         if (k >= 0)
-            return (uint32_t)(k + 1) << 4;
+            return slab_size_of(k);
     }
     HcHdr *h = heapcheck_on() ? hc_hdr(a) : NULL;
     return h ? h->size : nl_usable(G(a));

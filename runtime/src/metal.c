@@ -1125,7 +1125,7 @@ static void stage_arena_init(void)
 static void stage_vram_reserve(void)
 {
     const char *v = getenv("MINA_STAGE_VRAM");
-    int n = v ? atoi(v) : 8;
+    int n = v ? atoi(v) : 0;     /* default none: the console faulted writing one (Vita3K does not) */
     const uint32_t blk = 0x140000;
     const size_t keep = (size_t)48 << 20;
     while (!v && n > 0 && vglMemFree(VGL_MEM_VRAM) < keep + (size_t)n * blk)
