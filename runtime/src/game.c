@@ -150,7 +150,8 @@ static void spk_check(Ctx *c, const Spk *k, const char *what)
  * unset, it adapts: 60 steps a second while a step and the frame's update fit a 60 fps frame, 30
  * when they don't (the frame falls behind: frames with 2 steps while steps are long). At 30 it
  * tries 60 again after a wait (windows of 30 steps, 1 s) that doubles while tries fail (up to
- * 32 s); measuring at 30 can't tell: a step there does ~1.7x the work of one at 60.
+ * 8 s; 1 s after a drop caused by a hitch such as a load); measuring at 30 can't tell: a step
+ * there does ~1.7x the work of one at 60.
  * MINA_RATE_LOG=1 logs the windows. */
 static int g_rate_auto;              /* set by Game::InitFromSave */
 static uint32_t rate_fixed_since;    /* steps since the last Game::Update */
@@ -164,7 +165,8 @@ static void rate_set(uint32_t fps, const char *why, double avg_ms, double max_ms
 }
 static void rate_frame(uint64_t update_us)
 {
-    static uint32_t frames, late, held, wait = 2, waited;
+    static uint32_t frames, late, held, wait = 2, waited, since_fail;
+    static double tried_at, fail_ref;     /* the 30 Hz cost when 60 was tried; that of a failed try */
     static uint64_t sum_us, max_us;
     static int log = -1;
     if (log < 0)
@@ -191,19 +193,33 @@ static void rate_frame(uint64_t update_us)
         /* behind: frames with 2 steps while the steps are long (a load's single long
          * step makes frames late too, with short steps around it) */
         if ((late >= 4 && avg > 10.0) || avg > 15.0) {
-            wait = held >= 10 ? 2 : (wait * 2 > 32 ? 32 : wait * 2);
+            /* a window with a long hitch (a load, a room) says little: soon again; else the
+             * wait doubles while tries fail (a failed try is half a second of 2-step frames) */
+            if (worst > 50.0 || held >= 10) {
+                wait = 1;
+                fail_ref = 0;
+            } else {
+                wait = wait * 2 > 8 ? 8 : (wait < 2 ? 2 : wait * 2);
+                fail_ref = tried_at;
+                since_fail = 0;
+            }
             rate_set(30, "falling behind", avg, worst);
             held = waited = 0;
         } else if (++held == 10)
             wait = 2;                /* 60 held for 10 windows: the next drop tries again soon */
-    } else if (++waited >= wait) {
+    } else if (++since_fail, ++waited >= wait) {
         /* a step at 30 does more work than one at 60 (about 1.7x): hopeless when even
-         * half of it would not fit a 60 fps frame */
+         * half of it would not fit a 60 fps frame; after a failed try, not again until the
+         * scene got lighter (15% under the cost then) or 30 s went by */
         waited = 0;
-        if (avg * 0.5 < 14.0)
+        if (avg * 0.5 >= 14.0)
+            wait = wait * 2 > 8 ? 8 : wait * 2;
+        else if (fail_ref > 0 && avg > fail_ref * 0.85 && since_fail < 30)
+            ;
+        else {
+            tried_at = avg;
             rate_set(60, "trying", avg, worst);
-        else
-            wait = wait * 2 > 32 ? 32 : wait * 2;
+        }
     }
     frames = late = 0;
     sum_us = max_us = 0;
