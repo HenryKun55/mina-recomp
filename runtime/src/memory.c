@@ -199,6 +199,8 @@ typedef struct {
     uint32_t pages, live;
 } SlabCls;
 static SlabCls slab[SLAB_NCLS];
+static int mid_on;
+static SceKernelLwMutexWork t_mtx;
 static uint8_t slab_dir[65536];       /* host address >> 16: size class + 1 */
 static SceKernelLwMutexWork slab_chunk_mtx;
 static uint8_t *slab_chunk, *slab_chunk_end;
@@ -213,6 +215,11 @@ static void slab_init(void)
         sceKernelCreateLwMutex(&slab[i].mtx, "mina_slab", 0, 0, NULL);
     sceKernelCreateLwMutex(&slab_chunk_mtx, "mina_slab_chunk", 0, 0, NULL);
     slab_on = 1;
+    const char *m = getenv("MINA_MID");
+    if (!m || atoi(m)) {
+        sceKernelCreateLwMutex(&t_mtx, "mina_mid", 0, 0, NULL);
+        mid_on = 1;
+    }
 }
 static uint8_t *slab_page(int k)
 {
@@ -259,7 +266,12 @@ static void *slab_alloc(uint64_t size)
     sceKernelUnlockLwMutex(&s->mtx, 1);
     return p;
 }
-static inline int slab_class(const void *p) { return (int)slab_dir[(uintptr_t)p >> 16] - 1; }
+#define DIR_MID 0xFFu                 /* slab_dir: a granule of a mid-size pool */
+static inline int slab_class(const void *p)
+{
+    const unsigned v = slab_dir[(uintptr_t)p >> 16];
+    return v && v != DIR_MID ? (int)v - 1 : -1;
+}
 static void slab_free(void *p, int k)
 {
     SlabCls *s = &slab[k];
@@ -274,7 +286,192 @@ void slab_report(char *out, size_t n)
     uint64_t live = 0;
     for (int i = 0; i < SLAB_NCLS; i++)
         live += (uint64_t)slab[i].live * slab_size_of(i);
-    snprintf(out, n, "small blocks %.1f MiB in %.1f MiB of slabs", live / 1048576.0, slab_bytes / 1048576.0);
+    char mid[96];
+    void mid_report(char *o, size_t m);
+    mid_report(mid, sizeof mid);
+    snprintf(out, n, "small blocks %.1f MiB in %.1f MiB of slabs, %s", live / 1048576.0, slab_bytes / 1048576.0, mid);
+}
+
+/* Mid-size blocks (past SLAB_MAX, up to MID_MAX) come from a TLSF heap (two-level
+ * segregated fit: a free list per size range, bitmaps to find a fitting one, neighbours
+ * merged on free; every call O(1)) in 4 MiB pools taken from newlib. newlib's lists grew
+ * with the session (the console: 2.7k free pieces at the start, 58k after a long play,
+ * its calls 2-35 ms under its one lock: the sound decoders opening an effect waited, the
+ * game thread waited for them). A pool left entirely free goes back to newlib (one is kept).
+ * Block: 16-byte header {prev_phys, size | flags, check, pad}, the data after it; a free
+ * block keeps its list links in the data. MINA_MID=0: newlib for these. */
+#define MID_MAX (256u << 10)
+#define MID_POOL (4u << 20)
+#define T_SLL 5
+#define T_SL (1u << T_SLL)
+#define T_FL 24
+#define T_FREE 1u
+#define T_PFREE 2u
+#define T_HDR 16u
+#define T_MIN 32u
+#define T_CHECK 0x544C5346u
+typedef struct TBlk {
+    struct TBlk *prev_phys;
+    uint32_t size, check, pad;
+    struct TBlk *next_free, *prev_free;
+} TBlk;
+static TBlk *t_head[T_FL][T_SL];
+static uint32_t t_flmap, t_slmap[T_FL];
+static uint8_t *t_empty;             /* a pool left entirely free, kept */
+static uint32_t t_pools, t_live;
+static inline uint32_t t_sz(const TBlk *b) { return b->size & ~15u; }
+static inline TBlk *t_next(TBlk *b) { return (TBlk *)((uint8_t *)b + t_sz(b)); }
+static inline void t_map(uint32_t size, uint32_t *fl, uint32_t *sl)
+{
+    if (size < (T_SL << 4)) {
+        *fl = 0;
+        *sl = size >> 4;
+    } else {
+        const uint32_t f = 31u - (uint32_t)__builtin_clz(size);
+        *sl = (size >> (f - T_SLL)) ^ T_SL;
+        *fl = f - (T_SLL + 4) + 1;
+    }
+}
+static void t_insert(TBlk *b)
+{
+    uint32_t fl, sl;
+    t_map(t_sz(b), &fl, &sl);
+    TBlk *h = t_head[fl][sl];
+    b->next_free = h;
+    b->prev_free = NULL;
+    if (h)
+        h->prev_free = b;
+    t_head[fl][sl] = b;
+    t_flmap |= 1u << fl;
+    t_slmap[fl] |= 1u << sl;
+}
+static void t_remove(TBlk *b)
+{
+    uint32_t fl, sl;
+    t_map(t_sz(b), &fl, &sl);
+    if (b->prev_free)
+        b->prev_free->next_free = b->next_free;
+    else {
+        t_head[fl][sl] = b->next_free;
+        if (!b->next_free) {
+            t_slmap[fl] &= ~(1u << sl);
+            if (!t_slmap[fl])
+                t_flmap &= ~(1u << fl);
+        }
+    }
+    if (b->next_free)
+        b->next_free->prev_free = b->prev_free;
+}
+static TBlk *t_find(uint32_t need)
+{
+    uint32_t fl, sl;
+    if (need >= (T_SL << 4))
+        need += (1u << (31u - (uint32_t)__builtin_clz(need) - T_SLL)) - 1;    /* round up: any block there fits */
+    t_map(need, &fl, &sl);
+    if (fl >= T_FL)
+        return NULL;
+    uint32_t m = sl < 32 ? t_slmap[fl] & (~0u << sl) : 0;
+    if (!m) {
+        const uint32_t fm = fl + 1 < 32 ? t_flmap & (~0u << (fl + 1)) : 0;
+        if (!fm)
+            return NULL;
+        fl = (uint32_t)__builtin_ctz(fm);
+        m = t_slmap[fl];
+    }
+    return t_head[fl][__builtin_ctz(m)];
+}
+static int t_grow(void)
+{
+    uint8_t *p = memalign(SLAB_PAGE, MID_POOL);
+    if (!p)
+        return 0;
+    for (uint32_t g = 0; g < MID_POOL / SLAB_PAGE; g++)
+        slab_dir[((uintptr_t)p >> 16) + g] = DIR_MID;
+    TBlk *b = (TBlk *)p, *end = (TBlk *)(p + MID_POOL - T_HDR);
+    b->prev_phys = NULL;
+    b->size = (MID_POOL - T_HDR) | T_FREE;
+    end->prev_phys = b;
+    end->size = T_PFREE;              /* the sentinel: size 0, in use */
+    end->check = 0;
+    t_insert(b);
+    t_pools++;
+    return 1;
+}
+static inline int t_whole_pool(const TBlk *b) { return !b->prev_phys && t_sz(b) == MID_POOL - T_HDR; }
+static void *mid_alloc(uint64_t size)
+{
+    const uint32_t need = ((uint32_t)size + 15u & ~15u) + T_HDR;
+    sceKernelLockLwMutex(&t_mtx, 1, NULL);
+    TBlk *b = t_find(need);
+    if (!b && t_grow())
+        b = t_find(need);
+    if (!b) {
+        sceKernelUnlockLwMutex(&t_mtx, 1);
+        return NULL;
+    }
+    if ((uint8_t *)b == t_empty)
+        t_empty = NULL;
+    t_remove(b);
+    const uint32_t have = t_sz(b);
+    if (have - need >= T_MIN) {
+        TBlk *r = (TBlk *)((uint8_t *)b + need);
+        r->prev_phys = b;
+        r->size = (have - need) | T_FREE;
+        t_next(r)->prev_phys = r;
+        t_insert(r);
+        b->size = need | (b->size & T_PFREE);
+    } else {
+        b->size &= ~T_FREE;
+        t_next(b)->size &= ~T_PFREE;
+    }
+    b->check = T_CHECK ^ (uint32_t)(uintptr_t)b;
+    t_live += t_sz(b);
+    sceKernelUnlockLwMutex(&t_mtx, 1);
+    return (uint8_t *)b + T_HDR;
+}
+static inline uint32_t mid_usable(const void *p) { return t_sz((const TBlk *)((const uint8_t *)p - T_HDR)) - T_HDR; }
+static void mid_free(void *p)
+{
+    TBlk *b = (TBlk *)((uint8_t *)p - T_HDR);
+    uint8_t *drop = NULL;
+    sceKernelLockLwMutex(&t_mtx, 1, NULL);
+    if (b->check != (T_CHECK ^ (uint32_t)(uintptr_t)b) || (b->size & T_FREE))
+        rt_fatal("guest heap: mid-size block %p freed twice or its header overwritten", p);
+    b->check = 0;
+    t_live -= t_sz(b);
+    b->size |= T_FREE;
+    if (b->size & T_PFREE) {
+        TBlk *pv = b->prev_phys;
+        t_remove(pv);
+        pv->size += t_sz(b);
+        b = pv;
+    }
+    TBlk *n = t_next(b);
+    if (n->size & T_FREE) {
+        t_remove(n);
+        b->size += t_sz(n);
+        n = t_next(b);
+    }
+    n->prev_phys = b;
+    n->size |= T_PFREE;
+    if (t_whole_pool(b) && t_empty && t_empty != (uint8_t *)b) {
+        drop = (uint8_t *)b;          /* one free pool is kept: this one goes back */
+        for (uint32_t g = 0; g < MID_POOL / SLAB_PAGE; g++)
+            slab_dir[((uintptr_t)drop >> 16) + g] = 0;
+        t_pools--;
+    } else {
+        if (t_whole_pool(b))
+            t_empty = (uint8_t *)b;
+        t_insert(b);
+    }
+    sceKernelUnlockLwMutex(&t_mtx, 1);
+    if (drop)
+        free(drop);
+}
+static inline int mid_owns(const void *p) { return slab_dir[(uintptr_t)p >> 16] == DIR_MID; }
+void mid_report(char *o, size_t m)
+{
+    snprintf(o, m, "mid blocks %.1f MiB in %.1f MiB of pools", t_live / 1048576.0, t_pools * (MID_POOL / 1048576.0));
 }
 
 /* newlib's blocks for the guest: malloc(size + align), aligned up inside, the offset kept in
@@ -461,6 +658,16 @@ uint32_t gmalloc(uint64_t size)
             return guest_addr(q);
         }
     }
+    if (mid_on && size <= MID_MAX) {
+        const uint64_t t0 = slow_now();
+        void *q = mid_alloc(size);
+        slow_note("malloc", t0, size);
+        if (q) {
+            heap_in_use += mid_usable(q);
+            hs_note(q, mid_usable(q), 1);
+            return guest_addr(q);
+        }
+    }
     if (heapcheck_on()) {
         HcHdr *h = memalign(16, (size_t)size + 32);
         if (!h)
@@ -545,6 +752,15 @@ void gfree(uint32_t a)
             return;
         }
     }
+    if (mid_on && mid_owns(G(a))) {
+        const uint32_t us = mid_usable(G(a));
+        heap_in_use -= us;
+        hs_note(G(a), us, 0);
+        const uint64_t t0 = slow_now();
+        mid_free(G(a));
+        slow_note("free", t0, us);
+        return;
+    }
     if (heapcheck_on()) {               /* (a gmemalign block there: newlib's own) */
         free(G(a));
         return;
@@ -564,6 +780,8 @@ uint64_t gmalloc_usable(uint32_t a)
         const int k = slab_class(G(a));
         if (k >= 0)
             return slab_size_of(k);
+        if (mid_on && mid_owns(G(a)))
+            return mid_usable(G(a));
     }
     HcHdr *h = heapcheck_on() ? hc_hdr(a) : NULL;
     return h ? h->size : nl_usable(G(a));
@@ -601,6 +819,8 @@ uint32_t gmemalign(uint64_t align, uint64_t size)
 {
     if (align < 16)
         align = 16;
+    if (align == 16 && !heapcheck_on())
+        return gmalloc(size);
     void *p = heapcheck_on() ? memalign((size_t)align, (size_t)size) : nl_alloc((size_t)size, (size_t)align);
     if (!p) {
         rt_log("guest heap: %llu bytes aligned to %llu not available\n", (unsigned long long)size,
