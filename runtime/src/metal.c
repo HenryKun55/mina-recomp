@@ -985,11 +985,68 @@ static pthread_mutex_t stage_lock = PTHREAD_MUTEX_INITIALIZER;
 #define STAGE_KNOWN 64
 static uint32_t stage_known[STAGE_KNOWN];
 static int nstage_known;
+/* Vita: the system's spare main memory (outside newlib's heap: what vitaGL and the thread
+ * stacks left, ~16 MiB on the console) holds these blocks first, keeping them off the heap
+ * (a room's ~26 at once ran it out: 245 of 272 MiB, the rest in 46k pieces). Taken at the
+ * first staging buffer, leaving 6 MiB to the system. Guest addresses reach any host memory
+ * (they wrap around g_mem). */
+#define STAGE_ARENA_MAX 24
+static uint32_t stage_arena[STAGE_ARENA_MAX], stage_arena_free[STAGE_ARENA_MAX];
+static int nstage_arena, nstage_arena_free, stage_arena_tried;
+#if defined(__vita__)
+#include <psp2/kernel/sysmem.h>
+static void stage_arena_init(void)
+{
+    stage_arena_tried = 1;
+    const char *v = getenv("MINA_STAGE_ARENA");
+    if (v && !atoi(v))
+        return;
+    SceKernelFreeMemorySizeInfo info;
+    info.size = sizeof info;
+    if (sceKernelGetFreeMemorySize(&info) != 0)
+        return;
+    const uint32_t blk = 0x140000;               /* TILE_STAGING_LEN rounded to 64 KiB */
+    const int64_t spare = (int64_t)info.size_user - (6 << 20);
+    int n = spare > 0 ? (int)(spare / blk) : 0;
+    if (n > STAGE_ARENA_MAX)
+        n = STAGE_ARENA_MAX;
+    while (n > 0) {
+        const SceUID id = sceKernelAllocMemBlock("mina_staging", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, (SceSize)n * blk, NULL);
+        if (id >= 0) {
+            void *base = NULL;
+            sceKernelGetMemBlockBase(id, &base);
+            memset(base, 0, (size_t)n * blk);
+            for (int i = 0; i < n; i++) {
+                stage_arena[i] = guest_addr((uint8_t *)base + (size_t)i * blk);
+                stage_arena_free[i] = stage_arena[i];
+            }
+            nstage_arena = nstage_arena_free = n;
+            break;
+        }
+        n--;
+    }
+    rt_log("[mem] staging arena: %d blocks (%.1f MiB) of the system's %.1f MiB free\n", nstage_arena,
+           nstage_arena * (blk / 1048576.0), info.size_user / 1048576.0);
+}
+#else
+static void stage_arena_init(void) { stage_arena_tried = 1; }
+#endif
+static int stage_in_arena(uint32_t a)
+{
+    for (int i = 0; i < nstage_arena; i++)
+        if (stage_arena[i] == a)
+            return 1;
+    return 0;
+}
 static uint32_t stage_alloc(uint32_t len)
 {
     if (len == TILE_STAGING_LEN) {
         pthread_mutex_lock(&stage_lock);
-        const uint32_t a = nstage_pool ? stage_pool[--nstage_pool] : 0;
+        if (!stage_arena_tried)
+            stage_arena_init();
+        uint32_t a = nstage_arena_free ? stage_arena_free[--nstage_arena_free] : 0;
+        if (!a)
+            a = nstage_pool ? stage_pool[--nstage_pool] : 0;
         pthread_mutex_unlock(&stage_lock);
         if (a) {
             memset(G(a), 0, len);      /* whole: the game may write through an old pointer */
@@ -1016,6 +1073,13 @@ static int stage_is_known(uint32_t a)
 /* used: the bytes up to the last nonzero one (the rest is zero already) */
 static void stage_free(uint32_t a, uint32_t len, uint32_t used)
 {
+    if (len == TILE_STAGING_LEN && stage_in_arena(a)) {
+        memset(G(a), 0, used);
+        pthread_mutex_lock(&stage_lock);
+        stage_arena_free[nstage_arena_free++] = a;
+        pthread_mutex_unlock(&stage_lock);
+        return;
+    }
     if (len == TILE_STAGING_LEN) {
         pthread_mutex_lock(&stage_lock);
         const int room = nstage_pool < STAGE_POOL && stage_is_known(a);
@@ -2983,8 +3047,10 @@ void metal_present(uint64_t drawable)
                     static int every;
                     if (++every % 15 == 0) {
                         struct mallinfo mi = mallinfo();
-                        rt_log("[mem] heap %.1f MiB, free %.1f MiB in %d pieces; %d staging blocks pooled\n",
-                               mi.arena / 1048576.0, mi.fordblks / 1048576.0, mi.ordblks, nstage_pool);
+                        rt_log("[mem] heap %.1f MiB, free %.1f MiB in %d pieces; %d staging blocks pooled, arena %d of %d "
+                               "free\n",
+                               mi.arena / 1048576.0, mi.fordblks / 1048576.0, mi.ordblks, nstage_pool,
+                               nstage_arena_free, nstage_arena);
                     }
                 }
 #endif
