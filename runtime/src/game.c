@@ -810,7 +810,15 @@ void f_1cb43c_orig(Ctx *c);
  * functions that called it (by the host return address), most frequent first */
 const char *guest_func_at_host(const void *pc);
 typedef struct CallerHist { const char *what; uint32_t n, every, count[64]; const void *ra[64]; } CallerHist;
-static void caller_count(CallerHist *h, const void *ra)
+static void caller_count_(CallerHist *h, const void *ra);
+/* off (no MINA_CALLERS): one test, no call */
+static inline __attribute__((always_inline)) void caller_count(CallerHist *h, const void *ra)
+{
+    if (__builtin_expect(h->every == ~0u, 1))
+        return;
+    caller_count_(h, ra);
+}
+static void caller_count_(CallerHist *h, const void *ra)
 {
     if (!h->every) {
         const char *v = getenv("MINA_CALLERS");
