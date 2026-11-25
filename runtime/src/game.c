@@ -5874,6 +5874,11 @@ static inline int zones_on(void)
 void f_1b156c_orig(Ctx *c);
 void nat__ZN18ycPaletteComponent6UpdateEf(Ctx *c)
 {
+    static int skip = -1;               /* (measurement) */
+    if (skip < 0)
+        skip = getenv("MINA_SKIP_PAL") != NULL;
+    if (skip)
+        return;
     static int off = -1;
     if (off < 0)
         off = rt_native_off("PaletteScope");

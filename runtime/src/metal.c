@@ -260,13 +260,75 @@ static inline uint32_t spk_tid(void)
     Ctx *tc = thread_ctx();
     return tc && tc->thread_id < 32 ? tc->thread_id : 0;
 }
+/* Textures made while another thread holds the GPU lock (the renderer, for a whole frame)
+ * wait here for their GL texture: made by the next thread that takes the lock, before it
+ * does anything else (GL is used only under the lock). The game thread made them itself
+ * and waited: hub_overworld_south's animation frames (ycCutterAnimFrame::InitTexture),
+ * ~700 ms in 30 s, up to tens of ms at once. MINA_TEX_SYNC=1: made at once, as before. */
+static void tex_create_gl(MTexture *t);
+#define TEXQ_MAX 512
+static MTexture *texq[TEXQ_MAX];
+static int ntexq, texq_draining;
+static pthread_mutex_t texq_lock = PTHREAD_MUTEX_INITIALIZER;
+static void texq_drain(void)          /* with the GPU lock */
+{
+    if (texq_draining)
+        return;
+    texq_draining = 1;
+    for (;;) {
+        pthread_mutex_lock(&texq_lock);
+        MTexture *t = ntexq ? texq[--ntexq] : NULL;
+        pthread_mutex_unlock(&texq_lock);
+        if (!t)
+            break;
+        tex_create_gl(t);
+    }
+    texq_draining = 0;
+}
+/* MINA_LOCKSITES=1: where threads waited for the GPU lock (host return addresses), every 30 s */
+static struct { const void *ra; uint32_t tid; uint64_t us; uint32_t n; } locksite[64];
+static int locksites = -1;
+static void locksite_note(const void *ra, uint32_t tid, uint64_t us)
+{
+    for (int i = 0; i < 64; i++) {
+        if (locksite[i].ra == ra && locksite[i].tid == tid) {
+            locksite[i].us += us;
+            locksite[i].n++;
+            return;
+        }
+        if (!locksite[i].ra) {
+            locksite[i].ra = ra;
+            locksite[i].tid = tid;
+            locksite[i].us = us;
+            locksite[i].n = 1;
+            return;
+        }
+    }
+}
+void gpu_locksites_report(void)
+{
+    if (locksites <= 0)
+        return;
+    for (int i = 0; i < 64 && locksite[i].ra; i++)
+        if (locksite[i].us > 20000)
+            rt_log("[locksite] thread %u waited %.1f ms in %u waits at %p\n", locksite[i].tid, locksite[i].us / 1000.0,
+                   locksite[i].n, locksite[i].ra);
+    memset(locksite, 0, sizeof locksite);
+}
 void gpu_lock(void)
 {
     if (pthread_mutex_trylock(&gpu_mutex) != 0) {
         const uint64_t t0 = spk_now();
         pthread_mutex_lock(&gpu_mutex);
-        g_spk_lock_us[spk_tid()] += spk_now() - t0;
+        const uint64_t dt = spk_now() - t0;
+        g_spk_lock_us[spk_tid()] += dt;
+        if (locksites < 0)
+            locksites = getenv("MINA_LOCKSITES") != NULL;
+        if (locksites)
+            locksite_note(__builtin_return_address(0), spk_tid(), dt);
     }
+    if (__atomic_load_n(&ntexq, __ATOMIC_ACQUIRE))
+        texq_drain();
 #if defined(__vita__)
 #if !defined(MINA_NULL_GL)
 #endif
@@ -1389,7 +1451,23 @@ uint64_t metal_new_texture(uint32_t type, uint32_t fmt, uint32_t w, uint32_t h, 
     t->storage = storage;
     if (t->samples > 1 && t->type == 2)
         t->type = 4;
-    gpu_lock();
+    static int sync = -1;
+    if (sync < 0)
+        sync = getenv("MINA_TEX_SYNC") != NULL;
+    if (!sync && pthread_mutex_trylock(&gpu_mutex) != 0) {
+        pthread_mutex_lock(&texq_lock);
+        const int queued = ntexq < TEXQ_MAX;
+        if (queued)
+            texq[ntexq++] = t;
+        pthread_mutex_unlock(&texq_lock);
+        if (queued)
+            return o;
+        gpu_lock();
+    } else if (!sync) {
+        if (__atomic_load_n(&ntexq, __ATOMIC_ACQUIRE))
+            texq_drain();
+    } else
+        gpu_lock();
     tex_create_gl(t);
     if (metal_texlog() && t->width >= 64)
         rt_log("[tex] new %ux%u fmt %u gl %u\n", t->width, t->height, t->format, t->gl);
@@ -3148,6 +3226,7 @@ void metal_present(uint64_t drawable)
                         slab_report(sl, sizeof sl);
                         void heapstat_report(void);
                         heapstat_report();
+                        gpu_locksites_report();
                         rt_log("[mem] heap %.1f MiB, free %.1f MiB in %d pieces (%s); %d staging blocks pooled, arena %d of %d "
                                "free; video memory %.1f MiB free\n",
                                mi.arena / 1048576.0, mi.fordblks / 1048576.0, mi.ordblks, sl, nstage_pool,
