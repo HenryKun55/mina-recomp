@@ -4239,9 +4239,72 @@ static void combat_tail(Ctx *c, uint8_t *gm_, uint64_t F, uint64_t A, uint64_t D
     }
 }
 
+/* ProcessAttackList's defenders: those of B's pools with flag 2 and a shape, their boxes as
+ * the loop computes them (n -1: too many, the loop reads them itself) */
+typedef struct { float xlo, xhi, ylo, yhi; } DefBox;
+#define DCACHE_MAX 2048
+static DefBox dcache[DCACHE_MAX];
+static int dcache_n = -1, dcache_dirty = 1;
+static void dcache_build(uint8_t *gm_, uint64_t T, uint64_t B)
+{
+    dcache_dirty = 0;
+    dcache_n = 0;
+    const uint64_t bcnt = L64(B + 8);
+    if (!bcnt || !L32(T + 0xe4))
+        return;
+    const uint64_t barr = L64(B);
+    const uint64_t bend = (uint32_t)(barr + bcnt * 8);
+    uint32_t v9 = L32(T + 0xe4);
+    for (uint64_t pp = (uint32_t)barr; pp != bend; pp = (uint32_t)(pp + 8)) {
+        if (!v9)
+            continue;
+        const uint64_t dpool = L64(pp);
+        uint64_t dbase0 = L64(dpool + 0x20);
+        uint32_t w2 = 0, nw2;
+        for (;;) {
+            const uint64_t db = L64(L64(dpool) + (uint64_t)w2 * 8);
+            if (db != ~0ull) {
+                for (int h2 = 0; h2 < 2; h2++) {
+                    uint32_t lv = ~(uint32_t)(db >> (h2 * 32));
+                    const uint32_t dbase = (uint32_t)(dbase0 + h2 * 32 * 0x28);
+                    while (lv) {
+                        const uint32_t k = __builtin_ctz(lv);
+                        lv &= lv - 1;
+                        const uint64_t D = dbase + k * 0x28;
+                        const uint8_t *dp = gm_ + (uint32_t)D;
+                        if (!(dp[0x20] & 2) || !(rt_ld32(dp + 0x18) | rt_ld32(dp + 0x1c)))
+                            continue;
+                        if (dcache_n == DCACHE_MAX) {
+                            dcache_n = -1;
+                            return;
+                        }
+                        DefBox *d = &dcache[dcache_n++];
+                        {
+                            const float t = ldfp(D + 8), h = ldfp(D);
+                            d->xlo = t - h;
+                            d->xhi = t + h;
+                        }
+                        {
+                            const float h = ldfp(D + 4), t = ldfp(D + 0xc);
+                            d->ylo = t - h;
+                            d->yhi = h + t;
+                        }
+                    }
+                }
+            }
+            dbase0 = (uint32_t)(dbase0 + 0xa00);
+            w2++;
+            nw2 = L32(T + 0xe4);
+            if (w2 == nw2)
+                break;
+        }
+        v9 = nw2;
+    }
+}
 static void process_attack_list(Ctx *c, int dry)
 {
     GM_BEGIN;
+    dcache_dirty = 1;
     const uint64_t T = c->x[0];
     const uint32_t idx = (uint32_t)c->x[1];
     const uint64_t cnt = L64(T + 0x88);
@@ -4280,6 +4343,20 @@ static void process_attack_list(Ctx *c, int dry)
                         const float hx = ldfp(A) + e8, hy = ldfp(A + 4) + e8;
                         const float cx = ldfp(A + 8), cy = ldfp(A + 0xc);
                         const float s8 = cx - hx, s9 = hx + cx, s10 = hy + cy, s11 = cy - hy;
+                        /* the defenders once (their flags and boxes), until a hit runs game code:
+                         * an attacker that touches none of them does nothing in the game's loop */
+                        if (dcache_dirty)
+                            dcache_build(gm_, T, B);
+                        if (dcache_n >= 0) {
+                            int any = 0;
+                            for (int q = 0; q < dcache_n && !any; q++) {
+                                const DefBox *d = &dcache[q];
+                                any = !(s8 > d->xhi || d->xlo > s9) && !(s11 > d->yhi || d->ylo > s10);
+                            }
+                            if (!any)
+                                continue;
+                            dcache_dirty = 1;
+                        }
                         const uint64_t barr = L64(B);
                         const uint64_t bend = (uint32_t)(barr + bcnt * 8);
                         uint32_t v9 = L32(T + 0xe4);
