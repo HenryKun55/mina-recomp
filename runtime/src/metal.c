@@ -31,6 +31,9 @@ static pthread_t gl_owner;
 static int gl_owned;
 static SDL_Window *gl_window;
 
+#if defined(__vita__)
+static void stage_vram_reserve(void);
+#endif
 #if defined(__vita__) && !defined(MINA_NULL_GL)
 /* vitaGL starts on the main thread at boot, before the game takes memory */
 #include <vitashark.h>
@@ -239,6 +242,7 @@ void metal_vita_init(void)
     for (int k = 0; k < 5; k++)
         rt_log("[vgl] %s: %.1f of %.1f MiB free\n", names[k], vglMemFree((vglMemType)k) / 1048576.0,
                vglMemTotal((vglMemType)k) / 1048576.0);
+    stage_vram_reserve();
     mem_free_report();
 }
 #endif
@@ -1026,6 +1030,35 @@ static void stage_arena_init(void)
     }
     rt_log("[mem] staging arena: %d blocks (%.1f MiB) from the system's %.1f MiB free\n", n,
            n * (blk / 1048576.0), info.size_user / 1048576.0);
+}
+/* Video memory as staging blocks: vitaGL's CDRAM pool had 73 of 96 MiB free after its
+ * init on the console, while the system's spare main memory was 5 MiB (no blocks): a
+ * room's blocks past the pak's 17 came from the heap and stayed there (8, 10 MiB of
+ * 272, the heap at 257). Reserved once, at the GL init (one thread), keeping 48 MiB of
+ * the pool for textures; the CPU writes it (write-combined) and our uploads read it.
+ * MINA_STAGE_VRAM=n blocks (default 8, 0: none). */
+static void stage_vram_reserve(void)
+{
+    const char *v = getenv("MINA_STAGE_VRAM");
+    int n = v ? atoi(v) : 8;
+    const uint32_t blk = 0x140000;
+    const size_t keep = (size_t)48 << 20;
+    while (!v && n > 0 && vglMemFree(VGL_MEM_VRAM) < keep + (size_t)n * blk)
+        n--;                /* (a count asked for is taken as is: Vita3K reports no free video memory) */
+    uint8_t *base = NULL;
+    while (n > 0 && !(base = vglAlloc((uint32_t)n * blk, VGL_MEM_VRAM)))
+        n--;
+    if (base) {
+        memset(base, 0, (size_t)n * blk);
+        pthread_mutex_lock(&stage_lock);
+        for (int i = 0; i < n && nstage_arena < STAGE_ARENA_MAX; i++) {
+            stage_arena[nstage_arena++] = guest_addr(base + (size_t)i * blk);
+            stage_arena_free[nstage_arena_free++] = stage_arena[nstage_arena - 1];
+        }
+        pthread_mutex_unlock(&stage_lock);
+    }
+    rt_log("[mem] staging arena: %d blocks (%.1f MiB) from video memory, %.1f MiB of it left\n", n,
+           n * (blk / 1048576.0), vglMemFree(VGL_MEM_VRAM) / 1048576.0);
 }
 #else
 static void stage_arena_init(void) { stage_arena_tried = 1; }
@@ -3079,10 +3112,13 @@ void metal_present(uint64_t drawable)
                     static int every;
                     if (++every % 15 == 0) {
                         struct mallinfo mi = mallinfo();
-                        rt_log("[mem] heap %.1f MiB, free %.1f MiB in %d pieces; %d staging blocks pooled, arena %d of %d "
-                               "free\n",
-                               mi.arena / 1048576.0, mi.fordblks / 1048576.0, mi.ordblks, nstage_pool,
-                               nstage_arena_free, nstage_arena);
+                        char sl[96];
+                        void slab_report(char *out, size_t n);
+                        slab_report(sl, sizeof sl);
+                        rt_log("[mem] heap %.1f MiB, free %.1f MiB in %d pieces (%s); %d staging blocks pooled, arena %d of %d "
+                               "free; video memory %.1f MiB free\n",
+                               mi.arena / 1048576.0, mi.fordblks / 1048576.0, mi.ordblks, sl, nstage_pool,
+                               nstage_arena_free, nstage_arena, vglMemFree(VGL_MEM_VRAM) / 1048576.0);
                     }
                 }
 #endif

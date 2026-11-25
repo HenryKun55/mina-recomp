@@ -268,6 +268,11 @@ class Func:
         # table address: adrp + add into load.rn, before the load
         tab = self.const_before(self.index[load.addr], load.rn)
         if tab is None:
+            # the table's base loaded far before, kept in a callee-saved register
+            # across the loop (NPCPasserbyRect::Update: 350 instructions); the
+            # targets must all land inside the function below
+            tab = self.const_before(self.index[load.addr], load.rn, 4096)
+        if tab is None:
             return None
         n = self.bound_before(self.index[load.addr], load.rm)
         size, signed = load.size, load.signed
@@ -292,11 +297,11 @@ class Func:
             targets.append(t)
         return targets or None
 
-    def const_before(self, i, reg):
+    def const_before(self, i, reg, window=256):
         """Constant value of `reg` before instruction i (adrp/add/adr chains);
         None if it is redefined by anything else."""
         add = 0
-        for k in range(i - 1, max(-1, i - 256), -1):
+        for k in range(i - 1, max(-1, i - window), -1):
             ins = self.insns[k]
             if ins.op == "addsub_imm" and ins.rd == reg and not ins.s and not ins.sub and ins.rn == reg:
                 add += ins.imm
@@ -304,8 +309,23 @@ class Func:
             if ins.op in ("adrp", "adr") and ins.rd == reg:
                 return ins.target + add
             if reg in writes(ins):
+                if window > 256 and self.leaves(k):
+                    continue    # an early return's epilogue restoring it
                 return None
         return None
+
+    def leaves(self, k):
+        """Instruction k is followed, without any branch or label in between,
+        by a return or a tail call out of the function."""
+        for j in range(k + 1, min(len(self.insns), k + 24)):
+            o = self.insns[j]
+            if o.addr in self.labels:
+                return False
+            if o.op == "ret" or (o.op == "b" and not self.inside(o.target)):
+                return True
+            if o.op in ("b", "bcond", "cbz", "cbnz", "tbz", "tbnz", "br", "brk", "blr", "bl"):
+                return False
+        return False
 
     def bound_before(self, i, reg, depth=0):
         """Entry count of the table indexed by `reg` (from cmp #imm / b.hi), or None.

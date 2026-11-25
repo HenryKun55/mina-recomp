@@ -50,6 +50,7 @@ static void *lowguard_thread(void *arg)
     return NULL;
 }
 
+static void slab_init(void);
 char *sbrk_start;
 void mem_init(void)
 {
@@ -79,6 +80,7 @@ void mem_init(void)
     if (!block)
         rt_fatal("cannot allocate the image (%u bytes)", end - skip_hi);
     g_mem = (uint8_t *)((uintptr_t)block - skip_hi);
+    slab_init();
 }
 uint32_t image_skip_lo(void) { return GUEST_IMAGE_BASE; }
 uint32_t image_skip_hi(void) { return skip_hi; }
@@ -171,10 +173,114 @@ static void big_note(void *p, uint64_t size, int made, const void *ra)
         rt_log("[big] 524560 from host %p, thread %u: %s\n", ra, tc ? tc->thread_id : 0, bt);
     }
 }
+/* Small blocks (up to SLAB_MAX bytes) come from slabs: 64 KiB pages of one size each
+ * (16-byte steps), a free list per size under its own lock. newlib's malloc
+ * (dlmalloc 2.6) keeps its free chunks in sorted lists: on the console, with the heap
+ * in ~60k pieces, its calls took 2-65 ms under its one lock (the game thread lost ~7 s
+ * in a session to it, the audio and render threads as much). Small blocks no longer
+ * cut its free space into pieces, and theirs never walk a list. Pages are never given
+ * back (a size's pages serve only that size). MINA_SLAB=0: newlib for all. */
+#include <psp2/kernel/threadmgr.h>
+#define SLAB_MAX 512u
+#define SLAB_NCLS (SLAB_MAX / 16)
+#define SLAB_PAGE 0x10000u
+#define SLAB_CHUNK 0x100000u
+#define SLAB_LIMIT (112u << 20)       /* past this, newlib again */
+typedef struct {
+    SceKernelLwMutexWork mtx;
+    uint8_t *free_list, *bump, *bump_end;
+    uint32_t pages, live;
+} SlabCls;
+static SlabCls slab[SLAB_NCLS];
+static uint8_t slab_dir[65536];       /* host address >> 16: size class + 1 */
+static SceKernelLwMutexWork slab_chunk_mtx;
+static uint8_t *slab_chunk, *slab_chunk_end;
+static uint32_t slab_bytes;
+static int slab_on;
+static void slab_init(void)
+{
+    const char *v = getenv("MINA_SLAB");
+    if ((v && !atoi(v)) || getenv("MINA_HEAPCHECK"))
+        return;
+    for (int i = 0; i < SLAB_NCLS; i++)
+        sceKernelCreateLwMutex(&slab[i].mtx, "mina_slab", 0, 0, NULL);
+    sceKernelCreateLwMutex(&slab_chunk_mtx, "mina_slab_chunk", 0, 0, NULL);
+    slab_on = 1;
+}
+static uint8_t *slab_page(int k)
+{
+    uint8_t *pg = NULL;
+    sceKernelLockLwMutex(&slab_chunk_mtx, 1, NULL);
+    if (slab_chunk == slab_chunk_end && slab_bytes + SLAB_CHUNK <= SLAB_LIMIT) {
+        slab_chunk = memalign(SLAB_PAGE, SLAB_CHUNK);
+        slab_chunk_end = slab_chunk ? slab_chunk + SLAB_CHUNK : NULL;
+        if (slab_chunk)
+            slab_bytes += SLAB_CHUNK;
+    }
+    if (slab_chunk && slab_chunk < slab_chunk_end) {
+        pg = slab_chunk;
+        slab_chunk += SLAB_PAGE;
+        slab_dir[(uintptr_t)pg >> 16] = (uint8_t)(k + 1);
+    }
+    sceKernelUnlockLwMutex(&slab_chunk_mtx, 1);
+    return pg;
+}
+static void *slab_alloc(uint64_t size)
+{
+    const int k = size ? (int)((size - 1) >> 4) : 0;
+    SlabCls *s = &slab[k];
+    const uint32_t sz = (uint32_t)(k + 1) << 4;
+    sceKernelLockLwMutex(&s->mtx, 1, NULL);
+    uint8_t *p = s->free_list;
+    if (p)
+        s->free_list = *(uint8_t **)p;
+    else {
+        if (s->bump + sz > s->bump_end) {
+            uint8_t *pg = slab_page(k);
+            if (!pg) {
+                sceKernelUnlockLwMutex(&s->mtx, 1);
+                return NULL;
+            }
+            s->bump = pg;
+            s->bump_end = pg + SLAB_PAGE;
+            s->pages++;
+        }
+        p = s->bump;
+        s->bump += sz;
+    }
+    s->live++;
+    sceKernelUnlockLwMutex(&s->mtx, 1);
+    return p;
+}
+static inline int slab_class(const void *p) { return (int)slab_dir[(uintptr_t)p >> 16] - 1; }
+static void slab_free(void *p, int k)
+{
+    SlabCls *s = &slab[k];
+    sceKernelLockLwMutex(&s->mtx, 1, NULL);
+    *(uint8_t **)p = s->free_list;
+    s->free_list = p;
+    s->live--;
+    sceKernelUnlockLwMutex(&s->mtx, 1);
+}
+void slab_report(char *out, size_t n)
+{
+    uint64_t live = 0;
+    for (int i = 0; i < SLAB_NCLS; i++)
+        live += (uint64_t)slab[i].live * ((i + 1) << 4);
+    snprintf(out, n, "small blocks %.1f MiB in %.1f MiB of slabs", live / 1048576.0, slab_bytes / 1048576.0);
+}
+
 uint32_t gmalloc(uint64_t size)
 {
     if (size > 0x20000000ull)
         return 0;
+    if (slab_on && size <= SLAB_MAX) {
+        void *q = slab_alloc(size);
+        if (q) {
+            heap_in_use += ((size ? size - 1 : 0) | 15) + 1;
+            return guest_addr(q);
+        }
+    }
     if (heapcheck_on()) {
         HcHdr *h = memalign(16, (size_t)size + 32);
         if (!h)
@@ -248,6 +354,14 @@ void gfree(uint32_t a)
             hc_leave(out);
         return;
     }
+    if (slab_on) {
+        const int k = slab_class(G(a));
+        if (k >= 0) {
+            heap_in_use -= (uint32_t)(k + 1) << 4;
+            slab_free(G(a), k);
+            return;
+        }
+    }
     heap_in_use -= malloc_usable_size(G(a));
     if (biglog > 0)
         big_note(G(a), malloc_usable_size(G(a)), 0, __builtin_return_address(0));
@@ -257,6 +371,11 @@ void gfree(uint32_t a)
 }
 uint64_t gmalloc_usable(uint32_t a)
 {
+    if (slab_on) {
+        const int k = slab_class(G(a));
+        if (k >= 0)
+            return (uint32_t)(k + 1) << 4;
+    }
     HcHdr *h = heapcheck_on() ? hc_hdr(a) : NULL;
     return h ? h->size : malloc_usable_size(G(a));
 }
