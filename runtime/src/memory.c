@@ -323,9 +323,9 @@ static void hs_note(void *p, uint32_t u, int made)
     const int b = hs_bucket(u);
     __atomic_add_fetch(&hs_bytes[b], made ? (int64_t)u : -(int64_t)u, __ATOMIC_RELAXED);
     __atomic_add_fetch(&hs_cnt[b], made ? 1 : -1, __ATOMIC_RELAXED);
-    if (made && (b == hs_watch[0] || b == hs_watch[1] || b == hs_watch[2])) {
+    if (made && (u >= (4u << 20) || b == hs_watch[0] || b == hs_watch[1] || b == hs_watch[2])) {
         static uint32_t n;
-        if ((__atomic_add_fetch(&n, 1, __ATOMIC_RELAXED) % 97) == 0 && hs_samples < 6) {
+        if (u >= (4u << 20) || ((__atomic_add_fetch(&n, 1, __ATOMIC_RELAXED) % 97) == 0 && hs_samples < 6)) {
             hs_samples++;
             char bt[900];
             bt[0] = 0;
@@ -343,7 +343,7 @@ static void hs_note(void *p, uint32_t u, int made)
                 if (!f || f[0] == '?' || f == last)
                     continue;
                 last = f;
-                o += snprintf(bt + o, sizeof bt - (size_t)o, "%s%s", got ? " < " : "", f);
+                o += snprintf(bt + o, sizeof bt - (size_t)o, "%s%p", got ? " < " : "", (void *)w);
                 got++;
             }
             rt_log("[heapstat] %u bytes at %p: %s\n", u, p, bt);

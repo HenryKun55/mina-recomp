@@ -99,6 +99,10 @@ static void warp_requests(Ctx *c)
         return;
     const int idx = mina_level_index(name);
     rt_log("[warp] %s -> level %d\n", name, idx);
+    if (getenv("MINA_CJK_TEST")) {      /* (tests) the on-demand load, mid-game */
+        void cjk_fonts_load_test(Ctx *c);
+        cjk_fonts_load_test(c);
+    }
     if (idx <= 0)
         return;
     const Ctx save = *c;
@@ -7289,3 +7293,91 @@ void nat__ZN18ycPaletteAnimEntry6UpdateEfPNS_10UpdateInfoE(Ctx *c)
         rt_log("[verify] PaletteAnimEntry: %u checked, %u differ, %u skipped (a resource let go)\n", checked, bad,
                skipped);
 }
+
+#if defined(__vita__)
+#include <malloc.h>
+#endif
+/* ---- ycTextFont::GetFont: the Chinese, Japanese and Korean fonts on demand ----
+ * Game::LoadUpdate loads all 14 fonts of its table (Mach-O 0x100e18f68: name, size, font;
+ * 0x18 each) at boot: the six of fonts/japanese, korean, chineseSimplified and
+ * chineseTraditional took 26 MiB of the heap for good (Unifontexmono alone ~20), in any
+ * language. Their glyphs go into the per-size glyph caches the text draws from; nothing
+ * reads their table entries. In another language they wait: loaded (into their entries)
+ * when the language becomes one of them (ycTextLocalizer::ReloadLanguage) or the language
+ * list opens (OptionsMenuLanguagePopup: the languages' names in their own scripts).
+ * MINA_CJK_FONTS=1: all at boot, as the game does. MINA_FONTLOG=1: the fonts and their cost. */
+void f_1c12c8_orig(Ctx *c);
+#define FONT_TABLE 0x1e18f68u          /* guest address of the table */
+#define S_LANGUAGE 0x5ea15d8u          /* (anonymous)::s_language */
+static int cjk_waiting[16], ncjk_waiting, cjk_loaded;
+static int font_is_cjk(const char *n)
+{
+    return strstr(n, "fonts/japanese/") || strstr(n, "fonts/korean/") || strstr(n, "fonts/chinese");
+}
+static int language_is_cjk(void)
+{
+    const uint32_t l = rt_ld32(G(S_LANGUAGE));
+    return l == 5 || l == 6 || l == 9 || l == 10 || l == 11;
+}
+static void font_get(Ctx *c, uint64_t name, uint32_t size)
+{
+    c->x[0] = name;
+    c->x[1] = size;
+#if defined(__vita__)
+    struct mallinfo mi0 = mallinfo();
+    f_1c12c8_orig(c);
+    struct mallinfo mi1 = mallinfo();
+    const int d = mi1.uordblks - mi0.uordblks;
+#else
+    f_1c12c8_orig(c);
+    const int d = 0;
+#endif
+    if (getenv("MINA_FONTLOG"))
+        rt_log("[font] %s (%u): %+.1f MiB\n", name ? (const char *)G((uint32_t)name) : "-", size, d / 1048576.0);
+}
+/* the fonts left waiting, into their table entries (on the game thread) */
+static void cjk_fonts_load(Ctx *c, const char *why)
+{
+    if (cjk_loaded || !ncjk_waiting)
+        return;
+    cjk_loaded = 1;
+    const Ctx save = *c;
+    for (int k = 0; k < ncjk_waiting; k++) {
+        const uint32_t e = FONT_TABLE + 0x18u * (uint32_t)cjk_waiting[k];
+        font_get(c, rt_ld64(G(e)), rt_ld32(G(e + 8)));
+        rt_st64(G(e + 0x10), c->x[0]);
+    }
+    rt_log("[font] %d Chinese, Japanese and Korean fonts loaded (%s)\n", ncjk_waiting, why);
+    *c = save;
+}
+void nat__ZN10ycTextFont7GetFontEPKcj(Ctx *c)
+{
+    const uint64_t name = c->x[0];
+    const uint32_t size = (uint32_t)c->x[1];
+    static int all = -1;
+    if (all < 0)
+        all = getenv("MINA_CJK_FONTS") != NULL;
+    if (name && !all && !cjk_loaded && !language_is_cjk() && font_is_cjk((const char *)G((uint32_t)name))) {
+        for (int i = 0; i < 14; i++)
+            if (rt_ld64(G(FONT_TABLE + 0x18u * (uint32_t)i)) == name && ncjk_waiting < 16) {
+                cjk_waiting[ncjk_waiting++] = i;
+                c->x[0] = 0;
+                return;
+            }
+    }
+    font_get(c, name, size);
+}
+void f_1c2190_orig(Ctx *c);        /* ycTextLocalizer::ReloadLanguage */
+void nat__ZN15ycTextLocalizer14ReloadLanguageEv(Ctx *c)
+{
+    if (language_is_cjk())
+        cjk_fonts_load(c, "the language");
+    f_1c2190_orig(c);
+}
+void f_77c45c_orig(Ctx *c);        /* OptionsMenuLanguagePopup::UpdateState */
+void nat__ZN24OptionsMenuLanguagePopup11UpdateStateEv(Ctx *c)
+{
+    cjk_fonts_load(c, "the language list");
+    f_77c45c_orig(c);
+}
+void cjk_fonts_load_test(Ctx *c) { cjk_fonts_load(c, "test"); }

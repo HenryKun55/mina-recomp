@@ -2621,6 +2621,10 @@ static void cb_addCompletedHandler(Ctx *c)
     MCmdBuf *cb = objc_host(SELF);
     if (cb->nhandlers < 8) {
         cb->handlers[cb->nhandlers++] = block_copy(c, MARG(0));
+    } else {
+        static int told;
+        if (told++ < 5)
+            rt_log("[metal] a command buffer's completed handler past 8 dropped\n");
     }
 }
 static void cb_presentDrawable(Ctx *c)
