@@ -1373,6 +1373,54 @@ uint32_t g_depth_fs_draws, g_depth_restarts;     /* MINA_FPS */
  * the target's depth sampled as a texture: the scene drawn so far ends (its
  * depth stored) and another begins on the same target, loading it. The depth
  * it would write is not: later depth-tested draws of the pass see the old one. */
+/* MINA_DEPTHDBG: every 3 s, what the sampled depth buffer holds in memory (the console hid
+ * what tests it, Vita3K does not): its words that are the fill pattern (never stored), have
+ * the sign bit, are 0, and the range of the rest */
+#include <psp2/gxm.h>
+static void depth_probe(MTexture *d, int cmp)
+{
+    static int on = -1;
+    static uint64_t last;
+    if (on < 0)
+        on = getenv("MINA_DEPTHDBG") != NULL;
+    const uint64_t now = sceKernelGetProcessTimeWide();
+    if (!on || now - last < 3000000)
+        return;
+    last = now;
+    typedef struct { uint8_t active, wants_stencil, has_surface; SceGxmDepthStencilSurface ds; } RbMirror;
+    const RbMirror *rb = (const RbMirror *)(uintptr_t)d->gl;
+    if (!rb || !rb->has_surface || !rb->ds.depthData)
+        return;
+    const uint32_t w = (d->width + 31u) & ~31u, h = (d->height + 31u) & ~31u, n = w * h;
+    const uint32_t *m = (const uint32_t *)rb->ds.depthData;
+    uint32_t fill = 0, sign = 0, zero = 0, seen = 0;
+    float lo = 1e30f, hi = -1e30f;
+    for (uint32_t i = 0; i < n; i += 5) {
+        const uint32_t v = m[i];
+        seen++;
+        if (v == 0x80808080u) {
+            fill++;
+            continue;
+        }
+        if (v >> 31)
+            sign++;
+        const uint32_t a = v & 0x7fffffffu;
+        if (!a) {
+            zero++;
+            continue;
+        }
+        float f;
+        memcpy(&f, &a, 4);
+        if (f < lo)
+            lo = f;
+        if (f > hi)
+            hi = f;
+    }
+    const uint32_t c = m[(h / 2) * w + w / 2];
+    rt_log("[depthdbg] %ux%u (zls %#x) cmp %d: of %u words %u fill, %u sign bit, %u zero; rest %g..%g; centre %#x\n",
+           d->width, d->height, rb->ds.zlsControl, cmp, seen, fill, sign, zero, lo, hi, c);
+}
+
 static void depth_by_shader(REnc *e, MPipeline *p)
 {
     GL_DIRTY();
@@ -1404,6 +1452,7 @@ static void depth_by_shader(REnc *e, MPipeline *p)
             g_depth_restarts++;
         }
         d->sampled = 1;
+        depth_probe(d, cmp);
         glActiveTexture(GL_TEXTURE0 + (GLenum)p->dst_depth_unit);
         glBindTexture(GL_TEXTURE_2D, d->depth_tex);
         glBindSampler((GLuint)p->dst_depth_unit, 0);
