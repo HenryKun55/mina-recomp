@@ -378,8 +378,10 @@ static void log_big(Ctx *c, const char *what, uint64_t n)
         rt_log("[alloc] %s %.1f MiB: %s\n", what, n / 1048576.0, bt);
     }
 }
+const void *g_malloc_ra;      /* (MINA_HEAPSTAT) the recompiled code that called malloc last */
 static void imp_malloc(Ctx *c)
 {
+    g_malloc_ra = __builtin_return_address(0);
 #if defined(MINA_PROFILE)
     {   /* MINA_BIGLOG: which recompiled function asks for 512 KiB blocks */
         static int on = -1, told;
@@ -402,8 +404,8 @@ static void imp_malloc(Ctx *c)
     log_big(c, "malloc", A0);
     RET(gmalloc(A0));
 }
-static void imp_calloc(Ctx *c) { log_big(c, "calloc", A0 * A1); RET(gcalloc(A0, A1)); }
-static void imp_realloc(Ctx *c) { log_big(c, "realloc", A1); RET(grealloc((uint32_t)A0, A1)); }
+static void imp_calloc(Ctx *c) { g_malloc_ra = __builtin_return_address(0); log_big(c, "calloc", A0 * A1); RET(gcalloc(A0, A1)); }
+static void imp_realloc(Ctx *c) { g_malloc_ra = __builtin_return_address(0); log_big(c, "realloc", A1); RET(grealloc((uint32_t)A0, A1)); }
 static int pak_is_kept(uint32_t a);
 static void imp_free(Ctx *c)
 {

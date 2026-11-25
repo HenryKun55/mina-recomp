@@ -3115,6 +3115,8 @@ void metal_present(uint64_t drawable)
                         char sl[96];
                         void slab_report(char *out, size_t n);
                         slab_report(sl, sizeof sl);
+                        void heapstat_report(void);
+                        heapstat_report();
                         rt_log("[mem] heap %.1f MiB, free %.1f MiB in %d pieces (%s); %d staging blocks pooled, arena %d of %d "
                                "free; video memory %.1f MiB free\n",
                                mi.arena / 1048576.0, mi.fordblks / 1048576.0, mi.ordblks, sl, nstage_pool,

@@ -270,6 +270,118 @@ void slab_report(char *out, size_t n)
     snprintf(out, n, "small blocks %.1f MiB in %.1f MiB of slabs", live / 1048576.0, slab_bytes / 1048576.0);
 }
 
+/* newlib's blocks for the guest: malloc(size + align), aligned up inside, the offset kept in
+ * the 8 bytes before. memalign(16, n) asked newlib for n + 16 + its minimum and gave back the
+ * pieces around: a block freed left a hole the next request of the same size never fit, so the
+ * break moved up instead (Vita3K, a level standing still: 209 MiB in use, the heap at 272 with
+ * 63 free in 5k pieces, then out of memory; the console's crashes). One size now asks for one
+ * size and takes its hole again. */
+#define NL_MAGIC 0x4E4C4231u
+static void *nl_alloc(size_t size, size_t align)
+{
+    uint8_t *p = malloc(size + align);
+    if (!p)
+        return NULL;
+    uint8_t *q = (uint8_t *)(((uintptr_t)p + 8 + align - 1) & ~(uintptr_t)(align - 1));
+    const uint32_t off = (uint32_t)(q - p);
+    ((uint32_t *)q)[-1] = off;
+    ((uint32_t *)q)[-2] = NL_MAGIC ^ off;
+    return q;
+}
+static inline uint8_t *nl_base(void *q)
+{
+    const uint32_t off = ((uint32_t *)q)[-1];
+    if ((((uint32_t *)q)[-2] ^ off) != NL_MAGIC || off < 8 || off > (1u << 20))
+        rt_fatal("guest heap: block %p has no header (freed twice or written before its start)", q);
+    return (uint8_t *)q - off;
+}
+static inline size_t nl_usable(void *q)
+{
+    uint8_t *b = nl_base(q);
+    return malloc_usable_size(b) - (size_t)((uint8_t *)q - b);
+}
+static inline void nl_free(void *q) { free(nl_base(q)); }
+
+/* MINA_HEAPSTAT: live guest blocks by size (16-byte steps below 4 KiB, then powers of
+ * two), the sizes that grew most since the last report logged with a few guest
+ * call stacks of their allocations (what leaks) */
+#define HS_N 280
+static int64_t hs_bytes[HS_N], hs_prev[HS_N], hs_cnt[HS_N];
+static int hs_on = -1, hs_watch[3] = { -1, -1, -1 }, hs_samples;
+static inline int hs_bucket(uint32_t u)
+{
+    if (u < 4096)
+        return (int)(u >> 4);
+    return 256 + (31 - __builtin_clz(u)) - 12;
+}
+static void hs_note(void *p, uint32_t u, int made)
+{
+    if (hs_on < 0)
+        hs_on = getenv("MINA_HEAPSTAT") != NULL;
+    if (!hs_on)
+        return;
+    const int b = hs_bucket(u);
+    __atomic_add_fetch(&hs_bytes[b], made ? (int64_t)u : -(int64_t)u, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&hs_cnt[b], made ? 1 : -1, __ATOMIC_RELAXED);
+    if (made && (b == hs_watch[0] || b == hs_watch[1] || b == hs_watch[2])) {
+        static uint32_t n;
+        if ((__atomic_add_fetch(&n, 1, __ATOMIC_RELAXED) % 97) == 0 && hs_samples < 6) {
+            hs_samples++;
+            char bt[900];
+            bt[0] = 0;
+            /* the recompiled functions on the host stack (return addresses: thumb, near this code) */
+            const char *guest_func_at_host(const void *pc);
+            const uintptr_t lo = (uintptr_t)&hs_note - 0x3000000u, hi = (uintptr_t)&hs_note + 0x3000000u;
+            const uint32_t *st = (const uint32_t *)__builtin_frame_address(0);
+            int o = 0, got = 0;
+            const char *last = "";
+            for (int i = 0; i < 1024 && got < 9 && o < (int)sizeof bt - 80; i++) {
+                const uintptr_t w = st[i];
+                if (!(w & 1) || w < lo || w > hi)
+                    continue;
+                const char *f = guest_func_at_host((const void *)w);
+                if (!f || f[0] == '?' || f == last)
+                    continue;
+                last = f;
+                o += snprintf(bt + o, sizeof bt - (size_t)o, "%s%s", got ? " < " : "", f);
+                got++;
+            }
+            rt_log("[heapstat] %u bytes at %p: %s\n", u, p, bt);
+        }
+    }
+}
+void heapstat_report(void)
+{
+    if (hs_on <= 0)
+        return;
+    int top[6] = { -1, -1, -1, -1, -1, -1 };
+    for (int b = 0; b < HS_N; b++) {
+        const int64_t d = hs_bytes[b] - hs_prev[b];
+        for (int k = 0; k < 6; k++)
+            if (top[k] < 0 || d > hs_bytes[top[k]] - hs_prev[top[k]]) {
+                for (int j = 5; j > k; j--)
+                    top[j] = top[j - 1];
+                top[k] = b;
+                break;
+            }
+    }
+    char line[512];
+    int o = 0;
+    for (int k = 0; k < 6; k++) {
+        const int b = top[k];
+        const uint32_t lo = b < 256 ? (uint32_t)b << 4 : 1u << (b - 256 + 12);
+        o += snprintf(line + o, sizeof line - (size_t)o, " %u: %+.0f KiB (%.1f MiB, %lld)", lo,
+                      (hs_bytes[b] - hs_prev[b]) / 1024.0, hs_bytes[b] / 1048576.0, (long long)hs_cnt[b]);
+    }
+    struct mallinfo mi = mallinfo();
+    rt_log("[heapstat] guest blocks %.1f MiB of the %.1f in use (the rest: the runtime's own); grew most:%s\n",
+           heap_in_use / 1048576.0, mi.uordblks / 1048576.0, line);
+    for (int k = 0; k < 3; k++)
+        hs_watch[k] = top[k];
+    hs_samples = 0;
+    memcpy(hs_prev, hs_bytes, sizeof hs_prev);
+}
+
 uint32_t gmalloc(uint64_t size)
 {
     if (size > 0x20000000ull)
@@ -278,6 +390,7 @@ uint32_t gmalloc(uint64_t size)
         void *q = slab_alloc(size);
         if (q) {
             heap_in_use += ((size ? size - 1 : 0) | 15) + 1;
+            hs_note(q, (uint32_t)(((size ? size - 1 : 0) | 15) + 1), 1);
             return guest_addr(q);
         }
     }
@@ -291,7 +404,7 @@ uint32_t gmalloc(uint64_t size)
         return guest_addr(h + 1);
     }
     const uint64_t t0 = slow_now();
-    void *p = memalign(16, size ? (size_t)size : 1);
+    void *p = nl_alloc(size ? (size_t)size : 1, 16);
     slow_note("malloc", t0, size);
     if (!p) {
         rt_log("guest heap: %llu bytes not available\n", (unsigned long long)size);
@@ -304,10 +417,12 @@ uint32_t gmalloc(uint64_t size)
             rt_log("guest heap: break moved %.1f MiB since boot, sbrk(1 MiB) %s; arena %.1f MiB, free %.1f in %d chunks\n",
                    (now - sbrk_start) / 1048576.0, more == (void *)-1 ? "fails" : "works", mi.arena / 1048576.0,
                    mi.fordblks / 1048576.0, mi.ordblks);
+            heapstat_report();
         }
         return 0;
     }
-    heap_in_use += malloc_usable_size(p);
+    heap_in_use += nl_usable(p);
+    hs_note(p, (uint32_t)nl_usable(p), 1);
     big_note(p, size, 1, __builtin_return_address(0));
     return guest_addr(p);
 }
@@ -358,15 +473,22 @@ void gfree(uint32_t a)
         const int k = slab_class(G(a));
         if (k >= 0) {
             heap_in_use -= (uint32_t)(k + 1) << 4;
+            hs_note(G(a), (uint32_t)(k + 1) << 4, 0);
             slab_free(G(a), k);
             return;
         }
     }
-    heap_in_use -= malloc_usable_size(G(a));
+    if (heapcheck_on()) {               /* (a gmemalign block there: newlib's own) */
+        free(G(a));
+        return;
+    }
+    const size_t us = nl_usable(G(a));
+    heap_in_use -= us;
+    hs_note(G(a), (uint32_t)us, 0);
     if (biglog > 0)
-        big_note(G(a), malloc_usable_size(G(a)), 0, __builtin_return_address(0));
+        big_note(G(a), us, 0, __builtin_return_address(0));
     const uint64_t t0 = slow_now();
-    free(G(a));
+    nl_free(G(a));
     slow_note("free", t0, 0);
 }
 uint64_t gmalloc_usable(uint32_t a)
@@ -377,7 +499,7 @@ uint64_t gmalloc_usable(uint32_t a)
             return (uint32_t)(k + 1) << 4;
     }
     HcHdr *h = heapcheck_on() ? hc_hdr(a) : NULL;
-    return h ? h->size : malloc_usable_size(G(a));
+    return h ? h->size : nl_usable(G(a));
 }
 int gmalloc_was_fresh(void) { return 0; }     /* newlib memory is never known to be zero */
 uint32_t gcalloc(uint64_t n, uint64_t size)
@@ -410,13 +532,18 @@ uint32_t grealloc(uint32_t a, uint64_t size)
 }
 uint32_t gmemalign(uint64_t align, uint64_t size)
 {
-    void *p = memalign((size_t)align, (size_t)size);
+    if (align < 16)
+        align = 16;
+    void *p = heapcheck_on() ? memalign((size_t)align, (size_t)size) : nl_alloc((size_t)size, (size_t)align);
     if (!p) {
         rt_log("guest heap: %llu bytes aligned to %llu not available\n", (unsigned long long)size,
                (unsigned long long)align);
         return 0;
     }
-    heap_in_use += malloc_usable_size(p);
+    if (!heapcheck_on()) {
+        heap_in_use += nl_usable(p);
+        hs_note(p, (uint32_t)nl_usable(p), 1);
+    }
     return guest_addr(p);
 }
 uint32_t gstrdup(const char *s)
