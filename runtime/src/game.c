@@ -5996,12 +5996,62 @@ typedef struct { uint64_t light; V128 v[3]; } LightPos;
 static LightPos dm_pos[64];
 static int dm_batch, dm_n;
 static uint32_t dm_gen;          /* one per DarknessManager::Update: what CalcTile kept is for it */
+static void darkness_update(Ctx *c);
 void nat__ZN15DarknessManager6UpdateEP20ycUpdateQueueContext(Ctx *c)
 {
+    static int off = -1, verify = -1;
+    if (off < 0) {
+        off = rt_native_off("__ZN15DarknessManager6UpdateEP20ycUpdateQueueContext");
+        verify = getenv("MINA_VERIFY_DARK") != NULL;
+    }
     dm_batch = 1;
     dm_n = 0;
     dm_gen++;
-    f_585794_orig(c);
+    if (off) {
+        f_585794_orig(c);
+    } else if (!verify) {
+        darkness_update(c);
+    } else {
+        /* the grid, the sprites, the manager and its entity after each, compared */
+        GM_BEGIN;
+        static uint32_t checked, bad;
+        const uint64_t M = c->x[0], E = lp(M + 0x10);
+        const uint32_t n = rt_ld32(GP(M + 0x1ac));
+        const uint64_t T = lp(M + 0x170), S = lp(M + 0x178);
+        const size_t tn = T ? (size_t)n * 12 : 0, sn = S ? (size_t)n * 0x3e0 : 0;
+        uint8_t *b = malloc(2 * (tn + sn + 0x1c0 + 0x100));
+        if (!b) {
+            f_585794_orig(c);
+            dm_batch = 0;
+            return;
+        }
+        uint8_t *mine = b + tn + sn + 0x1c0 + 0x100;
+#define DK_TAKE(dst) do { uint8_t *p_ = (dst); memcpy(p_, GP(T), tn); memcpy(p_ + tn, GP(S), sn); \
+        memcpy(p_ + tn + sn, GP(M), 0x1c0); memcpy(p_ + tn + sn + 0x1c0, GP(E), 0x100); } while (0)
+#define DK_PUT(src) do { const uint8_t *p_ = (src); memcpy(GP(T), p_, tn); memcpy(GP(S), p_ + tn, sn); \
+        memcpy(GP(M), p_ + tn + sn, 0x1c0); memcpy(GP(E), p_ + tn + sn + 0x1c0, 0x100); } while (0)
+        DK_TAKE(b);
+        const Ctx save = *c;
+        darkness_update(c);
+        DK_TAKE(mine);
+        DK_PUT(b);
+        *c = save;
+        dm_n = 0;
+        dm_gen++;
+        f_585794_orig(c);
+        DK_TAKE(b);
+        checked++;
+        const size_t all = tn + sn + 0x1c0 + 0x100;
+        if (memcmp(b, mine, all) && bad++ < 10) {
+            size_t i = 0;
+            while (b[i] == mine[i]) i++;
+            rt_log("[verify] DarknessManager::Update differs at %zu (grid %zu, sprites %zu, manager 0x1c0, entity): "
+                   "%02x / %02x\n", i, tn, sn, mine[i], b[i]);
+        }
+        if ((checked & 0x3ff) == 0)
+            rt_log("[verify] DarknessManager::Update: %u checked, %u differ\n", checked, bad);
+        free(b);
+    }
     dm_batch = 0;
 }
 void nat__ZNK13DarknessLight6GetPosEv(Ctx *c)
@@ -6342,4 +6392,136 @@ void nat__Z10hashlittlePKvmj(Ctx *c)
         return;
     }
     c->x[0] = h;
+}
+
+/* ---- DarknessManager::Update (x0 the manager M, x1 the update context) ------------------------------
+ * Its entity follows the camera in whole tiles of 0.8 (snapped toward the room's corner); when it
+ * moves the grid (M+0x170, 12 bytes a tile) is shifted by whole rows/columns (that step runs the
+ * game's code); every tile is then recomputed
+ * (CalcTile) and fades toward its level by dt; each tile's sprite (M+0x178, 0x3e0 apart) shows
+ * animation "0".."3" for (target, level), found by name hash in its animations. The game's code,
+ * in order; MINA_VERIFY_DARK=1 compares the grid, sprites, manager and entity. */
+void f_d3d2c(Ctx *c);            /* ycCutterAnimComponent::UpdateRenderFrame */
+static void dk_calc(Ctx *c, uint64_t M, uint32_t i, uint32_t force)
+{
+    c->x[0] = M;
+    c->x[1] = i;
+    c->x[2] = force;
+    nat__ZN15DarknessManager8CalcTileEib(c);
+}
+static void darkness_update(Ctx *c)
+{
+    GM_BEGIN;
+    const uint64_t M = c->x[0], Q = c->x[1];
+    if (!*(uint8_t *)GP(M + 0x1b4))
+        return;
+    float s8 = ldfp(Q + 8);
+    const uint64_t E = lp(M + 0x10);
+    const float s9 = ldfp(E + 0x68);
+    const uint64_t cam = lp(lp(E + 0x50) + 0x16c0);
+    const float g = ldfp(0x1e14e28), k8 = hexf(0x3f4ccccd);
+    float nx, ny;
+    {
+        const float c0x = ldfp(0x1d4f880), c0y = ldfp(0x1d4f884);
+        float v0[2], v2[2];
+        for (int k = 0; k < 2; k++) {
+            v2[k] = ldfp(cam + 0x6a84 + 4 * k) - ldfp(cam + 0x6a74 + 4 * k);
+            v0[k] = ldfp(cam + 0x6a18 + 4 * k) - ldfp(cam + 0x6a24 + 4 * k);
+        }
+        float v1[2] = { c0x * g, c0y * g };
+        float r[2];
+        for (int k = 0; k < 2; k++) {
+            float t = v1[k] * 0.5f;
+            t = v2[k] + t;
+            t = t - v0[k];
+            t = t / k8;
+            t = floorf(t);
+            t = t * k8;
+            r[k] = v0[k] + t;
+        }
+        nx = r[0];
+        ny = r[1];
+    }
+    const float ox = ldfp(E + 0xdc), oy = ldfp(E + 0xe0), oz = ldfp(E + 0xe4);
+    /* the grid shifts (the camera crossed a tile): the game's code for that step (the shift
+     * isn't exercised by the unattended checks, which don't move) */
+    if (*(uint8_t *)GP(M + 0x1b5) && (!(nx == ox && ny == oy) || oz != 0.0f)) {
+        c->x[0] = M;
+        c->x[1] = Q;
+        f_585794_orig(c);
+        return;
+    }
+    stfp(E + 0x9c, nx);
+    stfp(E + 0xa0, ny);
+    rt_st32(GP(E + 0xa4), 0);
+    c->x[0] = E;
+    c->x[1] = Q;
+    nat__ZN8ycEntity21RefreshWorldTransformEb(c);
+    if (!*(uint8_t *)GP(M + 0x1b5)) {
+        for (uint32_t i = 0; (int32_t)i < (int32_t)rt_ld32(GP(M + 0x1ac)); i++)
+            dk_calc(c, M, i, 1);
+        *(uint8_t *)GP(M + 0x1b5) = 1;
+    } else {
+        for (uint32_t i = 0; (int32_t)i < (int32_t)rt_ld32(GP(M + 0x1ac)); i++)
+            dk_calc(c, M, i, 0);
+    }
+    /* each tile's fade and sprite */
+    static uint32_t hname[4];
+    if (!hname[0]) {
+        static const char nm[4][2] = { "0", "1", "2", "3" };
+        for (int k = 0; k < 4; k++)
+            hname[k] = hash_little((const uint8_t *)nm[k], 1);
+    }
+    /* (target, level) -> animation, -1 none: the game's jump table */
+    static const int8_t pick[22] = { 0, 1, 2, -1, -1, -1, -1, -1, -1, -1, 1, 2, 3, -1, -1, -1, -1, -1, -1, -1, 2, 3 };
+    s8 = s8 * s9;
+    for (uint64_t i = 0; (int64_t)i < (int64_t)(int32_t)rt_ld32(GP(M + 0x1ac)); i++) {
+        const uint64_t T = lp(M + 0x170), S = lp(M + 0x178);
+        const uint64_t A = S + i * 0x3e0;
+        uint32_t w25 = 0;
+        const uint64_t gs = lp(0x6051d08);
+        if (!(*(uint8_t *)GP(gs + 1) && (*(uint8_t *)GP(lp(gs + 0x20) + 0x16) & 2))) {
+            const uint64_t e = T + i * 12;
+            float f = ldfp(e + 8);
+            if (!(f < 0.0f || f != f)) {
+                f = f - s8;
+                stfp(e + 8, f);
+                if (!(f > 0.0f || f != f))
+                    rt_st32(GP(e), rt_ld32(GP(e + 4)));
+            }
+            const uint32_t idx = rt_ld32(GP(e)) * 10 + rt_ld32(GP(e + 4));
+            if (idx <= 0x15 && pick[idx] >= 0) {
+                const uint32_t h = hname[pick[idx]];
+                const uint64_t lst = lp(lp(A + 0x40) + 0x10);
+                const uint64_t nn = L64(lst + 0x28) >> 34;
+                w25 = 1;
+                if (nn) {
+                    const uint64_t arr = lp(lst + 0x30);
+                    uint32_t j = 0;
+                    while ((uint64_t)j < nn && rt_ld32(GP(arr + (uint64_t)j * 0x38)) != h)
+                        j++;
+                    if ((uint64_t)j < nn && j != 0xffffffffu && rt_ld32(GP(A + 0x17c)) != j) {
+                        rt_st32(GP(A + 0x17c), j);
+                        memset(GP(A + 0x158), 0, 0x18);
+                        rt_st32(GP(A + 0x170), 0xffffffffu);
+                        rt_st32(GP(A + 0x178), 0x3f800000u);
+                        *(uint8_t *)GP(A + 0x174) = 1;
+                        c->x[0] = A;
+                        f_d3d2c(c);
+                    }
+                }
+            }
+        }
+        *(uint8_t *)GP(A + 0x28c) = (uint8_t)w25;
+        uint8_t vis = (uint8_t)w25;
+        const uint64_t par = lp(A + 0x200);
+        if (par) {
+            const uint32_t fl = rt_ld32(GP(A + 0x1f8));
+            if (!(fl & 8) && w25)
+                vis = *(uint8_t *)GP(par + 0xcc) != 0;
+            else
+                vis = (uint8_t)(w25 & (fl >> 3));
+        }
+        *(uint8_t *)GP(A + 0x155) = vis;
+    }
 }
