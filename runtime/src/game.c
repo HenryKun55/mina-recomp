@@ -5449,11 +5449,29 @@ typedef struct { uint32_t cols, n, gen, used; uint32_t snap[256]; uint16_t tab[5
 static PalHash pal_h[PAL_SLOTS];
 static uint32_t pal_use;
 static inline uint32_t pal_hash(uint32_t x) { return (x * 2654435761u) >> 23; }
+static PalHash *pal_table(uint8_t *gm_, uint32_t cols, uint32_t n);
+static inline uint32_t pal_lookup(const PalHash *h, uint32_t x)
+{
+    uint32_t i = pal_hash(x);
+    while (h->tab[i] != 0xffff) {
+        if (h->snap[h->tab[i]] == x)
+            return h->tab[i];
+        i = (i + 1) & 511;
+    }
+    return h->n;
+}
 static uint32_t find_first(uint8_t *gm_, uint32_t cols, uint32_t n, uint32_t x)
+{
+    PalHash *h = pal_table(gm_, cols, n);
+    return h ? pal_lookup(h, x) : find_u32(GP(cols), n, x);
+}
+/* the table of a palette's colors in this scope, or null (out of a scope, small or big palettes,
+ * the component's own) */
+static PalHash *pal_table(uint8_t *gm_, uint32_t cols, uint32_t n)
 {
     const uint8_t *a = GP(cols);
     if (!pal_scope || n < 16 || n > 256 || cols == pal_avoid)
-        return find_u32(a, n, x);
+        return NULL;
     int k = 0;
     while (k < PAL_SLOTS && !(pal_h[k].cols == cols && pal_h[k].n == n))
         k++;
@@ -5490,13 +5508,7 @@ static uint32_t find_first(uint8_t *gm_, uint32_t cols, uint32_t n, uint32_t x)
         }
     }
     h->used = ++pal_use;
-    uint32_t i = pal_hash(x);
-    while (h->tab[i] != 0xffff) {
-        if (h->snap[h->tab[i]] == x)
-            return h->tab[i];
-        i = (i + 1) & 511;
-    }
-    return n;
+    return h;
 }
 static uint32_t pal_find_from_base(uint8_t *gm_, uint64_t P, uint64_t color, uint64_t B)
 {
@@ -6878,4 +6890,386 @@ void nat__ZN16ycPaletteTexture13WriteFromBaseEPKS_S1_(Ctx *c)
     }
     if ((checked & 0xff) == 0)
         rt_log("[verify] WriteFromBase: %u checked, %u differ\n", checked, bad);
+}
+
+/* ---- ycPaletteAnimEntry::Update (x0 the entry E, s0 dt, x1 the UpdateInfo I) -------------------------
+ * E: +0 its ycAnimDataLookup, +8 its resource, +0x10 a palette to write from, +0x18 a level,
+ * +0x1c a mask of its sub-animations, +0x20 time, +0x24 duration, +0x28 rate, +0x2c loops left.
+ * I: +0 the component's level, +8 a scratch palette, +0x10 the target palette, +0x18 a base,
+ * +0x20 "target set up". The time advances (and loops); each sub-animation (0x48 bytes) of the
+ * mask takes a frame (a palette resource) into the scratch palette, then copies a range of
+ * colors (cycled by time) from it into the target, through FindFromBase against the base when
+ * asked. Fields come through AnimateScalar (the game's). Returns 1 when its loops ran out.
+ * The game's operations in order; the per-color loop is where the time went (~190 colors an
+ * entry, ~5000 a step on hub_overworld_south). MINA_NO_NATIVES=PaletteAnimEntry: the game's. */
+void f_1b18e8_orig(Ctx *c);
+void f_a6c18(Ctx *c);            /* ycAnimDataLookup::AnimateScalar */
+void f_a5ac8(Ctx *c);            /* ycRenderUpdateQueue::Remove */
+void f_1b4294(Ctx *c);           /* ycPaletteResourceCache::ReleaseRef */
+void f_1b4b5c(Ctx *c);           /* ycPaletteTexture::Write */
+static inline int32_t fcvtzs32(float f)
+{
+    if (f != f)
+        return 0;
+    if (f >= 2147483648.0f)
+        return INT32_MAX;
+    if (f <= -2147483648.0f)
+        return INT32_MIN;
+    return (int32_t)f;
+}
+static inline int32_t posmod32(int32_t a, int32_t m)
+{
+    if (!m)
+        return a;                                  /* sdiv by 0 is 0 on arm64 */
+    if (m == -1)
+        return 0;
+    const int32_t r = a - (a / m) * m;
+    return r + (m & (r >> 31));
+}
+typedef struct { Ctx *c; uint8_t *gm; uint64_t fr; } PaeCtx;
+static uint64_t pae_scalar(PaeCtx *k, uint64_t look, uint64_t field, float t)
+{
+    Ctx *c = k->c;
+    const uint64_t saved = c->sp;
+    c->x[0] = look;
+    c->x[1] = field;
+    c->x[2] = k->fr + 0x58;
+    c->v[0] = vset_f32(t);
+    c->sp = k->fr;
+    f_a6c18(c);
+    c->sp = saved;
+    return (uint32_t)c->x[0] ? k->fr + 0x58 : field;
+}
+static void pae_queue(PaeCtx *k, uint64_t P, void (*fn)(Ctx *))
+{
+    Ctx *c = k->c;
+    uint8_t *gm_ = k->gm;
+    uint8_t *f = GP(k->fr);
+    const uint64_t cb = 0x11b463c;
+    memcpy(f + 0x58, &P, 8);
+    memcpy(f + 0x60, &cb, 8);
+    memset(f + 0x68, 0, 16);
+    rt_st32(f + 0x78, 0x40);
+    const uint64_t saved = c->sp;
+    c->sp = k->fr;
+    c->x[0] = k->fr + 0x58;
+    fn(c);
+    c->sp = saved;
+}
+/* the scratch palette T takes resource R */
+static int pae_released;          /* MINA_VERIFY_PAL: a resource let go (the run can't be undone) */
+static uint64_t pae_ref_at[16];
+static uint32_t pae_ref_was[16], pae_nref;
+static void pae_take(PaeCtx *k, uint64_t T, uint64_t R)
+{
+    uint8_t *gm_ = k->gm;
+    *(uint8_t *)GP(T + 0x3e) = 1;
+    if (*(uint8_t *)GP(T + 0x3c)) {
+        rt_st16(GP(T + 0x3c), 0);
+        pae_queue(k, T, f_a5ac8);
+    }
+    const uint64_t old = L64(T);
+    if (old == R)
+        return;
+    if (pae_nref < 16) {
+        pae_ref_at[pae_nref] = R + 4;
+        pae_ref_was[pae_nref++] = rt_ld32(GP(R + 4));
+    }
+    rt_st32(GP(R + 4), rt_ld32(GP(R + 4)) + 1);
+    memcpy(GP(T), &R, 8);
+    if (old) {
+        pae_released = 1;
+        const uint64_t saved = k->c->sp;
+        k->c->sp = k->fr;
+        k->c->x[0] = old;
+        f_1b4294(k->c);
+        k->c->sp = saved;
+    }
+    rt_st32(GP(T + 0x38), rt_ld32(GP(T + 0x38)) + 1);
+}
+/* color i of the target X (its own array) becomes v */
+static void pae_put(PaeCtx *k, uint64_t X, uint64_t cols, int64_t i, uint32_t v)
+{
+    uint8_t *gm_ = k->gm;
+    if (rt_ld32(GP(cols + (uint64_t)i * 4)) == v)
+        return;
+    *(uint8_t *)GP(lp(X + 0x20) + (uint64_t)i) = 1;
+    rt_st32(GP(cols + (uint64_t)i * 4), v);
+    if (!*(uint8_t *)GP(X + 0x3c)) {
+        *(uint8_t *)GP(X + 0x3c) = 1;
+        pae_queue(k, X, f_a5580);
+    }
+    *(uint8_t *)GP(X + 0x3d) = 1;
+}
+static void pae_setup(PaeCtx *k, uint64_t I)
+{
+    uint8_t *gm_ = k->gm;
+    if (*(uint8_t *)GP(I + 0x20))
+        return;
+    *(uint8_t *)GP(I + 0x20) = 1;
+    const uint64_t saved = k->c->sp;
+    k->c->sp = k->fr;
+    k->c->x[0] = lp(I + 0x10);
+    f_1b4d58(k->c);
+    k->c->sp = saved;
+}
+static uint32_t pal_anim_entry(Ctx *c)
+{
+    GM_BEGIN;
+    const uint64_t E = c->x[0], I = c->x[1];
+    float dt = c->v[0].f[0];
+    PaeCtx k = { c, gm_, c->sp - 0xf0 };
+    const uint64_t look = L64(E), res = L64(E + 8);
+    const uint64_t subv = lp(res + 0x10);
+    uint32_t ret = 0;
+    float t;
+    int32_t loops = (int32_t)rt_ld32(GP(E + 0x2c));
+    if (!loops) {
+        t = ldfp(E + 0x20);
+    } else {
+        const float rate = ldfp(E + 0x28), dur = ldfp(E + 0x24);
+        t = ldfp(E + 0x20) + rate * dt;
+        stfp(E + 0x20, t);
+        if (!(dur > 0.0f)) {
+            /* b.le (or NaN): as is */
+        } else if (rate >= 0.0f) {
+            const float lim = dur + hexf(0xba83126fu);
+            if (t >= lim) {
+                for (;;) {
+                    const int32_t l1 = loops - 1;
+                    if (l1 >= 0) {
+                        rt_st32(GP(E + 0x2c), (uint32_t)l1);
+                        loops = l1;
+                        if (l1 == 0) {
+                            ret = 1;
+                            stfp(E + 0x20, lim);
+                            t = lim;
+                            break;
+                        }
+                    }
+                    t = t - dur;
+                    if (t < lim || t != t) {
+                        stfp(E + 0x20, t);
+                        break;
+                    }
+                }
+            }
+        } else {
+            const float lim = hexf(0x3a83126fu);
+            if (!(t > lim || t != t)) {
+                for (;;) {
+                    const int32_t l1 = loops - 1;
+                    if (l1 >= 0) {
+                        rt_st32(GP(E + 0x2c), (uint32_t)l1);
+                        loops = l1;
+                        if (l1 == 0) {
+                            ret = 1;
+                            stfp(E + 0x20, 0.0f);
+                            t = 0.0f;
+                            break;
+                        }
+                    }
+                    t = dur + t;
+                    if (t > lim || t != t) {
+                        stfp(E + 0x20, t);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if (!(L64(subv) >> 34))
+        return ret;
+    if ((int32_t)rt_ld32(GP(E + 0x18)) < (int32_t)rt_ld32(GP(I)))
+        return ret;
+    const uint64_t subs = L64(subv + 8);
+    uint64_t acc = 0;
+    for (uint64_t si = 0; si < (L64(subv) >> 34); si++) {
+        const uint64_t sub = subs + si * 0x48;
+        const uint64_t m = L64(sub + 0x10) >> 34;
+        if (!((rt_ld32(GP(E + 0x1c)) >> ((uint32_t)si & 31)) & 1)) {
+            acc += m;
+            continue;
+        }
+        const int32_t first_frame = (int32_t)rt_ld32(GP(pae_scalar(&k, look, sub + 0x24, t)));
+        const float fr_rate = ldfp(pae_scalar(&k, look, sub + 0x28, t));
+        const int32_t fi = posmod32(first_frame + fcvtzs32(t * fr_rate), (int32_t)(uint32_t)m);
+        const uint64_t R = L64(lp(L64(E + 8) + 0x18) + (acc + (uint64_t)(int64_t)fi) * 8);
+        const uint32_t base_on = *(uint8_t *)GP(pae_scalar(&k, look, sub + 0x20, t));
+        const uint64_t T = L64(I + 8);
+        if (R) {
+            pae_take(&k, T, R);
+        } else if (base_on) {
+            acc += m;
+            continue;
+        } else {
+            const uint64_t X = L64(I + 0x10), RX = L64(X);
+            if (RX && *(uint8_t *)GP(X + 0x3e)) {
+                pae_take(&k, T, RX);
+            } else {
+                const uint64_t saved = c->sp;
+                c->sp = k.fr;
+                c->x[0] = T;
+                c->x[1] = X;
+                f_1b4b5c(c);
+                c->sp = saved;
+            }
+        }
+        const uint64_t wfb = L64(E + 0x10);
+        if (wfb) {
+            const uint64_t saved = c->sp;
+            c->sp = k.fr;
+            c->x[0] = L64(I + 8);
+            c->x[1] = wfb;
+            c->x[2] = 0;
+            nat__ZN16ycPaletteTexture13WriteFromBaseEPKS_S1_(c);
+            c->sp = saved;
+        }
+        const int32_t start = (int32_t)rt_ld32(GP(pae_scalar(&k, look, sub + 0x34, t)));
+        const int32_t len = (int32_t)rt_ld32(GP(pae_scalar(&k, look, sub + 0x38, t)));
+        int64_t i = (int64_t)(int32_t)rt_ld32(GP(pae_scalar(&k, look, sub + 0x2c, t)));
+        const int32_t count = (int32_t)rt_ld32(GP(pae_scalar(&k, look, sub + 0x30, t)));
+        const float off = ldfp(pae_scalar(&k, look, sub + 0x3c, t));
+        const float speed = ldfp(pae_scalar(&k, look, sub + 0x40, t));
+        const int use_base = base_on ? L64(I + 0x18) != 0 : 0;
+        int32_t span = (int32_t)pal_count(gm_, L64(I + 8)) - start;
+        span = (len < span && len != 0) ? len : span;
+        int32_t end = (int32_t)pal_count(gm_, L64(I + 0x10));
+        if (count >= 1) {
+            const int32_t e2 = count + (int32_t)i;
+            end = e2 < end ? e2 : end;
+        }
+        if ((int32_t)i >= end) {
+            acc += m;
+            continue;
+        }
+        int32_t pos = fcvtzs32(off + t * speed);
+        uint32_t left = (uint32_t)(end - (int32_t)i);
+        /* FindFromBase(scratch, color, base): both fixed through the loop (only the target is
+         * written: checked per color against their colors) */
+        PalHash *fb_h = NULL;
+        uint32_t fb_n = 0, fb_cols = 0, fb_bn = 0, fb_bcols = 0;
+        if (use_base) {
+            pal_colors(gm_, L64(I + 8), &fb_n, &fb_cols);
+            pal_colors(gm_, L64(I + 0x18), &fb_bn, &fb_bcols);
+            fb_h = pal_table(gm_, fb_bcols, fb_bn);
+        }
+        for (; left; left--, i++, pos++) {
+            uint64_t X = L64(I + 0x10);
+            if (i >= (int64_t)(int32_t)pal_count(gm_, X))
+                break;
+            const int32_t idx = posmod32(pos, span) + start;
+            if (use_base) {
+                const uint64_t col = rt_ld32(GP(pal_cols(gm_, X) + (uint64_t)(int64_t)idx * 4));
+                uint64_t own = lp(X + 0x18);
+                uint32_t r;
+                if (fb_h && own != fb_cols && own != fb_bcols) {
+                    /* FindFromBase with the base's table resolved before the loop */
+                    const uint32_t j = pal_lookup(fb_h, (uint32_t)col);
+                    if (j == fb_bn)
+                        r = (uint32_t)col;
+                    else if (j < fb_n)
+                        r = rt_ld32(GP(fb_cols + 4 * j));
+                    else {
+                        const uint32_t mm = fb_n - 1, q = mm ? j / mm : 0;
+                        r = rt_ld32(GP(fb_cols + 4 * (j - q * mm + 1)));
+                    }
+                } else {
+                    rt_st32(GP(k.fr + 0x50), (uint32_t)col);
+                    r = pal_find_from_base(gm_, L64(I + 8), k.fr + 0x50, L64(I + 0x18));
+                }
+                if (!*(uint8_t *)GP(I + 0x20)) {
+                    pae_setup(&k, I);
+                    X = L64(I + 0x10);
+                    own = lp(X + 0x18);
+                }
+                pae_put(&k, X, own, i, r);
+            } else {
+                const uint32_t col = rt_ld32(GP(pal_cols(gm_, L64(I + 8)) + (uint64_t)(int64_t)idx * 4));
+                if (!*(uint8_t *)GP(I + 0x20)) {
+                    pae_setup(&k, I);
+                    X = L64(I + 0x10);
+                }
+                pae_put(&k, X, lp(X + 0x18), i, col);
+            }
+        }
+        acc += m;
+    }
+    return ret;
+}
+void nat__ZN18ycPaletteAnimEntry6UpdateEfPNS_10UpdateInfoE(Ctx *c)
+{
+    static int off = -1;
+    if (off < 0)
+        off = rt_native_off("__ZN18ycPaletteAnimEntry6UpdateEfPNS_10UpdateInfoE");
+    if (off) {
+        f_1b18e8_orig(c);
+        return;
+    }
+    static int verify = -1;
+    if (verify < 0)
+        verify = getenv("MINA_VERIFY_PAL") != NULL;
+    const uint64_t saved = c->sp;
+    if (!verify) {
+        const uint32_t r = pal_anim_entry(c);
+        c->sp = saved;
+        c->x[0] = r;
+        return;
+    }
+    /* the entry, the info, the scratch and target palettes (headers, colors, dirty flags,
+     * indices) after each; WriteSetup's buffers (P+8..0x27) by content */
+    GM_BEGIN;
+    static uint32_t checked, bad, skipped;
+    const uint64_t E = c->x[0], I = c->x[1];
+    const uint64_t T = L64(I + 8), X = L64(I + 0x10);
+    static uint8_t s0[0x2000], s1[0x2000], s2[0x2000];
+#define PAE_TAKE(b) do { uint8_t *p_ = (b); size_t o_ = 0; memset(p_, 0, sizeof s0); \
+        memcpy(p_ + o_, GP(E), 0x58); o_ += 0x58; memcpy(p_ + o_, GP(I), 0x28); o_ += 0x28; \
+        const uint64_t pp_[2] = { T, X }; \
+        for (int q_ = 0; q_ < 2; q_++) { const uint64_t P_ = pp_[q_]; if (!P_) continue; \
+            memcpy(p_ + o_, GP(P_), 0x40); o_ += 0x40; const uint32_t n_ = rt_ld32(GP(P_ + 0x28)) & 0x3ff; \
+            if (lp(P_ + 0x18)) memcpy(p_ + o_, GP(lp(P_ + 0x18)), n_ * 4); o_ += 0x1000 / 2; \
+            if (lp(P_ + 0x20)) memcpy(p_ + o_, GP(lp(P_ + 0x20)), n_); o_ += 0x400 / 2; \
+            if (lp(P_ + 0x10)) memcpy(p_ + o_, GP(lp(P_ + 0x10)), n_); o_ += 0x400 / 2; } } while (0)
+#define PAE_PUT(b) do { const uint8_t *p_ = (b); size_t o_ = 0; \
+        memcpy(GP(E), p_ + o_, 0x58); o_ += 0x58; memcpy(GP(I), p_ + o_, 0x28); o_ += 0x28; \
+        const uint64_t pp_[2] = { T, X }; \
+        for (int q_ = 0; q_ < 2; q_++) { const uint64_t P_ = pp_[q_]; if (!P_) continue; \
+            memcpy(GP(P_), p_ + o_, 0x40); o_ += 0x40; const uint32_t n_ = rt_ld32(GP(P_ + 0x28)) & 0x3ff; \
+            if (lp(P_ + 0x18)) memcpy(GP(lp(P_ + 0x18)), p_ + o_, n_ * 4); o_ += 0x1000 / 2; \
+            if (lp(P_ + 0x20)) memcpy(GP(lp(P_ + 0x20)), p_ + o_, n_); o_ += 0x400 / 2; \
+            if (lp(P_ + 0x10)) memcpy(GP(lp(P_ + 0x10)), p_ + o_, n_); o_ += 0x400 / 2; } } while (0)
+    PAE_TAKE(s0);
+    const Ctx save = *c;
+    pae_released = 0;
+    pae_nref = 0;
+    const uint32_t mine = pal_anim_entry(c);
+    c->sp = saved;
+    if (pae_released) {
+        skipped++;
+        c->x[0] = mine;
+        return;
+    }
+    PAE_TAKE(s1);
+    PAE_PUT(s0);
+    for (uint32_t q = 0; q < pae_nref; q++)
+        rt_st32(GP(pae_ref_at[q]), pae_ref_was[q]);
+    *c = save;
+    f_1b18e8_orig(c);
+    PAE_TAKE(s2);
+    const size_t hp = 0x58 + 0x28;
+    for (int q = 0; q < 2; q++) {
+        memset(s1 + hp + q * 0xc40 + 8, 0, 0x20);
+        memset(s2 + hp + q * 0xc40 + 8, 0, 0x20);
+    }
+    checked++;
+    if ((memcmp(s1, s2, sizeof s1) || mine != (uint32_t)c->x[0]) && bad++ < 10) {
+        size_t i = 0;
+        while (i < sizeof s1 && s1[i] == s2[i]) i++;
+        rt_log("[verify] PaletteAnimEntry differs at %u: %02x / %02x, returns %u / %u\n", (unsigned)i,
+               i < sizeof s1 ? s1[i] : 0, i < sizeof s1 ? s2[i] : 0, mine, (uint32_t)c->x[0]);
+    }
+    if ((checked & 0x3ff) == 0)
+        rt_log("[verify] PaletteAnimEntry: %u checked, %u differ, %u skipped (a resource let go)\n", checked, bad,
+               skipped);
 }
