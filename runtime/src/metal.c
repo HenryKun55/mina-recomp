@@ -990,7 +990,7 @@ static int nstage_known;
  * (a room's ~26 at once ran it out: 245 of 272 MiB, the rest in 46k pieces). Taken at the
  * first staging buffer, leaving 6 MiB to the system. Guest addresses reach any host memory
  * (they wrap around g_mem). */
-#define STAGE_ARENA_MAX 24
+#define STAGE_ARENA_MAX 64
 static uint32_t stage_arena[STAGE_ARENA_MAX], stage_arena_free[STAGE_ARENA_MAX];
 static int nstage_arena, nstage_arena_free, stage_arena_tried;
 #if defined(__vita__)
@@ -1008,29 +1008,59 @@ static void stage_arena_init(void)
     const uint32_t blk = 0x140000;               /* TILE_STAGING_LEN rounded to 64 KiB */
     const int64_t spare = (int64_t)info.size_user - (6 << 20);
     int n = spare > 0 ? (int)(spare / blk) : 0;
-    if (n > STAGE_ARENA_MAX)
-        n = STAGE_ARENA_MAX;
+    if (n > 24)
+        n = 24;
     while (n > 0) {
         const SceUID id = sceKernelAllocMemBlock("mina_staging", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, (SceSize)n * blk, NULL);
         if (id >= 0) {
             void *base = NULL;
             sceKernelGetMemBlockBase(id, &base);
             memset(base, 0, (size_t)n * blk);
-            for (int i = 0; i < n; i++) {
-                stage_arena[i] = guest_addr((uint8_t *)base + (size_t)i * blk);
-                stage_arena_free[i] = stage_arena[i];
+            for (int i = 0; i < n && nstage_arena < STAGE_ARENA_MAX; i++) {
+                stage_arena[nstage_arena++] = guest_addr((uint8_t *)base + (size_t)i * blk);
+                stage_arena_free[nstage_arena_free++] = stage_arena[nstage_arena - 1];
             }
-            nstage_arena = nstage_arena_free = n;
             break;
         }
         n--;
     }
-    rt_log("[mem] staging arena: %d blocks (%.1f MiB) of the system's %.1f MiB free\n", nstage_arena,
-           nstage_arena * (blk / 1048576.0), info.size_user / 1048576.0);
+    rt_log("[mem] staging arena: %d blocks (%.1f MiB) from the system's %.1f MiB free\n", n,
+           n * (blk / 1048576.0), info.size_user / 1048576.0);
 }
 #else
 static void stage_arena_init(void) { stage_arena_tried = 1; }
 #endif
+/* memory the game never touches again (libc.c: a pak's files for other platforms) as staging
+ * blocks: taken at the first staging buffer (a level), not before: the game post-processes every
+ * file of a pak after reading it (PostProcessFileJob) */
+static uint32_t donate_at[4], donate_len[4];
+static int ndonate;
+void metal_stage_donate(uint32_t a, uint32_t n)
+{
+    pthread_mutex_lock(&stage_lock);
+    if (ndonate < 4) {
+        donate_at[ndonate] = a;
+        donate_len[ndonate++] = n;
+    }
+    pthread_mutex_unlock(&stage_lock);
+}
+static void stage_take_donations(void)     /* with stage_lock */
+{
+    const uint32_t blk = 0x140000;
+    for (int i = 0; i < ndonate; i++) {
+        const uint32_t a = donate_at[i], n = donate_len[i];
+        uint32_t p = (a + 255u) & ~255u;
+        int got = 0;
+        while (p + (uint64_t)blk <= (uint64_t)a + n && nstage_arena < STAGE_ARENA_MAX) {
+            stage_arena[nstage_arena++] = p;
+            stage_arena_free[nstage_arena_free++] = p;
+            p += blk;
+            got++;
+        }
+        rt_log("[mem] staging arena: %d blocks from a pak's unused file (%d in all)\n", got, nstage_arena);
+    }
+    ndonate = 0;
+}
 static int stage_in_arena(uint32_t a)
 {
     for (int i = 0; i < nstage_arena; i++)
@@ -1042,8 +1072,10 @@ static uint32_t stage_alloc(uint32_t len)
 {
     if (len == TILE_STAGING_LEN) {
         pthread_mutex_lock(&stage_lock);
-        if (!stage_arena_tried)
+        if (!stage_arena_tried) {
             stage_arena_init();
+            stage_take_donations();
+        }
         uint32_t a = nstage_arena_free ? stage_arena_free[--nstage_arena_free] : 0;
         if (!a)
             a = nstage_pool ? stage_pool[--nstage_pool] : 0;

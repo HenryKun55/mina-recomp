@@ -404,8 +404,13 @@ static void imp_malloc(Ctx *c)
 }
 static void imp_calloc(Ctx *c) { log_big(c, "calloc", A0 * A1); RET(gcalloc(A0, A1)); }
 static void imp_realloc(Ctx *c) { log_big(c, "realloc", A1); RET(grealloc((uint32_t)A0, A1)); }
+static int pak_is_kept(uint32_t a);
 static void imp_free(Ctx *c)
 {
+    if (pak_is_kept((uint32_t)A0)) {
+        rt_log("[mem] a pak holding staging blocks is not freed\n");
+        return;
+    }
     if (nlazy)
         lazy_freed((uint32_t)A0);
     gfree((uint32_t)A0);
@@ -818,6 +823,61 @@ static void imp_fclose(Ctx *c)
     if (f) gfree((uint32_t)A0);
     RET((int64_t)r);
 }
+#if defined(__vita__)
+/* A pak (YCD) read whole: the game keeps it in memory and opens its files in place. Some of
+ * global_startup.pak's are for other platforms and never opened (the game only names
+ * gameControllersOsx.cmap.yc): gameControllersNix.cmap.yc alone is 21.5 MiB. Their bytes go to
+ * the staging arena (metal.c, from the first level on: the load post-processes every file); the pak, holding them, is never freed then (imp_free). The
+ * directory: 0x20-byte entries from 0xe0 (size; data at entry+8+off; name length +0x14, name
+ * at entry+0x18+off). MINA_PAK_DONATE=0: kept. */
+static uint32_t pak_kept[4];
+static int npak_kept;
+static void pak_donate_unused(uint32_t base, uint32_t len)
+{
+    static int off = -1;
+    if (off < 0) {
+        const char *v = getenv("MINA_PAK_DONATE");
+        off = v && !atoi(v);
+    }
+    const uint8_t *d = G(base);
+    if (off || memcmp(d, "YCD", 4) != 0)
+        return;
+    static const char *const unused[] = { "gameControllersNix.cmap.yc", "gameControllersWin.cmap.yc" };
+    int donated = 0;
+    for (uint32_t k = 0; k < 4096; k++) {
+        const uint32_t e = 0xe0 + k * 0x20;
+        if (e + 0x20 > len)
+            break;
+        uint32_t f[8];
+        memcpy(f, d + e, 32);
+        const uint32_t nl = f[5], na = e + 0x18 + f[7], da = e + 8 + f[3], sz = f[0];
+        if (nl < 4 || nl > 200 || na + nl > len || memcmp(d + na + nl - 3, ".yc", 3) != 0)
+            break;
+        for (int u = 0; u < 2; u++) {
+            if (nl != strlen(unused[u]) || memcmp(d + na, unused[u], nl) != 0 || da + (uint64_t)sz > len)
+                continue;
+            void metal_stage_donate(uint32_t a, uint32_t n);
+            metal_stage_donate(base + da, sz);
+            rt_log("[mem] %s (%.1f MiB of a pak, never opened here) holds staging blocks\n", unused[u],
+                   sz / 1048576.0);
+            donated = 1;
+        }
+    }
+    if (donated && npak_kept < 4)
+        pak_kept[npak_kept++] = base;
+}
+/* a pak whose unused files hold staging blocks: its block (the allocator's header may
+ * precede the data) stays */
+static int pak_is_kept(uint32_t a)
+{
+    for (int i = 0; i < npak_kept; i++)
+        if (a <= pak_kept[i] && pak_kept[i] - a <= 64)
+            return 1;
+    return 0;
+}
+#else
+static int pak_is_kept(uint32_t a) { (void)a; return 0; }
+#endif
 static void imp_fread_(Ctx *c);
 static void imp_fread(Ctx *c)
 {
@@ -846,7 +906,15 @@ static void imp_fread_(Ctx *c)
         RET(A1 ? want / A1 : 0);
         return;
     }
+#if defined(__vita__)
+    const off_t at = ftello(f);
+    const size_t got = fread(G(A0), (size_t)A1, (size_t)A2, f);
+    if (at == 0 && got * A1 >= (16u << 20))
+        pak_donate_unused((uint32_t)A0, (uint32_t)(got * A1));
+    RET(got);
+#else
     RET(fread(G(A0), (size_t)A1, (size_t)A2, f));
+#endif
 }
 static void imp_fwrite(Ctx *c) { FILE *f = host_file(A3); RET(f ? fwrite(G(A0), (size_t)A1, (size_t)A2, f) : 0); }
 static void imp_fseek(Ctx *c) { FILE *f = host_file(A0); RET(f ? (int64_t)fseeko(f, (off_t)(int64_t)A1, (int)A2) : -1); }
