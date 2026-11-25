@@ -145,6 +145,70 @@ static void spk_check(Ctx *c, const Spk *k, const char *what)
     void rt_profile_spike(uint64_t t0, uint64_t t1);
     rt_profile_spike(k->t, now_us());
 }
+/* ---- The world's rate (Vita): s_targetFPS, which ycGameThread::ThreadMain reads for every frame
+ * (the Max FPS option changes it while the game runs). MINA_TARGET_FPS=n fixes it (0: the game's);
+ * unset, it adapts: 60 steps a second while a step and the frame's update fit a 60 fps frame, 30
+ * when they don't (the frame falls behind: frames with 2 steps while steps are long). At 30 it
+ * tries 60 again after a wait (windows of 30 steps, 1 s) that doubles while tries fail (up to
+ * 32 s); measuring at 30 can't tell: a step there does ~1.7x the work of one at 60.
+ * MINA_RATE_LOG=1 logs the windows. */
+static int g_rate_auto;              /* set by Game::InitFromSave */
+static uint32_t rate_fixed_since;    /* steps since the last Game::Update */
+static uint64_t rate_step_us;        /* the last step's time */
+static void rate_set(uint32_t fps, const char *why, double avg_ms, double max_ms)
+{
+    GM_BEGIN;
+    rt_st32(GP(0x1e14de8), fps);
+    rt_log("[rate] the world steps %u times a second (%s: step+update %.1f ms average, %.1f worst)\n", fps, why,
+           avg_ms, max_ms);
+}
+static void rate_frame(uint64_t update_us)
+{
+    static uint32_t frames, late, held, wait = 2, waited;
+    static uint64_t sum_us, max_us;
+    static int log = -1;
+    if (log < 0)
+        log = getenv("MINA_RATE_LOG") != NULL;
+    const uint32_t steps = rate_fixed_since;
+    rate_fixed_since = 0;
+    if (!steps)
+        return;                      /* a frame without a step (30 Hz): no information */
+    GM_BEGIN;
+    const uint32_t fps = rt_ld32(GP(0x1e14de8));
+    const uint64_t cost = rate_step_us + update_us;
+    frames++;
+    late += steps > 1;
+    sum_us += cost;
+    if (cost > max_us)
+        max_us = cost;
+    if (frames < 30)
+        return;
+    const double avg = sum_us / 1000.0 / frames, worst = max_us / 1000.0;
+    if (log)
+        rt_log("[rate] %u Hz: %u frames, %u late, step+update %.1f ms average, %.1f worst; next try in %u/%u\n", fps,
+               frames, late, avg, worst, waited, wait);
+    if (fps >= 60) {
+        /* behind: frames with 2 steps while the steps are long (a load's single long
+         * step makes frames late too, with short steps around it) */
+        if ((late >= 4 && avg > 10.0) || avg > 15.0) {
+            wait = held >= 10 ? 2 : (wait * 2 > 32 ? 32 : wait * 2);
+            rate_set(30, "falling behind", avg, worst);
+            held = waited = 0;
+        } else if (++held == 10)
+            wait = 2;                /* 60 held for 10 windows: the next drop tries again soon */
+    } else if (++waited >= wait) {
+        /* a step at 30 does more work than one at 60 (about 1.7x): hopeless when even
+         * half of it would not fit a 60 fps frame */
+        waited = 0;
+        if (avg * 0.5 < 14.0)
+            rate_set(60, "trying", avg, worst);
+        else
+            wait = wait * 2 > 32 ? 32 : wait * 2;
+    }
+    frames = late = 0;
+    sum_us = max_us = 0;
+}
+
 void nat__ZN4Game11FixedUpdateEv(Ctx *c)
 {
     Spk spk;
@@ -160,7 +224,9 @@ void nat__ZN4Game11FixedUpdateEv(Ctx *c)
     f_99f430_orig(c);
     g_game_stage = 0;
     g_in_fixed = 0;
-    g_fixed_us += now_us() - t0;
+    rate_step_us = now_us() - t0;
+    rate_fixed_since++;
+    g_fixed_us += rate_step_us;
     if (spk_)
         spk_check(c, &spk, "fixed update");
     static int heavy;          /* consecutive fixed updates moving thousands of transforms */
@@ -185,6 +251,8 @@ void nat__ZN4Game6UpdateEf(Ctx *c)
     f_9a0638_orig(c);
     g_game_stage = 0;
     g_update_us += now_us() - t0;
+    if (g_rate_auto)
+        rate_frame(now_us() - t0);
     if (spk_)
         spk_check(c, &spk, "update (frame, with its fixed updates)");
 }
@@ -2171,11 +2239,12 @@ void nat__ZN4Game12InitFromSaveEv(Ctx *c)
 #endif
     /* The game steps its world (Game::FixedUpdate) s_targetFPS times a
      * second, by 1/s_targetFPS: 60 or 120 (the Max FPS option), presenting
-     * after up to 2 steps. The Vita steps it 30 times (MINA_TARGET_FPS=n
-     * another rate, 0 the game's), a step a frame at 30 fps. */
+     * after up to 2 steps. The Vita starts at 30 and adapts (rate_frame);
+     * MINA_TARGET_FPS=n fixes another rate, 0 the game's. */
     const char *t = getenv("MINA_TARGET_FPS");
 #if defined(__vita__)
-    const uint32_t fps = t ? (uint32_t)atoi(t) : 30;
+    g_rate_auto = !t || strcmp(t, "auto") == 0;
+    const uint32_t fps = t && !g_rate_auto ? (uint32_t)atoi(t) : 30;
 #else
     const uint32_t fps = t ? (uint32_t)atoi(t) : 0;
 #endif
