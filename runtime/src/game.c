@@ -5442,9 +5442,12 @@ static inline uint32_t find_u32(const uint8_t *a, uint32_t n, uint32_t x)
 static int pal_scope;
 static uint32_t pal_gen;
 static uint32_t pal_avoid;
-typedef struct { uint32_t cols, n, gen, calls, stamp; } PalHash;
-static PalHash pal_h[4];
-static uint32_t pal_hk[4][512], pal_hv[4][512], pal_hs[4][512], pal_stamp;
+/* a table per palette (8, by its colors' address), kept across scopes with a copy of the colors
+ * it was built from: the first search of a scope compares them (one memcmp), rebuilt if changed */
+#define PAL_SLOTS 8
+typedef struct { uint32_t cols, n, gen, used; uint32_t snap[256]; uint16_t tab[512]; } PalHash;
+static PalHash pal_h[PAL_SLOTS];
+static uint32_t pal_use;
 static inline uint32_t pal_hash(uint32_t x) { return (x * 2654435761u) >> 23; }
 static uint32_t find_first(uint8_t *gm_, uint32_t cols, uint32_t n, uint32_t x)
 {
@@ -5452,38 +5455,48 @@ static uint32_t find_first(uint8_t *gm_, uint32_t cols, uint32_t n, uint32_t x)
     if (!pal_scope || n < 16 || n > 256 || cols == pal_avoid)
         return find_u32(a, n, x);
     int k = 0;
-    while (k < 4 && !(pal_h[k].cols == cols && pal_h[k].n == n && pal_h[k].gen == pal_gen))
+    while (k < PAL_SLOTS && !(pal_h[k].cols == cols && pal_h[k].n == n))
         k++;
-    if (k == 4) {
-        k = (int)((cols >> 4) & 3);
-        pal_h[k].cols = cols;
-        pal_h[k].n = n;
-        pal_h[k].gen = pal_gen;
-        pal_h[k].calls = 0;
-        pal_h[k].stamp = 0;
+    PalHash *h;
+    if (k < PAL_SLOTS) {
+        h = &pal_h[k];
+        if (h->gen != pal_gen) {
+            if (memcmp(h->snap, a, n * 4))
+                h->cols = 0;          /* changed: rebuilt below */
+            else
+                h->gen = pal_gen;
+        }
+    } else {
+        int lru = 0;
+        for (int j = 1; j < PAL_SLOTS; j++)
+            if (pal_h[j].used < pal_h[lru].used)
+                lru = j;
+        h = &pal_h[lru];
+        h->cols = 0;
     }
-    PalHash *h = &pal_h[k];
-    if (!h->stamp) {
-        if (++h->calls < 3)
-            return find_u32(a, n, x);
-        h->stamp = ++pal_stamp;
+    if (!h->cols) {
+        h->cols = cols;
+        h->n = n;
+        h->gen = pal_gen;
+        memcpy(h->snap, a, n * 4);
+        memset(h->tab, 0xff, sizeof h->tab);
         for (uint32_t j = 0; j < n; j++) {
-            uint32_t v;
-            memcpy(&v, a + 4 * j, 4);
+            const uint32_t v = h->snap[j];
             uint32_t i = pal_hash(v);
-            while (pal_hs[k][i] == h->stamp && pal_hk[k][i] != v)
+            while (h->tab[i] != 0xffff && h->snap[h->tab[i]] != v)
                 i = (i + 1) & 511;
-            if (pal_hs[k][i] != h->stamp) {
-                pal_hs[k][i] = h->stamp;
-                pal_hk[k][i] = v;
-                pal_hv[k][i] = j;
-            }
+            if (h->tab[i] == 0xffff)
+                h->tab[i] = (uint16_t)j;
         }
     }
+    h->used = ++pal_use;
     uint32_t i = pal_hash(x);
-    while (pal_hs[k][i] == h->stamp && pal_hk[k][i] != x)
+    while (h->tab[i] != 0xffff) {
+        if (h->snap[h->tab[i]] == x)
+            return h->tab[i];
         i = (i + 1) & 511;
-    return pal_hs[k][i] == h->stamp ? pal_hv[k][i] : n;
+    }
+    return n;
 }
 static uint32_t pal_find_from_base(uint8_t *gm_, uint64_t P, uint64_t color, uint64_t B)
 {
