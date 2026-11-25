@@ -3227,6 +3227,8 @@ void metal_present(uint64_t drawable)
                         void heapstat_report(void);
                         heapstat_report();
                         gpu_locksites_report();
+                        void objc_census(void);
+                        objc_census();
                         rt_log("[mem] heap %.1f MiB, free %.1f MiB in %d pieces (%s); %d staging blocks pooled, arena %d of %d "
                                "free; video memory %.1f MiB free\n",
                                mi.arena / 1048576.0, mi.fordblks / 1048576.0, mi.ordblks, sl, nstage_pool,
@@ -3430,4 +3432,11 @@ void metal_bufage_report(void)
         if (g[k].n > 4)
             rt_log("[bufage] %d buffers of %u bytes over 10 s old, made by %s\n", g[k].n, g[k].len,
                    g[k].fn ? g[k].fn : "-");
+}
+
+void metal_buffer_describe(void *host, uint32_t *len, const char **fn)
+{
+    const MBuffer *b = host;
+    *len = b->length;
+    *fn = b->maker_fn;
 }

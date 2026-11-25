@@ -321,6 +321,8 @@ static inline int hs_bucket(uint32_t u)
         return (int)(u >> 4);
     return 256 + (31 - __builtin_clz(u)) - 12;
 }
+static void hs_track(void *p, const uintptr_t *st);
+static void hs_untrack(void *p);
 static void hs_note(void *p, uint32_t u, int made)
 {
     if (hs_on < 0)
@@ -330,6 +332,22 @@ static void hs_note(void *p, uint32_t u, int made)
     const int b = hs_bucket(u);
     __atomic_add_fetch(&hs_bytes[b], made ? (int64_t)u : -(int64_t)u, __ATOMIC_RELAXED);
     __atomic_add_fetch(&hs_cnt[b], made ? 1 : -1, __ATOMIC_RELAXED);
+    if (!made && u <= 128)
+        hs_untrack(p);
+    if (made && u <= 128 && (b == hs_watch[0] || b == hs_watch[1])) {
+        static uint32_t m;
+        if ((__atomic_add_fetch(&m, 1, __ATOMIC_RELAXED) & 63) == 0) {
+            uintptr_t st[10] = { 0 };
+            const uintptr_t lo = (uintptr_t)&hs_note - 0x3000000u, hi = (uintptr_t)&hs_note + 0x3000000u;
+            const uint32_t *sp = (const uint32_t *)__builtin_frame_address(0);
+            for (int i = 0, k = 0; i < 1024 && k < 10; i++) {
+                const uintptr_t w = sp[i];
+                if ((w & 1) && w >= lo && w <= hi)
+                    st[k++] = w;
+            }
+            hs_track(p, st);
+        }
+    }
     if (made && (u >= (4u << 20) || b == hs_watch[0] || b == hs_watch[1] || b == hs_watch[2])) {
         static uint32_t n;
         if (u >= (4u << 20) || ((__atomic_add_fetch(&n, 1, __ATOMIC_RELAXED) % 97) == 0 && hs_samples < 6)) {
@@ -357,10 +375,51 @@ static void hs_note(void *p, uint32_t u, int made)
         }
     }
 }
+/* the survivors: every 64th block of the watched sizes, its stack's host addresses; freed ones
+ * are struck off; the report groups those alive for over one report by their stack */
+#define HS_TRACK 4096
+static struct { void *p; uint32_t gen; uintptr_t st[10]; } hs_trk[HS_TRACK];
+static uint32_t hs_trk_i, hs_gen;
+static void hs_track(void *p, const uintptr_t *st)
+{
+    const uint32_t i = __atomic_fetch_add(&hs_trk_i, 1, __ATOMIC_RELAXED) % HS_TRACK;
+    hs_trk[i].p = p;
+    hs_trk[i].gen = hs_gen;
+    memcpy(hs_trk[i].st, st, sizeof hs_trk[i].st);
+}
+static void hs_untrack(void *p)
+{
+    for (int i = 0; i < HS_TRACK; i++)
+        if (hs_trk[i].p == p)
+            hs_trk[i].p = NULL;
+}
 void heapstat_report(void)
 {
     if (hs_on <= 0)
         return;
+    hs_gen++;
+    {
+        static uint8_t seen[HS_TRACK];
+        memset(seen, 0, sizeof seen);
+        int lines = 0;
+        for (int i = 0; i < HS_TRACK; i++) {
+            if (!hs_trk[i].p || hs_gen - hs_trk[i].gen < 2 || seen[i])
+                continue;
+            int n = 0;
+            for (int j = i; j < HS_TRACK; j++)
+                if (hs_trk[j].p && hs_gen - hs_trk[j].gen >= 2 && !seen[j] &&
+                    !memcmp(hs_trk[j].st, hs_trk[i].st, sizeof hs_trk[i].st)) {
+                    seen[j] = 1;
+                    n++;
+                }
+            if (n >= 2 && lines++ < 12)
+                rt_log("[heapstat] %d sampled blocks still alive from %p %p %p %p %p %p %p %p %p %p\n", n,
+                       (void *)hs_trk[i].st[0], (void *)hs_trk[i].st[1], (void *)hs_trk[i].st[2],
+                       (void *)hs_trk[i].st[3], (void *)hs_trk[i].st[4], (void *)hs_trk[i].st[5],
+                       (void *)hs_trk[i].st[6], (void *)hs_trk[i].st[7], (void *)hs_trk[i].st[8],
+                       (void *)hs_trk[i].st[9]);
+        }
+    }
     int top[6] = { -1, -1, -1, -1, -1, -1 };
     for (int b = 0; b < HS_N; b++) {
         const int64_t d = hs_bytes[b] - hs_prev[b];

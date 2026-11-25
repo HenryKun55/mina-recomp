@@ -7474,3 +7474,39 @@ void f_1eccbc_orig(Ctx *c);
 void f_1ecd38_orig(Ctx *c);
 void nat__ZZN9ycTexture6UploadEPvEN3__08__invokeES0_S0_(Ctx *c) { __atomic_add_fetch(&g_stage_kept, 1, __ATOMIC_RELAXED); f_1eccbc_orig(c); }
 void nat__ZZN9ycTexture6UploadEPvEN3__18__invokeES0_S0_(Ctx *c) { __atomic_add_fetch(&g_stage_gone, 1, __ATOMIC_RELAXED); f_1ecd38_orig(c); }
+
+/* ---- ycGpuBuffer::Upload ----------------------------------------------------------------
+ * After the copy, a buffer with flag 2 (+0x14) has its upload record (and its 16 KiB staging
+ * MTLBuffer) pushed onto a list of its own (+0x20) by the GC thread; nothing ever takes them
+ * off it (ycGpuBuffer::Update makes a new one each time). ycDrawUtil's page buffers have it,
+ * and here one commits every frame (the black borders around the picture): 60 records and
+ * buffers a second, ~50 MiB an hour, the console's slow leak. Their upload goes the other way:
+ * record and buffer let go once the copy is done. MINA_GPUBUF_KEEP=1: as the game does.
+ * (MINA_STAGE_STATS: the uploads, by flags and size.) */
+void f_1e833c_orig(Ctx *c);
+void nat__ZN11ycGpuBuffer6UploadEPv(Ctx *c)
+{
+    static int on = -1, keep = -1;
+    if (on < 0) {
+        on = getenv("MINA_STAGE_STATS") != NULL;
+        keep = getenv("MINA_GPUBUF_KEEP") != NULL;
+    }
+    const uint32_t fa = (uint32_t)c->x[0] + 0x14;
+    const uint8_t f0 = *(uint8_t *)G(fa);
+    if (!keep && (f0 & 2)) {
+        *(uint8_t *)G(fa) = f0 & ~2;
+        f_1e833c_orig(c);
+        *(uint8_t *)G(fa) = f0;
+        return;
+    }
+    if (on) {
+        static uint32_t n, kept;
+        const uint64_t B = c->x[0];
+        const uint8_t fl = *(uint8_t *)G((uint32_t)B + 0x14);
+        kept += (fl >> 1) & 1;
+        if ((++n % 600) == 0)
+            rt_log("[gpubuf] %u uploads, %u kept for reuse (last: flags %#x, %u bytes, buffer %#llx)\n", n, kept, fl,
+                   rt_ld32(G((uint32_t)B + 0x10)), (unsigned long long)B);
+    }
+    f_1e833c_orig(c);
+}

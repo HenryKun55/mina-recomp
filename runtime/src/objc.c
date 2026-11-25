@@ -1316,3 +1316,59 @@ const ImportImpl g_impl_objc[] = {
     { "_objc_end_catch", imp_objc_fatal, 0, NULL },
     { NULL, NULL, 0, NULL },
 };
+
+/* (MINA_NEWSTATS) the objects alive by class, counted in the object map, and the held ones */
+void objc_census(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("MINA_NEWSTATS") != NULL;
+    if (!on)
+        return;
+    struct { Class *k; uint32_t n, refs1, held; } t[32];
+    int nt = 0;
+    pthread_mutex_lock(&objc_lock);
+    for (uint32_t i = 0; i < objects.cap; i++) {
+        Obj *o = objects.keys[i] ? objects.vals[i] : NULL;
+        if (!o)
+            continue;
+        int j = 0;
+        while (j < nt && t[j].k != o->cls)
+            j++;
+        if (j == nt && nt < 32)
+            t[nt++] = (typeof(t[0])){ o->cls, 0, 0, 0 };
+        if (j < 32) {
+            t[j].n++;
+            t[j].refs1 += o->refs == 1;
+            t[j].held += o->held != 0;
+        }
+    }
+    /* the buffers by length and maker */
+    struct { uint32_t len; const char *fn; uint32_t n; } g[24];
+    int ng = 0;
+    void metal_buffer_describe(void *host, uint32_t *len, const char **fn);
+    for (uint32_t i = 0; i < objects.cap; i++) {
+        Obj *o = objects.keys[i] ? objects.vals[i] : NULL;
+        if (!o || strcmp(o->cls->name, "MTLBuffer_GL") || !o->host)
+            continue;
+        uint32_t len;
+        const char *fn;
+        metal_buffer_describe(o->host, &len, &fn);
+        int j = 0;
+        fn = NULL;
+        while (j < ng && !(g[j].len == len && g[j].fn == fn))
+            j++;
+        if (j == ng && ng < 24)
+            g[ng++] = (typeof(g[0])){ len, fn, 0 };
+        if (j < 24)
+            g[j].n++;
+    }
+    pthread_mutex_unlock(&objc_lock);
+    for (int j = 0; j < ng; j++)
+        if (g[j].n > 30)
+            rt_log("[census]   %u buffers of %u bytes made by %s\n", g[j].n, g[j].len, g[j].fn ? g[j].fn : "-");
+    for (int j = 0; j < nt; j++)
+        if (t[j].n > 50)
+            rt_log("[census] %s: %u objects (%u with one reference, %u held for the GPU), %u pooled\n", t[j].k->name,
+                   t[j].n, t[j].refs1, t[j].held, t[j].k->pooled);
+}
