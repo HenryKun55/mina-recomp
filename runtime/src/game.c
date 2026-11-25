@@ -5974,3 +5974,282 @@ void nat__ZN4Shop12IsOutOfStockEPK7ShopDefRNS_7OutInfoE(Ctx *c)
     shop_memo[i].age = 0;
     memcpy(shop_memo[i].out, G(out), sizeof shop_memo[i].out);
 }
+
+/* ---- DarknessManager::Update / DarknessLight::GetPos --------------------------------------------
+ * The darkness grid (mansion): Update recomputes every tile (CalcTile), and each tile asks every
+ * light its position (GetPos: the light's or its entity's position, offsets, two fmodf to snap
+ * it), tiles x lights times a step. Nothing moves between those calls (Update refreshes its own
+ * entity first; CalcTile writes only the grid), so during an Update each light's answer (s0-s2)
+ * is kept after its first call. MINA_NO_NATIVES=GetPos: always asked. */
+void f_585794_orig(Ctx *c);
+void f_5852e0_orig(Ctx *c);
+typedef struct { uint64_t light; V128 v[3]; } LightPos;
+static LightPos dm_pos[64];
+static int dm_batch, dm_n;
+static uint32_t dm_gen;          /* one per DarknessManager::Update: what CalcTile kept is for it */
+void nat__ZN15DarknessManager6UpdateEP20ycUpdateQueueContext(Ctx *c)
+{
+    dm_batch = 1;
+    dm_n = 0;
+    dm_gen++;
+    f_585794_orig(c);
+    dm_batch = 0;
+}
+void nat__ZNK13DarknessLight6GetPosEv(Ctx *c)
+{
+    static int off = -1;
+    if (off < 0)
+        off = rt_native_off("__ZNK13DarknessLight6GetPosEv");
+    if (!dm_batch || off) {
+        f_5852e0_orig(c);
+        return;
+    }
+    const uint64_t L = c->x[0];
+    for (int i = 0; i < dm_n; i++)
+        if (dm_pos[i].light == L) {
+            c->v[0] = dm_pos[i].v[0];
+            c->v[1] = dm_pos[i].v[1];
+            c->v[2] = dm_pos[i].v[2];
+            return;
+        }
+    f_5852e0_orig(c);
+    if (dm_n < 64) {
+        dm_pos[dm_n].light = L;
+        dm_pos[dm_n].v[0] = c->v[0];
+        dm_pos[dm_n].v[1] = c->v[1];
+        dm_pos[dm_n].v[2] = c->v[2];
+        dm_n++;
+    }
+}
+
+/* ---- DarknessManager::CalcTile (x0 the manager M, w1 the tile, w2 force) -------------------------
+ * The tile's center (its column and row - 1, x 0.8, + 0.4, from M's entity position) against
+ * each light of M+0x180 (the brightest of: 1 inside its inner box, 0.5 inside its outer one in
+ * x or y) and the first darkness area of the room (entity +0x50, +0x778) holding it (its
+ * values into M+0x198; outside every area the tile is lit). The level (0 dark, 1 half, 2 lit)
+ * into the grid M+0x170 (12 bytes a tile: target, level, fade). The game's comparisons, in
+ * order (NaN goes where the game's flags send it). MINA_VERIFY_DARK=1 runs both, compares. */
+void f_585f84_orig(Ctx *c);
+void f_584ec8(Ctx *c);           /* DarknessArea::GetDarknessAABB */
+static void calc_tile(Ctx *c)
+{
+    GM_BEGIN;
+    const uint64_t M = c->x[0];
+    const int32_t i = (int32_t)c->x[1];
+    const uint32_t force = (uint32_t)c->x[2] & 1;
+    const int32_t w = (int32_t)rt_ld32(GP(M + 0x1a4));
+    const int32_t q = w ? i / w : 0;
+    const float k8 = hexf(0x3f4ccccd), k4 = hexf(0x3ecccccd);
+    const float s0 = (float)(int32_t)(i - q * w - 1) * k8 + k4;
+    const float s1 = (float)(q - 1) * k8 + k4;
+    const uint64_t E = lp(M + 0x10);
+    const float s8 = ldfp(E + 0xdc) + s0, s9 = ldfp(E + 0xe0) + s1;
+    float s11 = ldfp(E + 0xe4);
+    uint32_t w24 = 0, w23 = 0;
+    float s10 = 0.0f;
+    /* in an Update: the lights' boxes, worked out once for all the tiles */
+    static struct { uint64_t M; uint32_t gen; int n, ok; uint32_t w23, w24; uint8_t on[64]; float b[64][6]; } lc;
+    if (dm_batch && (lc.M != M || lc.gen != dm_gen)) {
+        lc.M = M;
+        lc.gen = dm_gen;
+        lc.n = 0;
+        lc.ok = 1;
+        lc.w23 = lc.w24 = 0;
+        for (uint64_t node = lp(M + 0x180); node; node = lp(node + 0x18)) {
+            if (lc.n == 64) {
+                lc.ok = 0;
+                break;
+            }
+            const uint64_t L = lp(node + 8);
+            if (*(uint8_t *)GP(L + 0x98)) {
+                lc.w24 = rt_ld32(GP(L + 0x9c));
+                lc.w23 = 1;
+            }
+            const int k = lc.n++;
+            lc.on[k] = *(uint8_t *)GP(L + 0x84) != 0;
+            if (!lc.on[k])
+                continue;
+            c->x[0] = L;
+            nat__ZNK13DarknessLight6GetPosEv(c);
+            float s2 = ldfp(L + 0x6c), s3 = ldfp(L + 0x70), s4, s5;
+            if (*(uint8_t *)GP(L + 0x87)) {
+                const float a = ldfp(L + 0x78), b = ldfp(L + 0x7c);
+                s2 = s2 - a;
+                s3 = s3 - b;
+                s5 = a + s2;
+                s4 = b + s3;
+            } else {
+                const float kk = hexf(0xbba3d70a);
+                s2 = s2 * 0.5f + kk;
+                s3 = s3 * 0.5f + kk;
+                s5 = (s2 + ldfp(L + 0x78)) + kk;
+                s4 = (s3 + ldfp(L + 0x7c)) + kk;
+            }
+            float *b = lc.b[k];
+            b[0] = c->v[0].f[0];
+            b[1] = c->v[1].f[0];
+            b[2] = s2;
+            b[3] = s3;
+            b[4] = s4;
+            b[5] = s5;
+        }
+    }
+    if (dm_batch && lc.ok) {
+        w23 = lc.w23;
+        w24 = lc.w24;
+        /* s10 only grows, to at most 1 (s6 is 0, 0.5 or 1): once 1, the rest can't change it */
+        for (int k = 0; k < lc.n && s10 != 1.0f; k++) {
+            float s6 = 0.0f;
+            if (lc.on[k]) {
+                const float *b = lc.b[k];
+                float d0 = b[0] - s8, d1 = b[1] - s9;
+                if (d0 < 0.0f) d0 = -d0;
+                if (d1 < 0.0f) d1 = -d1;
+                if (d0 < b[2] && d1 < b[3])
+                    s6 = 1.0f;
+                else if (d0 <= b[5] && d1 <= b[3])
+                    s6 = 0.5f;
+                else
+                    s6 = d0 <= b[2] && d1 <= b[4] ? 0.5f : 0.0f;
+            }
+            s10 = s10 > s6 ? s10 : s6;
+        }
+    } else
+    for (uint64_t node = lp(M + 0x180); node; node = lp(node + 0x18)) {
+        const uint64_t L = lp(node + 8);
+        if (*(uint8_t *)GP(L + 0x98)) {
+            w24 = rt_ld32(GP(L + 0x9c));
+            w23 = 1;
+        }
+        float s6 = 0.0f;
+        if (*(uint8_t *)GP(L + 0x84)) {
+            c->x[0] = L;
+            nat__ZNK13DarknessLight6GetPosEv(c);
+            float d0 = c->v[0].f[0] - s8, d1 = c->v[1].f[0] - s9;
+            if (d0 < 0.0f) d0 = -d0;
+            if (d1 < 0.0f) d1 = -d1;
+            float s2 = ldfp(L + 0x6c), s3 = ldfp(L + 0x70), s4, s5;
+            if (*(uint8_t *)GP(L + 0x87)) {
+                const float a = ldfp(L + 0x78), b = ldfp(L + 0x7c);
+                s2 = s2 - a;
+                s3 = s3 - b;
+                s5 = a + s2;
+                s4 = b + s3;
+            } else {
+                const float k = hexf(0xbba3d70a);
+                s2 = s2 * 0.5f + k;
+                s3 = s3 * 0.5f + k;
+                s5 = (s2 + ldfp(L + 0x78)) + k;
+                s4 = (s3 + ldfp(L + 0x7c)) + k;
+            }
+            if (d0 < s2 && d1 < s3)
+                s6 = 1.0f;
+            else if (d0 <= s5 && d1 <= s3)
+                s6 = 0.5f;
+            else
+                s6 = d0 <= s2 && d1 <= s4 ? 0.5f : 0.0f;
+        }
+        s10 = s10 > s6 ? s10 : s6;
+    }
+    if (!lp(M + 0x180))
+        s10 = 0.0f;
+    float r = 1.0f;
+    uint64_t an = lp(lp(E + 0x50) + 0x778);
+    if (an) {
+        s11 = s11 + 0.0f;
+        const uint64_t saved_sp = c->sp, fr = saved_sp - 0x40;
+        for (; an; an = lp(an + 0x18)) {
+            const uint64_t A = lp(an + 8);
+            if (!A || !*(uint8_t *)GP(A + 0x171))
+                continue;
+            /* its box: GetDarknessAABB keeps it itself (from the area's position), so in an
+             * Update its first answer is every later one */
+            static struct { uint64_t A; uint32_t gen; float b[6]; } ab[16];
+            float bx[6];
+            int k = 0;
+            while (k < 16 && !(ab[k].A == A && ab[k].gen == dm_gen))
+                k++;
+            if (dm_batch && k < 16) {
+                memcpy(bx, ab[k].b, sizeof bx);
+            } else {
+                c->sp = fr;
+                c->x[0] = fr + 8;
+                c->x[1] = A;
+                f_584ec8(c);
+                c->sp = saved_sp;
+                memcpy(bx, GP(fr + 8), sizeof bx);
+                if (dm_batch) {
+                    k = (int)((A >> 4) & 15);
+                    ab[k].A = A;
+                    ab[k].gen = dm_gen;
+                    memcpy(ab[k].b, bx, sizeof bx);
+                }
+            }
+            const float c0 = bx[0], c1 = bx[1], c2 = bx[2];
+            const float h0 = bx[3], h1 = bx[4], h2 = bx[5];
+            if (s8 < c0 - h0 || s9 < c1 - h1)
+                continue;
+            if (!(s11 < c2 - h2) && s8 <= c0 + h0 && s9 <= c1 + h1 && !(s11 > c2 + h2)) {
+                memcpy(GP(M + 0x198), GP(A + 0x174), 8);
+                memcpy(GP(M + 0x1a0), GP(A + 0x17c), 4);
+                r = s10;
+                break;
+            }
+        }
+        c->sp = saved_sp;
+    }
+    const uint32_t w11 = w23 & (w24 == 1);
+    if (w11)
+        r = 1.0f;
+    const uint32_t lvl = (r < 1.0f || r != r) ? (r >= 0.5f) : 2;
+    const uint64_t T = lp(M + 0x170) + (uint64_t)(int64_t)i * 12;
+    if (force || w11) {
+        rt_st32(GP(T), lvl);
+        rt_st32(GP(T + 4), lvl);
+        stfp(T + 8, 0.0f);
+    } else if (rt_ld32(GP(T + 4)) != lvl) {
+        rt_st32(GP(T + 4), lvl);
+        rt_st32(GP(T + 8), 0x3d088889u);
+    }
+    if (w23 && w24 == 2)
+        rt_st32(GP(T + 8), 0);
+}
+void nat__ZN15DarknessManager8CalcTileEib(Ctx *c)
+{
+    static int off = -1, verify = -1;
+    if (off < 0) {
+        off = rt_native_off("__ZN15DarknessManager8CalcTileEib");
+        verify = getenv("MINA_VERIFY_DARK") != NULL;
+    }
+    if (off) {
+        f_585f84_orig(c);
+        return;
+    }
+    if (!verify) {
+        calc_tile(c);
+        return;
+    }
+    GM_BEGIN;
+    static uint32_t checked, bad;
+    const uint64_t M = c->x[0];
+    const uint64_t T = lp(M + 0x170) + (uint64_t)(int64_t)(int32_t)c->x[1] * 12;
+    uint8_t t0[12], m0[12], t1[12], m1[12];
+    memcpy(t0, GP(T), 12);
+    memcpy(m0, GP(M + 0x198), 12);
+    const Ctx save = *c;
+    calc_tile(c);
+    memcpy(t1, GP(T), 12);
+    memcpy(m1, GP(M + 0x198), 12);
+    memcpy(GP(T), t0, 12);
+    memcpy(GP(M + 0x198), m0, 12);
+    *c = save;
+    f_585f84_orig(c);
+    checked++;
+    if ((memcmp(t1, GP(T), 12) || memcmp(m1, GP(M + 0x198), 12)) && bad++ < 10) {
+        const uint32_t *a = (const uint32_t *)t1, *b = (const uint32_t *)GP(T);
+        rt_log("[verify] CalcTile %d differs: %x %x %x / %x %x %x\n", (int32_t)save.x[1], a[0], a[1], a[2], b[0], b[1],
+               b[2]);
+    }
+    if ((checked & 0xffff) == 0)
+        rt_log("[verify] CalcTile: %u checked, %u differ\n", checked, bad);
+}
