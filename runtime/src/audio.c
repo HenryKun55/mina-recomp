@@ -161,6 +161,29 @@ uint64_t a_now(void)
 #endif
 void nat__ZN7ycAudio7Decoder9DecodeCtxEPNS0_3CtxE(Ctx *c)
 {
+    /* The console crashed here once, in a long play: the sound's OggVorbis_File (ctx+0x20)
+     * had a vorbis_info (vf+0x68) whose channel count read 2.6 billion, and the copy of the
+     * decoded samples ran over that many channel pointers. A sound in that state is not
+     * decoded (it stays silent) and says so. */
+    {
+        const uint64_t vi = rt_ld64(G(A0 + 0x88));
+        const int32_t ready = (int32_t)rt_ld32(G(A0 + 0xa0));
+        int bad = 0;
+        if (!ready)
+            ;                     /* not open yet: DecodeCtx opens it (ov_open clears the struct) */
+        else if (vi)
+            bad = vi < GUEST_IMAGE_BASE || vi >= 0x20000000u || rt_ld32(G(vi + 4)) - 1u >= 8u;
+        else
+            bad = ready >= 2;
+        if (bad) {
+            static int told;
+            if (told++ < 20)
+                rt_log("[audio] sound %#llx not decoded: vorbis_info %#llx (channels %d), state %d\n",
+                       (unsigned long long)A0, (unsigned long long)vi,
+                       vi && vi < 0x20000000u ? (int)rt_ld32(G(vi + 4)) : -1, ready);
+            return;
+        }
+    }
     static int on = -1;
     if (on < 0)
         on = getenv("MINA_AUDIOSTAT") != NULL;

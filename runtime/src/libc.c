@@ -269,6 +269,26 @@ int lazy_contains(uint32_t addr) { return addr >= LAZY_WINDOW_BASE && addr < LAZ
 static struct { int blob; uint32_t off, len, used; uint8_t *buf; } lzc[LAZY_SLOTS];
 static uint32_t lzc_tick;
 static pthread_mutex_t lzc_lock = PTHREAD_MUTEX_INITIALIZER;
+/* A read of the card that failed (the console: 7 blocks of the music bank in a row, once in
+ * a long play) is tried again, then once more with the file opened anew; what still fails
+ * reads as zeros (vorbisfile skips it) and says why. */
+static ssize_t lazy_pread_fd(LazyBlob *b, void *dst, uint32_t n, uint32_t off)
+{
+    ssize_t r = pread(b->fd, dst, n, (off_t)off);
+    for (int t = 0; t < 3 && r != (ssize_t)n; t++) {
+        const int e = errno;
+        if (t == 1) {
+            const int fd = open(b->path, O_RDONLY);
+            if (fd >= 0) {
+                close(b->fd);
+                b->fd = fd;
+            }
+        }
+        rt_log("[lazy] read of %u bytes at %u of %s: %d (errno %d), try %d\n", n, off, b->path, (int)r, e, t + 2);
+        r = pread(b->fd, dst, n, (off_t)off);
+    }
+    return r;
+}
 static void lazy_pread(int bi, uint32_t off, uint8_t *dst, uint32_t n)
 {
     LazyBlob *b = &lazy[bi];
@@ -276,15 +296,15 @@ static void lazy_pread(int bi, uint32_t off, uint8_t *dst, uint32_t n)
     if (direct < 0)
         direct = getenv("MINA_LAZY_DIRECT") != NULL;
     if (direct || n >= LAZY_BLOCK) {           /* a big read: straight from the card */
-        ssize_t r = pread(b->fd, dst, n, (off_t)off);
+        const ssize_t r = lazy_pread_fd(b, dst, n, off);
         if (r != (ssize_t)n)
-            rt_log("[lazy] read of %u bytes at %u: %zd\n", n, off, r);
+            memset(dst + (r > 0 ? r : 0), 0, n - (r > 0 ? (uint32_t)r : 0));
         return;
     }
     pthread_mutex_lock(&lzc_lock);
     while (n) {
         const uint32_t blk = off & ~(LAZY_BLOCK - 1);
-        int k = -1, old = 0;
+        int k = -1, old = 0, bad = 0;
         for (int j = 0; j < LAZY_SLOTS; j++) {
             if (lzc[j].buf && lzc[j].blob == bi && lzc[j].off == blk) {
                 k = j;
@@ -299,12 +319,12 @@ static void lazy_pread(int bi, uint32_t off, uint8_t *dst, uint32_t n)
                 lzc[k].buf = malloc(LAZY_BLOCK);
             const uint64_t left = b->size > blk ? b->size - blk : 0;
             const uint32_t want = left < LAZY_BLOCK ? (uint32_t)left : LAZY_BLOCK;
-            const ssize_t r = pread(b->fd, lzc[k].buf, want, (off_t)blk);
+            const ssize_t r = lazy_pread_fd(b, lzc[k].buf, want, blk);
             lzc[k].blob = bi;
             lzc[k].off = blk;
             lzc[k].len = r > 0 ? (uint32_t)r : 0;
             if (r != (ssize_t)want)
-                rt_log("[lazy] read of %u bytes at %u: %zd\n", want, blk, r);
+                bad = 1;                       /* not kept: the next read tries the card again */
         }
         lzc[k].used = ++lzc_tick;
         const uint32_t in = off - blk;
@@ -316,6 +336,8 @@ static void lazy_pread(int bi, uint32_t off, uint8_t *dst, uint32_t n)
                 take = lzc[k].len - in;
             memcpy(dst, lzc[k].buf + in, take);
         }
+        if (bad)
+            lzc[k].blob = -1;
         dst += take;
         off += take;
         n -= take;
