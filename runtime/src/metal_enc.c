@@ -2516,6 +2516,7 @@ static void be_copy_to_gpu(MBuffer *s, MBuffer *d, uint32_t so, uint32_t dof, ui
     gpu_buffer_write(d, dof, G(mem + so), n);
     metal_staging_lock();
     s->reading--;
+    metal_staging_unlock();
     {
         /* A whole staging buffer uploaded to GPU memory gives its memory back
          * (tile levels keep them all, 1.25 MiB each, with a few KiB written):
@@ -2523,10 +2524,9 @@ static void be_copy_to_gpu(MBuffer *s, MBuffer *d, uint32_t so, uint32_t dof, ui
         static int keep = -1;
         if (keep < 0)
             keep = getenv("MINA_KEEP_STAGING") != NULL;
-        if (!keep && so == 0 && n == s->length && !s->fresh && !s->keep_contents)
+        if (!keep && so == 0 && n == s->length && !s->fresh)
             metal_buf_give_back(s);
     }
-    metal_staging_unlock();
 }
 /* fillBuffer:range:value: (NSRange in x3/x4) */
 static void be_fillBuffer(Ctx *c)

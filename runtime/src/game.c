@@ -82,6 +82,14 @@ static void warp_requests(Ctx *c)
     if (++tick % 30)
         return;
 #if defined(__vita__)
+    /* (tests) only with MINA_WARP=1: the console's game thread opened the file twice a second,
+     * and an open behind the card's other reads (the music banks) held it 100-260 ms (the
+     * [spike] lines all in Game::FixedUpdate itself) */
+    static int on = -1;
+    if (on < 0)
+        on = getenv("MINA_WARP") != NULL;
+    if (!on)
+        return;
     const char *path = "ux0:data/mina/warp.txt";
 #else
     const char *path = getenv("MINA_WARP_FILE");
@@ -7539,13 +7547,32 @@ void nat__ZN13ycUpdateQueue6RemoveERK21ycUpdateQueueItemInfo(Ctx *c)
         const uint64_t T = L64(Q + 0x38);
         const uint64_t tbl = L64(Q + 0x40), cap = L64(Q + 0x48), probes = L64(Q + 0x50) + 1, vals = L64(Q + 0x70);
         const uint64_t mask = cap - 1, C = 0xd6e8feb86659fd93ull;
+        /* the handle table's shape, read once (a 64-bit division per item was a library call
+         * on the console's 32-bit CPU) */
+        const uint64_t per64 = T ? L64(T + 0x28) : 0, pages = T ? L64(T + 0x40) : 0;
+        const uint64_t base = T ? L64(T + 0x10) : 0, stride = T ? L64(T + 0x18) : 0;
+        const int small = per64 && per64 <= 0xffffffffu;
+        const uint32_t per = (uint32_t)per64;
+        const int pow2 = small && !(per & (per - 1));
+        const int sh = pow2 ? __builtin_ctz(per) : 0;
         for (; idx + 1 < cnt; idx++) {
             const uint8_t *it = items + idx * 40;
             const uint64_t k = rt_ld64(it + 0x18);
             uint64_t at;
             if (k) {
-                const uint64_t per = L64(T + 0x28), j = k - 1, pg = j / per, o = j - pg * per;
-                at = L64(L64(T + 0x40) + pg * 8) + L64(T + 0x10) + L64(T + 0x18) * o + 8;
+                uint64_t pg, o;
+                const uint64_t j = k - 1;
+                if (pow2 && j <= 0xffffffffu) {
+                    pg = (uint32_t)j >> sh;
+                    o = (uint32_t)j & (per - 1);
+                } else if (small && j <= 0xffffffffu) {
+                    pg = (uint32_t)j / per;
+                    o = (uint32_t)j - (uint32_t)pg * per;
+                } else {
+                    pg = j / per64;
+                    o = j - pg * per64;
+                }
+                at = L64(pages + pg * 8) + base + stride * o + 8;
             } else {
                 const uint64_t key = rt_ld64(it);
                 uint64_t h = key ^ (key >> 32);

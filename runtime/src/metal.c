@@ -1314,8 +1314,14 @@ static void d_newBufferWithLength(Ctx *c)
         static int keep = -1;
         if (keep < 0)
             keep = getenv("MINA_KEEP_STAGING") != NULL;
+        /* only when the staging blocks run short: with spare ones, the older buffers go
+         * back after their upload (the renderer, within a frame), not here on the game
+         * thread (a copy of each: 8-15 ms on the console) */
+        pthread_mutex_lock(&stage_lock);
+        const int spare = !stage_arena_tried || nstage_arena_free + nstage_pool >= 3;
+        pthread_mutex_unlock(&stage_lock);
         pthread_mutex_lock(&bufs_lock);
-        for (int i = 0; i < nlive_bufs && !keep; i++) {
+        for (int i = 0; i < nlive_bufs && !keep && !spare; i++) {
             MBuffer *x = live_bufs[i];
             if (x->length == TILE_STAGING_LEN && x->maker == b->maker && x->contents && x->contents_asked == 1)
                 metal_buf_give_back(x);
@@ -2451,19 +2457,24 @@ uint32_t metal_buf_mem_(MBuffer *b)
     return b->contents;
 }
 
-static void metal_buf_give_back_(MBuffer *b);
+/* A staging buffer's memory goes back, its bytes up to the last nonzero one kept (for
+ * another upload). The copy (up to 1.25 MiB) and the clearing are done outside the
+ * staging lock: held through them, they kept the game thread waiting in contents and
+ * newBufferWithLength 10-17 ms on the console. The buffer is marked read meanwhile (not
+ * given back twice); if its memory is asked for again meanwhile, it stays. Called without
+ * the staging lock held. */
 void metal_buf_give_back(MBuffer *b)
 {
     metal_staging_lock();
-    metal_buf_give_back_(b);
-    metal_staging_unlock();
-}
-static void metal_buf_give_back_(MBuffer *b)
-{
-    if (!b->contents || b->gpu_only || b->fresh || b->keep_contents || b->reading)
+    if (!b->contents || b->gpu_only || b->fresh || b->keep_contents || b->reading) {
+        metal_staging_unlock();
         return;
-    const uint8_t *m = G(b->contents);
-    const uint32_t len = used_len(b->contents, b->length);
+    }
+    const uint32_t mem = b->contents, asked = b->contents_asked;
+    b->reading++;
+    metal_staging_unlock();
+    const uint8_t *m = G(mem);
+    const uint32_t len = used_len(mem, b->length);
     if (getenv("MINA_STAGINGLOG")) {
         uint32_t first = 0;
         while (first < len && m[first] == 0)
@@ -2471,16 +2482,24 @@ static void metal_buf_give_back_(MBuffer *b)
         rt_log("[staging] %u bytes: data %u..%u\n", b->length, first, len);
     }
     uint8_t *keepb = len ? malloc(len) : NULL;
-    if (len && !keepb)
-        return;
-    if (len)
+    if (len && keepb)
         memcpy(keepb, m, len);
-    free(b->saved);
-    b->saved = keepb;
-    b->saved_len = len;
-    b->given_back = 1;
-    stage_free(b->contents, b->length, len);
-    b->contents = 0;
+    metal_staging_lock();
+    b->reading--;
+    const int ok = (!len || keepb) && b->contents == mem && b->contents_asked == asked && !b->keep_contents &&
+                   !b->reading;
+    if (ok) {
+        free(b->saved);
+        b->saved = keepb;
+        b->saved_len = len;
+        b->given_back = 1;
+        b->contents = 0;
+    }
+    metal_staging_unlock();
+    if (ok)
+        stage_free(mem, b->length, len);
+    else
+        free(keepb);
 }
 
 static void b_contents(Ctx *c)
