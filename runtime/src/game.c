@@ -2065,6 +2065,51 @@ void nat__ZN21ycCutterAnimComponent11UpdateFrameEfb(Ctx *c)
     update_frame(c);
 }
 
+/* ---- ycCutterAnimComponent::UpdateRenderFrame: its indices checked ------------------------------
+ * The render frame is the anim's (O+0x40) frame (+0x28, 0x58 each, +0x18 of them) that the
+ * current animation's (data +0x10: list +0x30, 0x38 each, count +0x28 >> 34) track (+0x20,
+ * 0x18 each, count +0x18 >> 34) names at the frame index (O+0x158). The console crashed in a
+ * long play (ycCutterAnimFrame::InitTexture on a frame 0x5_8e8d4b20: an index far out of its
+ * anim's frames, on the game thread). An index or pointer out of range keeps the frame
+ * shown (logged, with the component) instead. */
+void f_d3d2c_orig(Ctx *c);
+int guest_ptr_ok(uint32_t a);
+void nat__ZN21ycCutterAnimComponent17UpdateRenderFrameEv(Ctx *c)
+{
+    GM_BEGIN;
+    const uint64_t O = c->x[0];
+    const uint32_t an = rt_ld32(GP(O + 0x17c));
+    if ((int32_t)an < 0) {
+        f_d3d2c_orig(c);
+        return;
+    }
+    const uint64_t anim = lp(O + 0x40);
+    const char *why = NULL;
+    uint64_t nan = 0, nfr = 0, nf = 0;
+    uint32_t fi = rt_ld32(GP(O + 0x158)), f = 0;
+    uint64_t data = 0, lst = 0, A = 0, trk = 0, frames = 0;
+    if (!guest_ptr_ok((uint32_t)anim) || !guest_ptr_ok((uint32_t)(data = lp(anim + 0x10))))
+        why = "anim";
+    else if (an >= (nan = rt_ld64(GP(data + 0x28)) >> 34) || !guest_ptr_ok((uint32_t)(lst = lp(data + 0x30))))
+        why = "animation";
+    else if (A = lst + 0x38ull * an, fi >= (nfr = rt_ld64(GP(A + 0x18)) >> 34) || !guest_ptr_ok((uint32_t)(trk = lp(A + 0x20))))
+        why = "frame index";
+    else if (f = rt_ld32(GP(trk + 0x18ull * fi)), f >= (nf = rt_ld32(GP(anim + 0x18))) ||
+             !guest_ptr_ok((uint32_t)(frames = lp(anim + 0x28))))
+        why = "frame";
+    if (!why) {
+        f_d3d2c_orig(c);
+        return;
+    }
+    static int told;
+    if (told++ < 20)
+        rt_log("[anim] component %#llx (vtable %#x, entity %#x): %s out of range (anim %#llx, animation %u of %llu, "
+               "index %u of %llu, frame %u of %llu); frame kept\n",
+               (unsigned long long)O, rt_ld32(GP(O)), rt_ld32(GP(O + 0x10)), why, (unsigned long long)anim, an,
+               (unsigned long long)nan, fi, (unsigned long long)nfr, f, (unsigned long long)nf);
+    c->x[0] = O;
+}
+
 /* ---- GameAnim::UpdateFacing: its early out natively ------------------------------------------
  * Nothing to do unless the facing flag (bit 3 of +0x1e4) is set and the facing
  * (from the owner at +0x248 +0x144, or +0x280) differs from the one used

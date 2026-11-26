@@ -712,6 +712,16 @@ static int not_heap(uint32_t a, const char *what)
     return 1;
 }
 
+/* a guest address of the image or of the heap's memory so far (checks of game data that may be
+ * stale) */
+int guest_ptr_ok(uint32_t a)
+{
+    if (a >= GUEST_IMAGE_BASE && a < image_end)
+        return 1;
+    const uintptr_t h = (uintptr_t)(g_mem + a);
+    return a >= image_end && h >= (uintptr_t)sbrk_start && h < (uintptr_t)sbrk(0);
+}
+
 void gfree(uint32_t a)
 {
     if (!a || not_heap(a, "free"))
@@ -1420,6 +1430,12 @@ void mem_report(void)
                    resident[order[k]] / 1048576.0, (long long)sites[order[k]].count, nm);
         }
     }
+}
+
+/* a guest address of the image or of the heap so far */
+int guest_ptr_ok(uint32_t a)
+{
+    return (a >= GUEST_IMAGE_BASE && a < HEAP_BASE) || (a >= HEAP_BASE && a < heap_top);
 }
 
 #endif
