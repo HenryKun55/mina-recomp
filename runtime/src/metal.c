@@ -1306,6 +1306,9 @@ static void d_newBufferWithLength(Ctx *c)
      * made before are written by now (made, filled, queued for upload, the
      * next one made), so their memory goes, their bytes kept for the upload:
      * a region's layers would take 1.25 MiB each at once. */
+    uint64_t a_now(void);
+    const uint64_t t0 = a_now();
+    uint64_t t1 = t0;
     b->maker = thread_ctx();
     if (b->length == TILE_STAGING_LEN) {
         static int keep = -1;
@@ -1318,6 +1321,7 @@ static void d_newBufferWithLength(Ctx *c)
                 metal_buf_give_back(x);
         }
         pthread_mutex_unlock(&bufs_lock);
+        t1 = a_now();
     }
 #if !defined(__vita__)
     uint32_t gmalloc_fresh(uint64_t size);
@@ -1328,6 +1332,13 @@ static void d_newBufferWithLength(Ctx *c)
 #endif
     b->contents = stage_alloc(b->length);
     buf_track(b, 1);
+    const uint64_t t2 = a_now();
+    if (t2 - t0 > 8000) {          /* where a slow one went (the console's spikes) */
+        static int told;
+        if (told++ < 40)
+            rt_log("[buf] new %u-byte buffer: %.1f ms (giving back older ones %.1f, its memory %.1f)\n", b->length,
+                   (t2 - t0) / 1000.0, (t1 - t0) / 1000.0, (t2 - t1) / 1000.0);
+    }
     RET(o);
 }
 static void d_newBufferWithBytes(Ctx *c)
@@ -2450,7 +2461,7 @@ void metal_buf_give_back(MBuffer *b)
 }
 static void metal_buf_give_back_(MBuffer *b)
 {
-    if (!b->contents || b->gpu_only || b->fresh || b->keep_contents)
+    if (!b->contents || b->gpu_only || b->fresh || b->keep_contents || b->reading)
         return;
     const uint8_t *m = G(b->contents);
     const uint32_t len = used_len(b->contents, b->length);
@@ -2476,7 +2487,10 @@ static void metal_buf_give_back_(MBuffer *b)
 static void b_contents(Ctx *c)
 {
     MBuffer *b = objc_host(SELF);
+    uint64_t a_now(void);
+    const uint64_t t0 = a_now();
     metal_staging_lock();
+    const uint64_t t1 = a_now();
     b->contents_asked++;
     if (!b->contents && !b->gpu_only) {
         /* the game writes through this pointer whenever: never given back again */
@@ -2491,6 +2505,13 @@ static void b_contents(Ctx *c)
     }
     const uint32_t r = metal_buf_mem(b);
     metal_staging_unlock();
+    const uint64_t t2 = a_now();
+    if (t2 - t0 > 8000) {
+        static int told;
+        if (told++ < 40)
+            rt_log("[buf] contents of a %u-byte buffer: %.1f ms (waiting for the staging lock %.1f)\n", b->length,
+                   (t2 - t0) / 1000.0, (t1 - t0) / 1000.0);
+    }
     RET(r);
 }
 static void b_length(Ctx *c) { RET(((MBuffer *)objc_host(SELF))->length); }

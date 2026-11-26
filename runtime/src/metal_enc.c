@@ -2291,11 +2291,18 @@ static void be_copyBufferToTexture(Ctx *c)
     uint64_t sp = c->sp;
     uint32_t slice = (uint32_t)rt_ld64(G(sp)), level = (uint32_t)rt_ld64(G(sp + 8));
     uint64_t origin = rt_ld64(G(sp + 16));
+    /* Not given back while it is read: marked, not locked. The staging lock held for the
+     * whole upload (a texture of a room, tens of ms on the console) kept the game thread
+     * waiting in newBufferWithLength / contents: its spikes of 50-660 ms. */
     void metal_staging_lock(void), metal_staging_unlock(void);
-    metal_staging_lock();       /* not given back while it is read */
+    metal_staging_lock();
+    const uint32_t mem = metal_buf_mem(b);
+    b->reading++;
+    metal_staging_unlock();
     metal_tex_upload(t, (uint32_t)rt_ld64(G(origin)), (uint32_t)rt_ld64(G(origin + 8)), (uint32_t)rt_ld64(G(size)),
-                     (uint32_t)rt_ld64(G(size + 8)), level, slice, G(metal_buf_mem(b) + (uint32_t)MARG(1)),
-                     (uint32_t)MARG(2));
+                     (uint32_t)rt_ld64(G(size + 8)), level, slice, G(mem + (uint32_t)MARG(1)), (uint32_t)MARG(2));
+    metal_staging_lock();
+    b->reading--;
     metal_staging_unlock();
 }
 
@@ -2480,31 +2487,36 @@ static void be_copyBuffer(Ctx *c)
             rt_log("metal: copy from a private buffer (%u bytes): skipped\n", n);
         return;
     }
-    if (d->gpu_only) {
-        void metal_staging_lock(void), metal_staging_unlock(void);
-        metal_staging_lock();
+    if (d->gpu_only)
         be_copy_to_gpu(s, d, so, dof, n);
-        metal_staging_unlock();
-    } else
+    else
         memmove(G(metal_buf_mem(d) + dof), G(metal_buf_mem(s) + so), n);
 }
-/* (with the staging lock) */
+/* The staging lock only around the buffer's state, not the copy (see be_copyBufferToTexture) */
 static void be_copy_to_gpu(MBuffer *s, MBuffer *d, uint32_t so, uint32_t dof, uint32_t n)
 {
+    void metal_staging_lock(void), metal_staging_unlock(void);
+    metal_staging_lock();
+    if (!s->contents && s->given_back) {
+        /* given back: uploaded again from its saved bytes (ycGpuBuffer keeps
+         * its staging buffers to fill its GPU buffer again) */
+        uint8_t *tmp = calloc(1, (size_t)so + n);
+        if (!tmp)
+            rt_fatal("metal: no memory to upload %u bytes again", n);
+        if (s->saved_len)
+            memcpy(tmp, s->saved, s->saved_len < so + n ? s->saved_len : so + n);
+        metal_staging_unlock();
+        gpu_buffer_write(d, dof, tmp + so, n);
+        free(tmp);
+        return;
+    }
+    const uint32_t mem = metal_buf_mem(s);
+    s->reading++;
+    metal_staging_unlock();
+    gpu_buffer_write(d, dof, G(mem + so), n);
+    metal_staging_lock();
+    s->reading--;
     {
-        if (!s->contents && s->given_back) {
-            /* given back: uploaded again from its saved bytes (ycGpuBuffer keeps
-             * its staging buffers to fill its GPU buffer again) */
-            uint8_t *tmp = calloc(1, (size_t)so + n);
-            if (!tmp)
-                rt_fatal("metal: no memory to upload %u bytes again", n);
-            if (s->saved_len)
-                memcpy(tmp, s->saved, s->saved_len < so + n ? s->saved_len : so + n);
-            gpu_buffer_write(d, dof, tmp + so, n);
-            free(tmp);
-            return;
-        }
-        gpu_buffer_write(d, dof, G(metal_buf_mem(s) + so), n);
         /* A whole staging buffer uploaded to GPU memory gives its memory back
          * (tile levels keep them all, 1.25 MiB each, with a few KiB written):
          * its bytes up to the last nonzero one are kept, for another upload. */
@@ -2514,6 +2526,7 @@ static void be_copy_to_gpu(MBuffer *s, MBuffer *d, uint32_t so, uint32_t dof, ui
         if (!keep && so == 0 && n == s->length && !s->fresh && !s->keep_contents)
             metal_buf_give_back(s);
     }
+    metal_staging_unlock();
 }
 /* fillBuffer:range:value: (NSRange in x3/x4) */
 static void be_fillBuffer(Ctx *c)

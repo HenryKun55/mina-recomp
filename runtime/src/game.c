@@ -7510,3 +7510,63 @@ void nat__ZN11ycGpuBuffer6UploadEPv(Ctx *c)
     }
     f_1e833c_orig(c);
 }
+
+/* ---- ycUpdateQueue::Remove(ycUpdateQueueItemInfo const&) (x0 the queue Q, x1 its page P, x2 the index) -----
+ * The page's items after the index move down one (40 bytes each) and every moved item's info
+ * (its page index) goes down by one: found through Q+0x38's paged table when the item has a
+ * handle (+0x18, 1-based), else through Q's open hash by the item's key (+0): 64-bit mix,
+ * linear probing up to Q+0x50 + 1 slots, values Q+0x70 (16 bytes, the index at +8). The count
+ * (P+0x10) goes down; an emptied page is unlinked and freed: that case runs the game's code
+ * (nothing moves then). The console's profile: this function in 195 of 459 game-update spikes
+ * (a room's entities going at once: every removal moves the whole rest of the page). */
+void f_1e5f8c_orig(Ctx *c);
+void nat__ZN13ycUpdateQueue6RemoveERK21ycUpdateQueueItemInfo(Ctx *c)
+{
+    static int off = -1;
+    if (off < 0)
+        off = rt_native_off("__ZN13ycUpdateQueue6RemoveERK21ycUpdateQueueItemInfo");
+    GM_BEGIN;
+    const uint64_t Q = c->x[0], P = c->x[1];
+    const uint64_t cnt = L64(P + 0x10);
+    if (off || cnt <= 1) {
+        f_1e5f8c_orig(c);
+        return;
+    }
+    uint64_t idx = c->x[2];
+    if (idx + 1 < cnt) {
+        uint8_t *items = GP(P + 0x18);
+        memmove(items + idx * 40, items + (idx + 1) * 40, (size_t)(cnt - idx - 1) * 40);
+        const uint64_t T = L64(Q + 0x38);
+        const uint64_t tbl = L64(Q + 0x40), cap = L64(Q + 0x48), probes = L64(Q + 0x50) + 1, vals = L64(Q + 0x70);
+        const uint64_t mask = cap - 1, C = 0xd6e8feb86659fd93ull;
+        for (; idx + 1 < cnt; idx++) {
+            const uint8_t *it = items + idx * 40;
+            const uint64_t k = rt_ld64(it + 0x18);
+            uint64_t at;
+            if (k) {
+                const uint64_t per = L64(T + 0x28), j = k - 1, pg = j / per, o = j - pg * per;
+                at = L64(L64(T + 0x40) + pg * 8) + L64(T + 0x10) + L64(T + 0x18) * o + 8;
+            } else {
+                const uint64_t key = rt_ld64(it);
+                uint64_t h = key ^ (key >> 32);
+                h *= C;
+                h ^= h >> 32;
+                h *= C;
+                h ^= h >> 32;
+                h &= mask;
+                if (tbl)
+                    for (uint64_t n = probes;;) {
+                        const uint64_t v = L64(tbl + h * 8);
+                        if (!v || v == key)
+                            break;
+                        h = (h + 1) & mask;
+                        if (!--n)
+                            break;
+                    }
+                at = vals + h * 16 + 8;
+            }
+            rt_st64(GP(at), L64(at) - 1);
+        }
+    }
+    rt_st64(GP(P + 0x10), cnt - 1);
+}

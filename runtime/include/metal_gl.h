@@ -67,6 +67,7 @@ typedef struct MBuffer {
     uint8_t *saved;          /* given back: its bytes up to the last nonzero one (the rest are zero) */
     uint32_t saved_len;
     int given_back;          /* its memory went after an upload (saved holds its bytes) */
+    int reading;             /* uploads reading its memory now (render thread): not given back meanwhile */
     const void *maker;       /* the thread (Ctx) that made it */
     uint32_t gl_size;        /* private: bytes of its GL buffer (big ones hold their data, not all their length) */
     uint32_t gl_used;        /* private: bytes up to the last nonzero one written whole */
