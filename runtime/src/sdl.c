@@ -569,6 +569,13 @@ int mina_level_index(const char *want)
         if (name && !strcmp((const char *)G(name), want))
             return i;
     }
+    static int listed;      /* the names there are, once */
+    for (int i = 0; base && !listed && i < count; i++) {
+        const uint32_t sp = (uint32_t)rt_ld64(G(base + 72u * (uint32_t)i + 0x30));
+        if (sp && *(const char *)G(sp))
+            rt_log("[warp]   %s\n", (const char *)G(sp));
+    }
+    listed = 1;
     return -1;
 }
 /* (the index of MINA_START_LEVEL, -1 none or not found yet) */

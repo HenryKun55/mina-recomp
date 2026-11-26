@@ -1479,9 +1479,11 @@ static void depth_by_shader(REnc *e, MPipeline *p)
  * against a cleared depth: Mina drawn over the bridge she walks under. */
 static void depth_alias(REnc *e, MPipeline *p)
 {
-    static int off = -1;     /* MINA_DEPTH_ALIAS=1: on (Vita3K ran at 0.7 fps with it: being looked at) */
-    if (off < 0)
-        off = getenv("MINA_DEPTH_ALIAS") == NULL;
+    static int off = -1;     /* MINA_DEPTH_ALIAS=0: off (the sprites over the trees, grass and bridges again) */
+    if (off < 0) {
+        const char *v = getenv("MINA_DEPTH_ALIAS");
+        off = v && !atoi(v);
+    }
     if (off || p->fs < 0 || !g_shaders[p->fs].writes_depth || !e->dtex || !e->dtex->is_rb || !e->clear_depth)
         return;
     MDepthStencil *ds = e->ds ? objc_host(e->ds) : NULL;
