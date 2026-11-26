@@ -1257,37 +1257,6 @@ static uint32_t used_len(uint32_t a, uint32_t len)
         len--;
     return len;
 }
-/* The bytes of a tile staging buffer given back: whole-size blocks, the freed ones kept for the
- * next (up to SAVE_KEEP). newlib's malloc of 1.25 MiB took ~15 ms on the console, its heap in
- * tens of thousands of free pieces (the game thread's slow newBufferWithLength), and each
- * one freed cut the heap up further. */
-#define SAVE_KEEP 4
-static uint8_t *save_free_blk[SAVE_KEEP];
-static int nsave_free;
-static uint8_t *save_get(uint32_t length, uint32_t len)
-{
-    if (length != TILE_STAGING_LEN)
-        return malloc(len);
-    pthread_mutex_lock(&stage_lock);
-    uint8_t *p = nsave_free ? save_free_blk[--nsave_free] : NULL;
-    pthread_mutex_unlock(&stage_lock);
-    return p ? p : malloc(TILE_STAGING_LEN);
-}
-static void save_put(uint32_t length, uint8_t *p)
-{
-    if (!p)
-        return;
-    if (length == TILE_STAGING_LEN) {
-        pthread_mutex_lock(&stage_lock);
-        const int kept = nsave_free < SAVE_KEEP;
-        if (kept)
-            save_free_blk[nsave_free++] = p;
-        pthread_mutex_unlock(&stage_lock);
-        if (kept)
-            return;
-    }
-    free(p);
-}
 static void buf_dealloc(void *h)
 {
     MBuffer *b = h;
@@ -1298,7 +1267,7 @@ static void buf_dealloc(void *h)
         gpu_unlock();
     }
     free(b->shadow);
-    save_put(b->length, b->saved);
+    free(b->saved);
     if (!b->fresh && !b->gpu_only && b->contents)
         stage_free(b->contents, b->length,
                    b->length == TILE_STAGING_LEN ? used_len(b->contents, b->length) : 0);
@@ -2482,7 +2451,7 @@ uint32_t metal_buf_mem_(MBuffer *b)
             rt_fatal("metal: no guest memory for a %u-byte buffer", b->length);
         if (b->saved)
             memcpy(G(b->contents), b->saved, b->saved_len);
-        save_put(b->length, b->saved);
+        free(b->saved);
         b->saved = NULL;
         b->saved_len = 0;
         b->given_back = 0;
@@ -2514,7 +2483,7 @@ int metal_buf_give_back(MBuffer *b)
             first++;
         rt_log("[staging] %u bytes: data %u..%u\n", b->length, first, len);
     }
-    uint8_t *keepb = len ? save_get(b->length, len) : NULL;
+    uint8_t *keepb = len ? malloc(len) : NULL;
     if (len && keepb)
         memcpy(keepb, m, len);
     metal_staging_lock();
@@ -2522,7 +2491,7 @@ int metal_buf_give_back(MBuffer *b)
     const int ok = (!len || keepb) && b->contents == mem && b->contents_asked == asked && !b->keep_contents &&
                    !b->reading;
     if (ok) {
-        save_put(b->length, b->saved);
+        free(b->saved);
         b->saved = keepb;
         b->saved_len = len;
         b->given_back = 1;
@@ -2532,7 +2501,7 @@ int metal_buf_give_back(MBuffer *b)
     if (ok)
         stage_free(mem, b->length, len);
     else
-        save_put(b->length, keepb);
+        free(keepb);
     return ok;
 }
 
