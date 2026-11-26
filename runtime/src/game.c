@@ -2073,7 +2073,6 @@ void nat__ZN21ycCutterAnimComponent11UpdateFrameEfb(Ctx *c)
  * anim's frames, on the game thread). An index or pointer out of range keeps the frame
  * shown (logged, with the component) instead. */
 void f_d3d2c_orig(Ctx *c);
-int guest_ptr_ok(uint32_t a);
 void nat__ZN21ycCutterAnimComponent17UpdateRenderFrameEv(Ctx *c)
 {
     GM_BEGIN;

@@ -27,6 +27,12 @@ uint32_t rt_alloc(uint32_t size, uint32_t align);
 uint32_t gstrdup(const char *s);
 
 static inline uint32_t guest_addr(const void *p) { return (uint32_t)((uintptr_t)p - (uintptr_t)g_mem); }
+/* a guest address in the image or the heap (memory.c sets the ranges): checks of game data that may be stale */
+extern uint32_t g_ok_lo[2], g_ok_len[2];
+static inline int guest_ptr_ok(uint32_t a)
+{
+    return a - g_ok_lo[0] < g_ok_len[0] || a - g_ok_lo[1] < g_ok_len[1];
+}
 static inline const char *gstr(uint64_t a) { return a ? (const char *)G(a) : NULL; }
 
 /* ---- loader ---------------------------------------------------------- */

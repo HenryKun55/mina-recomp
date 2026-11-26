@@ -51,6 +51,7 @@ static void *lowguard_thread(void *arg)
 }
 
 static void slab_init(void);
+static void ok_ranges(void);
 char *sbrk_start;
 void mem_init(void)
 {
@@ -70,6 +71,7 @@ void mem_init(void)
         memset(all, 0xA5, GUEST_IMAGE_BASE);
         pthread_t t;
         pthread_create(&t, NULL, lowguard_thread, NULL);
+        ok_ranges();
         return;
     }
     /* the Mach-O header and the arm64 code (never read: the recompiled C runs
@@ -81,6 +83,7 @@ void mem_init(void)
         rt_fatal("cannot allocate the image (%u bytes)", end - skip_hi);
     g_mem = (uint8_t *)((uintptr_t)block - skip_hi);
     slab_init();
+    ok_ranges();
 }
 uint32_t image_skip_lo(void) { return GUEST_IMAGE_BASE; }
 uint32_t image_skip_hi(void) { return skip_hi; }
@@ -712,14 +715,16 @@ static int not_heap(uint32_t a, const char *what)
     return 1;
 }
 
-/* a guest address of the image or of the heap's memory so far (checks of game data that may be
- * stale) */
-int guest_ptr_ok(uint32_t a)
+/* the image's and newlib's heap's guest ranges (start, length), for checks of game data that
+ * may be stale (guest_ptr_ok in runtime.h); newlib's heap is one reserved block of
+ * _newlib_heap_size_user from sbrk_start */
+uint32_t g_ok_lo[2], g_ok_len[2];
+static void ok_ranges(void)
 {
-    if (a >= GUEST_IMAGE_BASE && a < image_end)
-        return 1;
-    const uintptr_t h = (uintptr_t)(g_mem + a);
-    return a >= image_end && h >= (uintptr_t)sbrk_start && h < (uintptr_t)sbrk(0);
+    g_ok_lo[0] = GUEST_IMAGE_BASE;
+    g_ok_len[0] = image_end - GUEST_IMAGE_BASE;
+    g_ok_lo[1] = guest_addr(sbrk_start);
+    g_ok_len[1] = (uint32_t)_newlib_heap_size_user;
 }
 
 void gfree(uint32_t a)
@@ -1432,10 +1437,6 @@ void mem_report(void)
     }
 }
 
-/* a guest address of the image or of the heap so far */
-int guest_ptr_ok(uint32_t a)
-{
-    return (a >= GUEST_IMAGE_BASE && a < HEAP_BASE) || (a >= HEAP_BASE && a < heap_top);
-}
+uint32_t g_ok_lo[2] = { GUEST_IMAGE_BASE, HEAP_BASE }, g_ok_len[2] = { HEAP_BASE - GUEST_IMAGE_BASE, HEAP_END - HEAP_BASE };
 
 #endif
