@@ -1323,8 +1323,10 @@ static void d_newBufferWithLength(Ctx *c)
         pthread_mutex_lock(&bufs_lock);
         for (int i = 0; i < nlive_bufs && !keep && !spare; i++) {
             MBuffer *x = live_bufs[i];
-            if (x->length == TILE_STAGING_LEN && x->maker == b->maker && x->contents && x->contents_asked == 1)
-                metal_buf_give_back(x);
+            /* one a call: enough to keep a block spare (all at once: 137 ms in a warp) */
+            if (x->length == TILE_STAGING_LEN && x->maker == b->maker && x->contents && x->contents_asked == 1 &&
+                metal_buf_give_back(x))
+                break;
         }
         pthread_mutex_unlock(&bufs_lock);
         t1 = a_now();
@@ -2463,12 +2465,12 @@ uint32_t metal_buf_mem_(MBuffer *b)
  * newBufferWithLength 10-17 ms on the console. The buffer is marked read meanwhile (not
  * given back twice); if its memory is asked for again meanwhile, it stays. Called without
  * the staging lock held. */
-void metal_buf_give_back(MBuffer *b)
+int metal_buf_give_back(MBuffer *b)
 {
     metal_staging_lock();
     if (!b->contents || b->gpu_only || b->fresh || b->keep_contents || b->reading) {
         metal_staging_unlock();
-        return;
+        return 0;
     }
     const uint32_t mem = b->contents, asked = b->contents_asked;
     b->reading++;
@@ -2500,6 +2502,7 @@ void metal_buf_give_back(MBuffer *b)
         stage_free(mem, b->length, len);
     else
         free(keepb);
+    return ok;
 }
 
 static void b_contents(Ctx *c)
