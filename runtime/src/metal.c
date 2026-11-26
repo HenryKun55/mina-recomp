@@ -1465,7 +1465,10 @@ uint64_t metal_new_texture(uint32_t type, uint32_t fmt, uint32_t w, uint32_t h, 
     static int sync = -1;
     if (sync < 0)
         sync = getenv("MINA_TEX_SYNC") != NULL;
-    if (!sync && pthread_mutex_trylock(&gpu_mutex) != 0) {
+    /* Always queued (the next GPU lock holder makes it, the renderer within a frame): the
+     * game thread that found the lock free made it, and every queued one, itself (the
+     * console's profile: newTextureWithDescriptor in 58 game-update spikes). */
+    if (!sync) {
         pthread_mutex_lock(&texq_lock);
         const int queued = ntexq < TEXQ_MAX;
         if (queued)
@@ -1473,12 +1476,8 @@ uint64_t metal_new_texture(uint32_t type, uint32_t fmt, uint32_t w, uint32_t h, 
         pthread_mutex_unlock(&texq_lock);
         if (queued)
             return o;
-        gpu_lock();
-    } else if (!sync) {
-        if (__atomic_load_n(&ntexq, __ATOMIC_ACQUIRE))
-            texq_drain();
-    } else
-        gpu_lock();
+    }
+    gpu_lock();
     tex_create_gl(t);
     if (metal_texlog() && t->width >= 64)
         rt_log("[tex] new %ux%u fmt %u gl %u\n", t->width, t->height, t->format, t->gl);
