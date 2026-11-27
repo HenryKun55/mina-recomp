@@ -33,7 +33,7 @@ uint32_t g_calls[24];
 const char *const g_call_name[24] = { "RecalcWorld", "DerivedState", "UpdateFrame", "RenderFrame", "RenderFrameFast",
                                       "Shapes", "ShapesFast", "AttackList", "PalComp", "PalAnimEntry", "GetIndex",
                                       "UQItems", "PalSame", "PalNoEntry", "PalNoEntryUs", "PalEntryUs",
-                                      "PalOff", "PalSkipped", NULL };
+                                      "PalOff", "PalSkipped", "InputIdle", "Attackers", "DefBoxes", "AtkHits", "BoxTests", NULL };
 #define CALLS(k) (g_calls[k]++)
 static int g_calls_on;           /* MINA_CALLS set (read once at the first palette update) */
 #define ldfp(a) ({ float f_; memcpy(&f_, GP(a), 4); f_; })
@@ -1887,12 +1887,29 @@ static void input_array(uint8_t *cur, uint8_t *prev, uint8_t *pressed, uint8_t *
         memcpy(hold + 4 * i, &nh, 4);
     }
 }
+/* all bytes zero (n a multiple of 4) */
+static inline int all_zero(const uint8_t *p, size_t n)
+{
+    uint32_t acc = 0;
+    for (size_t i = 0; i < n; i += 4) {
+        uint32_t w;
+        memcpy(&w, p + i, 4);
+        acc |= w;
+    }
+    return acc == 0;
+}
 static void update_derived_state(Ctx *c)
 {
     CALLS(1);
     uint8_t *s = G(c->x[0]);
     const float dt = c->v[0].f[0];
     uint8_t *a = s + 0x2f4;
+    /* an idle input state (most are the enemies'): every value, previous value, press, hold and
+     * release +0 gives all of them +0 again (and the groups' flags and maxima +0): nothing to do */
+    if (all_zero(s + 0x2f4, 0x35c) && all_zero(s + 0x650, 0xab4) && all_zero(s + 0x1104, 0x24)) {
+        CALLS(18);
+        return;
+    }
     input_array(a, a + 0xac, a + 0x158, a + 0x204, a + 0x2b0, 43, dt);
     input_array(s + 0x650, s + 0x874, s + 0xa98, s + 0xcbc, s + 0xee0, 137, dt);
     const float one = 1.0f, zero = 0.0f;
@@ -4423,6 +4440,7 @@ void f_98944c(Ctx *c);          /* CombatShape::GetModifiedShape */
 void f_5721dc_orig(Ctx *c);     /* AttackShape::CheckAttackOverlap */
 void f_98375c(Ctx *c);          /* CombatCore::AssignDamage */
 static int combat_rec_on = -1, combat_rec_hit;
+static int combat_hit_any;      /* a hit ran the game's code (the defenders may have changed) */
 void nat__ZN11AttackShape18CheckAttackOverlapE16ycShapeContainerjjS0_jP12DefenseShapejb(Ctx *c)
 {
     if (combat_rec_on > 0 && !combat_rec_hit) {
@@ -4545,6 +4563,7 @@ static void combat_tail(Ctx *c, uint8_t *gm_, uint64_t F, uint64_t A, uint64_t D
             if (!(uint32_t)c->x[0])
                 continue;
             /* a hit */
+            combat_hit_any = 1;
             const uint32_t saved = L32(x20 + 0x1ec);
             if (L32(F + 0xb4) & (1u << 11))
                 rt_st32(GP(x20 + 0x1ec), 1);
@@ -4623,7 +4642,20 @@ static void combat_tail(Ctx *c, uint8_t *gm_, uint64_t F, uint64_t A, uint64_t D
 
 /* ProcessAttackList's defenders: those of B's pools with flag 2 and a shape, their boxes as
  * the loop computes them (n -1: too many, the loop reads them itself) */
-typedef struct { float xlo, xhi, ylo, yhi; } DefBox;
+/* (as ordered integers: a float's bits with -0 made +0, negatives' magnitude bits flipped, compare
+ * as signed ints in the same order as the floats; a NaN box takes the widest range: always a
+ * candidate, the exact test is the loop's) */
+typedef struct { int32_t xlo, xhi, ylo, yhi; } DefBox;
+static inline int32_t fkey(float f, int *nan)
+{
+    uint32_t b;
+    memcpy(&b, &f, 4);
+    if ((b & 0x7fffffffu) > 0x7f800000u)
+        *nan = 1;
+    if (!(b & 0x7fffffffu))
+        b = 0;
+    return (int32_t)(b ^ ((uint32_t)((int32_t)b >> 31) & 0x7fffffffu));
+}
 #define DCACHE_MAX 2048
 static DefBox dcache[DCACHE_MAX];
 static int dcache_n = -1, dcache_dirty = 1;
@@ -4661,15 +4693,20 @@ static void dcache_build(uint8_t *gm_, uint64_t T, uint64_t B)
                             return;
                         }
                         DefBox *d = &dcache[dcache_n++];
+                        int nan = 0;
                         {
                             const float t = ldfp(D + 8), h = ldfp(D);
-                            d->xlo = t - h;
-                            d->xhi = t + h;
+                            d->xlo = fkey(t - h, &nan);
+                            d->xhi = fkey(t + h, &nan);
                         }
                         {
                             const float h = ldfp(D + 4), t = ldfp(D + 0xc);
-                            d->ylo = t - h;
-                            d->yhi = h + t;
+                            d->ylo = fkey(t - h, &nan);
+                            d->yhi = fkey(h + t, &nan);
+                        }
+                        if (nan) {
+                            d->xlo = d->ylo = INT32_MIN;
+                            d->xhi = d->yhi = INT32_MAX;
                         }
                     }
                 }
@@ -4727,18 +4764,36 @@ static void process_attack_list(Ctx *c, int dry)
                         const float s8 = cx - hx, s9 = hx + cx, s10 = hy + cy, s11 = cy - hy;
                         /* the defenders once (their flags and boxes), until a hit runs game code:
                          * an attacker that touches none of them does nothing in the game's loop */
-                        if (dcache_dirty)
+                        CALLS(19);
+                        if (dcache_dirty) {
                             dcache_build(gm_, T, B);
+                            g_calls[20] += dcache_n > 0 ? dcache_n : 0;
+                        }
                         if (dcache_n >= 0) {
-                            int any = 0;
-                            for (int q = 0; q < dcache_n && !any; q++) {
-                                const DefBox *d = &dcache[q];
-                                any = !(s8 > d->xhi || d->xlo > s9) && !(s11 > d->yhi || d->ylo > s10);
+                            int nan = 0;
+                            const int32_t k8 = fkey(s8, &nan), k9 = fkey(s9, &nan), k10 = fkey(s10, &nan),
+                                          k11 = fkey(s11, &nan);
+                            int any = nan;
+                            if (!any) {
+                                const DefBox *d = dcache, *const de = dcache + dcache_n;
+                                const DefBox *d0 = d;
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC novector
+#endif
+                                for (; d != de; d++) {
+                                    /* (most boxes fail the first test: one load, compare, branch) */
+                                    if (k8 > d->xhi || d->xlo > k9 || k11 > d->yhi || d->ylo > k10)
+                                        continue;
+                                    any = 1;
+                                    break;
+                                }
+                                g_calls[22] += (uint32_t)(d - d0);
                             }
                             if (!any)
                                 continue;
-                            dcache_dirty = 1;
+                            CALLS(21);
                         }
+                        combat_hit_any = 0;
                         const uint64_t barr = L64(B);
                         const uint64_t bend = (uint32_t)(barr + bcnt * 8);
                         uint32_t v9 = L32(T + 0xe4);
@@ -4774,6 +4829,8 @@ static void process_attack_list(Ctx *c, int dry)
                                                     continue;
                                             }
                                             combat_tail(c, gm_, F, A, D, dry);
+                                            if (combat_hit_any)
+                                                dcache_dirty = 1;
                                         }
                                     }
                                 }
