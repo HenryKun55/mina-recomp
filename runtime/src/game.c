@@ -27,6 +27,13 @@ static uint64_t now_us(void)
 #define GM_BEGIN uint8_t *const gm_ = g_mem
 #define GP(a) ((void *)(gm_ + (uint32_t)(a)))
 #define lp(a) ((uint64_t)rt_ld32(GP(a)))
+/* MINA_CALLS=1: calls per fixed update of a few hot functions in the [fps] lines (the counts
+ * always kept: one add each) */
+uint32_t g_calls[16];
+const char *const g_call_name[16] = { "RecalcWorld", "DerivedState", "UpdateFrame", "RenderFrame", "RenderFrameFast",
+                                      "Shapes", "ShapesFast", "AttackList", "PalComp", "PalAnimEntry", "GetIndex",
+                                      "UQItems", "PalSame", NULL };
+#define CALLS(k) (g_calls[k]++)
 #define ldfp(a) ({ float f_; memcpy(&f_, GP(a), 4); f_; })
 #define stfp(a, v) do { float f_ = (v); memcpy(GP(a), &f_, 4); } while (0)
 
@@ -619,6 +626,7 @@ int rt_native_off(const char *name)
 void f_9a65c4_orig(Ctx *c);
 static void recalc_world_transform(Ctx *c)
 {
+    CALLS(0);
     GM_BEGIN;
     const uint64_t O = c->x[0];
     const XForm *W = GP(c->x[1]);
@@ -1879,6 +1887,7 @@ static void input_array(uint8_t *cur, uint8_t *prev, uint8_t *pressed, uint8_t *
 }
 static void update_derived_state(Ctx *c)
 {
+    CALLS(1);
     uint8_t *s = G(c->x[0]);
     const float dt = c->v[0].f[0];
     uint8_t *a = s + 0x2f4;
@@ -1944,6 +1953,7 @@ void f_d3b20_orig(Ctx *c);
 void f_d3d2c(Ctx *c);            /* ycCutterAnimComponent::UpdateRenderFrame */
 static void update_frame(Ctx *c)
 {
+    CALLS(2);
     GM_BEGIN;
     const uint64_t O = c->x[0];
     float dt = c->v[0].f[0];
@@ -2075,6 +2085,7 @@ void nat__ZN21ycCutterAnimComponent11UpdateFrameEfb(Ctx *c)
 void f_d3d2c_orig(Ctx *c);
 void nat__ZN21ycCutterAnimComponent17UpdateRenderFrameEv(Ctx *c)
 {
+    CALLS(3);
     GM_BEGIN;
     const uint64_t O = c->x[0];
     const uint32_t an = rt_ld32(GP(O + 0x17c));
@@ -2097,6 +2108,14 @@ void nat__ZN21ycCutterAnimComponent17UpdateRenderFrameEv(Ctx *c)
              !guest_ptr_ok((uint32_t)(frames = lp(anim + 0x28))))
         why = "frame";
     if (!why) {
+        /* the usual case natively: the frame's texture set up (InitTexture returns at once on
+         * its flag 4) and the same frame and texture as shown (the original's early return) */
+        const uint64_t F = frames + 0x58ull * f;
+        if ((rt_ld32(GP(F + 0x40)) & 4) && lp(O + 0x48) == F && rt_ld64(GP(O + 0x110)) == rt_ld64(GP(F + 0x10))) {
+            c->x[0] = O;
+            CALLS(4);
+            return;
+        }
         f_d3d2c_orig(c);
         return;
     }
@@ -2107,6 +2126,129 @@ void nat__ZN21ycCutterAnimComponent17UpdateRenderFrameEv(Ctx *c)
                (unsigned long long)O, rt_ld32(GP(O)), rt_ld32(GP(O + 0x10)), why, (unsigned long long)anim, an,
                (unsigned long long)nan, fi, (unsigned long long)nfr, f, (unsigned long long)nf);
     c->x[0] = O;
+}
+
+/* ---- CombatShape::UpdateShapes(dt, names, n): its "nothing changed" return natively ----------
+ * Most calls find the owner's anim (S+0x58) at the same position, animation, frame, scale as
+ * the last time (and no rotation to compare, S+0x40 clear) and nothing moved: the timers
+ * (+0x44, +0x48) advance, the motion (+0x90..0x98) is stored, the bounds' offset (+0xc0, +0xc8)
+ * cleared, 0 returned. That decided from reads only; anything else runs the original untouched.
+ * The arithmetic in the original's order (fp-contract off). MINA_NO_NATIVES=ShapesFast. */
+void f_987cac_orig(Ctx *c);
+static int shapes_fast(Ctx *c);
+void nat__ZN11CombatShape12UpdateShapesEfPPKcj(Ctx *c)
+{
+    CALLS(5);
+    static int verify = -1;
+    if (verify < 0)
+        verify = getenv("MINA_VERIFY_SHAPES") != NULL;
+    if (!verify) {
+        if (!shapes_fast(c))
+            f_987cac_orig(c);
+        else
+            CALLS(6);
+        return;
+    }
+    /* MINA_VERIFY_SHAPES=1: a fast return checked against the original on the same object */
+    GM_BEGIN;
+    static uint32_t checked, bad;
+    static uint8_t s0[0x100], s1[0x100];
+    const uint64_t S = c->x[0];
+    memcpy(s0, GP(S), sizeof s0);
+    const Ctx save = *c;
+    if (!shapes_fast(c)) {
+        f_987cac_orig(c);
+        return;
+    }
+    const uint64_t mine = c->x[0];
+    memcpy(s1, GP(S), sizeof s1);
+    memcpy(GP(S), s0, sizeof s0);
+    *c = save;
+    f_987cac_orig(c);
+    checked++;
+    if ((memcmp(s1, GP(S), sizeof s1) || mine != c->x[0]) && bad++ < 10) {
+        unsigned i = 0;
+        while (i < sizeof s1 && s1[i] == ((uint8_t *)GP(S))[i]) i++;
+        rt_log("[verify] UpdateShapes differs at +%#x: %02x / %02x, returns %llu / %llu\n", i, i < sizeof s1 ? s1[i] : 0,
+               i < sizeof s1 ? ((uint8_t *)GP(S))[i] : 0, (unsigned long long)mine, (unsigned long long)c->x[0]);
+    }
+    if ((checked & 0xfff) == 0)
+        rt_log("[verify] UpdateShapes: %u fast returns checked, %u differ\n", checked, bad);
+}
+#define LB8(a) (*(uint8_t *)GP(a))
+static int shapes_fast(Ctx *c)
+{
+    static int off = -1;
+    if (off < 0)
+        off = rt_native_off("ShapesFast");
+    if (off)
+        return 0;
+    GM_BEGIN;
+    const uint64_t S = c->x[0];
+    const float dt = c->v[0].f[0];
+    const uint32_t st = rt_ld32(GP(S + 0xb4));
+    if (st & 8) {
+        stfp(S + 0x44, ldfp(S + 0x44) + dt);
+        stfp(S + 0x48, ldfp(S + 0x48) + dt);
+        rt_st64(GP(S + 0xc0), 0);
+        rt_st32(GP(S + 0xc8), 0);
+        c->x[0] = 0;
+        return 1;
+    }
+    const uint64_t A = lp(S + 0x58);
+    if (((st >> 3) & 2) || !A || rt_ld64(GP(S + 0x60)) != A || LB8(S + 0xbd) || LB8(S + 0x40))
+        goto orig;
+    {
+        const uint64_t E = lp(S + 0x38);
+        if (LB8(E + 0x254) || rt_ld32(GP(S + 0x68)) != rt_ld32(GP(A + 0x17c)) ||
+            rt_ld32(GP(S + 0xb0)) != rt_ld32(GP(A + 0x158)) || !(ldfp(S + 0x9c) == ldfp(A + 0x190)) ||
+            !(ldfp(S + 0xa0) == ldfp(A + 0x194)) || !(ldfp(S + 0xa4) == ldfp(A + 0x198)))
+            goto orig;
+        float s1 = ldfp(A + 0x25c), s2 = ldfp(A + 0x260);
+        const float s0 = ldfp(A + 0x264);
+        const uint64_t P = rt_ld64(GP(A + 0x200));
+        if (P) {
+            const uint64_t p = (uint32_t)P;
+            const float s3 = ldfp(p + 0x94) - ldfp(p + 0xa0);
+            const float d0 = ldfp(p + 0x98) - ldfp(p + 0xa4), d1 = ldfp(p + 0x9c) - ldfp(p + 0xa8);
+            s1 = s1 - s3;
+            s2 = s2 - d0;
+            s2 = s2 - d1;
+        }
+        const float s8 = s1 + ldfp(S + 0xd8);
+        const float s9 = s0 + 0.0f;
+        const float s10 = (s2 + ldfp(S + 0xdc)) + ldfp(S + 0xe0);
+        const float s12 = s8 - ldfp(S + 0x6c), s11 = s10 - ldfp(S + 0x70), m = s9 - ldfp(S + 0x74);
+        if (!(s12 == 0.0f) || !(s11 == 0.0f))
+            goto orig;              /* moved */
+        int stop = 0;
+        if (LB8(S + 0xbf)) {
+            const float lim = ldfp(S + 0xe4);
+            float a = s12 - (ldfp(S + 0xc0) + ldfp(S + 0xcc));
+            a = a > 0.0f ? a : -a;
+            if (a > lim)
+                stop = 1;
+            else {
+                float b = s11 - (ldfp(S + 0xc4) + ldfp(S + 0xd0));
+                b = b > 0.0f ? b : -b;
+                stop = !(b <= lim);
+            }
+        }
+        stfp(S + 0x44, ldfp(S + 0x44) + dt);
+        stfp(S + 0x48, ldfp(S + 0x48) + dt);
+        rt_st32(GP(S + 0xb4), 0);
+        stfp(S + 0x90, s12);
+        stfp(S + 0x94, s11);
+        stfp(S + 0x98, m);
+        if (stop)
+            rt_st32(GP(S + 0x48), 0);
+        rt_st64(GP(S + 0xc0), 0);
+        rt_st32(GP(S + 0xc8), 0);
+        c->x[0] = 0;
+        return 1;
+    }
+orig:
+    return 0;
 }
 
 /* ---- GameAnim::UpdateFacing: its early out natively ------------------------------------------
@@ -2127,6 +2269,192 @@ void nat__ZN8GameAnim12UpdateFacingEv(Ctx *c)
     if (ldfp(xy) == ldfp(O + 0x250) && ldfp(xy + 4) == ldfp(O + 0x254) && ldfp(z) == ldfp(O + 0x258))
         return;
     f_9a7c54_orig(c);
+}
+
+/* ---- GameAnim::Update / PostUpdate (ycUpdateQueueContext): the update queue's most called
+ * callbacks (~700 GameAnims each per update in hub_overworld_south), natively: the facing, the
+ * frame and the render frame through their natives' early outs, the world transform (vtable
+ * +0x80) when flagged (+0x1e4 bit 5, or bit 4 with mode 4 at +0x1dc), then bit 5 cleared.
+ * PostUpdate taking itself off its queue (bit 27 without 26) runs the game's code.
+ * MINA_NO_NATIVES=GameAnimUQ. */
+void f_9a7af0_orig(Ctx *c);
+void f_9a7b04_orig(Ctx *c);
+static int gameanim_uq_off = -1;
+static inline void gameanim_xform(Ctx *c, uint8_t *gm_, uint64_t O)
+{
+    uint32_t f = rt_ld32(GP(O + 0x1e4));
+    if ((f & 0x20) || ((f & 0x10) && rt_ld32(GP(O + 0x1dc)) == 4)) {
+        c->x[0] = O;
+        static const GuestFunc *ic;
+        RT_CALL_IC(c, rt_ld64(GP(lp(O) + 0x80)), ic);
+        f = rt_ld32(GP(O + 0x1e4));
+    }
+    rt_st32(GP(O + 0x1e4), f & ~0x20u);
+}
+void nat__ZN8GameAnim6UpdateEP20ycUpdateQueueContext(Ctx *c)
+{
+    if (gameanim_uq_off < 0)
+        gameanim_uq_off = rt_native_off("GameAnimUQ");
+    if (gameanim_uq_off) {
+        f_9a7af0_orig(c);
+        return;
+    }
+    GM_BEGIN;
+    const uint64_t O = c->x[0];
+    const float dt = ldfp(c->x[1] + 8) * ldfp(lp(O + 0x10) + 0x68);
+    nat__ZN8GameAnim12UpdateFacingEv(c);
+    if ((int32_t)rt_ld32(GP(O + 0x17c)) < 0) {
+        rt_st32(GP(O + 0x124), 0);
+    } else {
+        if (!*(uint8_t *)GP(O + 0x1c9)) {
+            c->x[0] = O;
+            c->x[1] = 1;
+            c->v[0] = vset_f32(dt);
+            nat__ZN21ycCutterAnimComponent11UpdateFrameEfb(c);
+        }
+        c->x[0] = O;
+        nat__ZN21ycCutterAnimComponent17UpdateRenderFrameEv(c);
+        if (*(uint8_t *)GP(O + 0x1c9)) {
+            c->x[0] = O;
+            c->x[1] = 0;
+            c->v[0] = vset_f32(dt);
+            nat__ZN21ycCutterAnimComponent11UpdateFrameEfb(c);
+        }
+    }
+    if (rt_ld64(GP(O + 0x3d8)) || (rt_ld32(GP(O + 0x1e4)) & (1u << 26)))
+        return;
+    gameanim_xform(c, gm_, O);
+}
+void nat__ZN8GameAnim10PostUpdateEP20ycUpdateQueueContext(Ctx *c)
+{
+    if (gameanim_uq_off < 0)
+        gameanim_uq_off = rt_native_off("GameAnimUQ");
+    GM_BEGIN;
+    const uint64_t O = c->x[0];
+    const uint32_t f = rt_ld32(GP(O + 0x1e4));
+    if (gameanim_uq_off || ((f & (1u << 27)) && !(f & (1u << 26)))) {
+        f_9a7b04_orig(c);
+        return;
+    }
+    gameanim_xform(c, gm_, O);
+}
+
+/* ---- CombatCore::Update (ycUpdateQueueContext), ~240 a world update: the timers (+0x268..0x288
+ * counted down while positive; the list at +0x108, count +0x1c8, entries dropped when done), then
+ * its defense (+0xd8) and attack (+0xd0) shapes' UpdateShapes (natives first: a "nothing changed"
+ * 0 skips the box comparison) and, when a box moved by 1e-6 or more, the core's data again;
+ * UpdateDamageDesc with an attack shape. The game's order and arithmetic. MINA_NO_NATIVES=CoreUQ. */
+void f_981fc4_orig(Ctx *c);
+void f_982398(Ctx *c);          /* CombatCore::UpdateCoreDefenseData */
+void f_98245c(Ctx *c);          /* CombatCore::UpdateCoreAttackData */
+void f_982588(Ctx *c);          /* CombatCore::UpdateDamageDesc */
+static int core_shape(Ctx *c, uint8_t *gm_, uint64_t O, uint32_t so, uint32_t names, uint32_t n, float dt)
+{
+    const uint64_t sh = lp(O + so);
+    float old[6];
+    memcpy(old, GP(sh + 0x14), sizeof old);
+    c->x[0] = sh;
+    c->x[1] = rt_ld64(GP(O + names));
+    c->x[2] = rt_ld32(GP(O + n));
+    c->v[0] = vset_f32(dt);
+    nat__ZN11CombatShape12UpdateShapesEfPPKcj(c);
+    if (!(uint32_t)c->x[0])
+        return 0;
+    const float eps = hexf(0x358637bdu);
+    const uint64_t sh2 = lp(O + so);      /* (read again, as the game does) */
+    for (int k = 0; k < 6; k++) {
+        float d = ldfp(sh2 + 0x14 + 4 * k) - old[k];
+        d = d > 0.0f ? d : -d;
+        if (!(d < eps))
+            return 1;
+    }
+    return 0;
+}
+static void core_update(Ctx *c);
+void nat__ZN10CombatCore6UpdateEP20ycUpdateQueueContext(Ctx *c)
+{
+    static int off = -1, verify = -1;
+    if (off < 0) {
+        off = rt_native_off("CoreUQ");
+        verify = getenv("MINA_VERIFY_CORE") != NULL;
+    }
+    if (off) {
+        f_981fc4_orig(c);
+        return;
+    }
+    if (!verify) {
+        core_update(c);
+        return;
+    }
+    /* MINA_VERIFY_CORE=1: the core and its two shapes after this one and after the game's code
+     * (a pointer set from 0 at the attack shape's +0x100 differs: each run allocates its block) */
+    GM_BEGIN;
+    static uint32_t checked, bad;
+    static uint8_t b[3][0x300], m[3][0x300];
+    const uint64_t O = c->x[0], ob[3] = { O, lp(O + 0xd8), lp(O + 0xd0) };
+    for (int k = 0; k < 3; k++)
+        if (ob[k])
+            memcpy(b[k], GP(ob[k]), 0x300);
+    const Ctx save = *c;
+    core_update(c);
+    for (int k = 0; k < 3; k++)
+        if (ob[k])
+            memcpy(m[k], GP(ob[k]), 0x300), memcpy(GP(ob[k]), b[k], 0x300);
+    *c = save;
+    f_981fc4_orig(c);
+    checked++;
+    for (int k = 0; k < 3; k++)
+        if (ob[k] && memcmp(m[k], GP(ob[k]), 0x300) && bad++ < 10) {
+            unsigned i = 0;
+            while (m[k][i] == ((uint8_t *)GP(ob[k]))[i]) i++;
+            {
+                uint64_t a, g;
+                memcpy(&a, m[k] + (i & ~7u), 8);
+                memcpy(&g, GP(ob[k] + (i & ~7u)), 8);
+                rt_log("[verify] CombatCore::Update differs: object %d at +%#x: mine %#llx, game %#llx (was %#llx)\n", k, i,
+                       (unsigned long long)a, (unsigned long long)g,
+                       (unsigned long long)({ uint64_t w_; memcpy(&w_, b[k] + (i & ~7u), 8); w_; }));
+            }
+        }
+    if ((checked & 0xfff) == 0)
+        rt_log("[verify] CombatCore::Update: %u checked, %u differ\n", checked, bad);
+}
+static void core_update(Ctx *c)
+{
+    GM_BEGIN;
+    const uint64_t O = c->x[0];
+    const float dt = ldfp(c->x[1] + 8) * ldfp(lp(O + 0x10) + 0x68);
+    stfp(O + 0x1e4, ldfp(O + 0x1e0));
+    for (uint32_t o = 0x268; o <= 0x288; o += 4) {
+        const float v = ldfp(O + o);
+        if (v > 0.0f)
+            stfp(O + o, v - dt);
+    }
+    for (uint32_t i = 0; i < rt_ld32(GP(O + 0x1c8)); i++) {
+        const uint64_t e = O + 0x108 + 8ull * i;
+        const float v = ldfp(e) - dt;
+        stfp(e, v);
+        if (v > 0.0f)
+            continue;
+        const uint32_t n = rt_ld32(GP(O + 0x1c8));
+        rt_st64(GP(e), rt_ld64(GP(O + 0x108 + 8ull * (n - 1))));
+        rt_st32(GP(O + 0x1c8), n - 1);
+        i--;
+    }
+    const uint64_t D = lp(O + 0xd8);
+    if (D && core_shape(c, gm_, O, 0xd8, 0xc0, 0xcc, dt)) {
+        c->x[0] = O;
+        f_982398(c);
+    }
+    const uint64_t A = lp(O + 0xd0);
+    if (!A)
+        return;
+    if (core_shape(c, gm_, O, 0xd0, 0xb8, 0xc8, dt)) {
+        c->x[0] = O;
+        f_98245c(c);
+    }
+    c->x[0] = O;
+    f_982588(c);
 }
 
 /* ---- ShipIntroBossArm::ApplySpline ------------------------------------------------------------
@@ -4472,6 +4800,7 @@ static void process_attack_list(Ctx *c, int dry)
 
 void nat__ZN13CombatManager17ProcessAttackListEi(Ctx *c)
 {
+    CALLS(7);
     if (combat_rec_on < 0)
         combat_rec_on = getenv("MINA_VERIFY_COMBAT") != NULL;
     if (combat_rec_on > 0) {
@@ -5723,6 +6052,7 @@ void nat__ZNK16ycPaletteTexture12FindFromBaseERK7ycColorPKS_(Ctx *c)
 }
 void nat__ZNK16ycPaletteTexture8GetIndexE7ycColorb(Ctx *c)
 {
+    CALLS(10);
     GM_BEGIN;
     {
         static CallerHist h = { .what = "ycPaletteTexture::GetIndex" };
@@ -5786,6 +6116,9 @@ static void uq_report(void)
     uq_runs = 0;
     uq_total_us = 0;
 }
+void nat__ZN8GameAnim6UpdateEP20ycUpdateQueueContext(Ctx *c);
+void nat__ZN8GameAnim10PostUpdateEP20ycUpdateQueueContext(Ctx *c);
+void nat__ZN10CombatCore6UpdateEP20ycUpdateQueueContext(Ctx *c);
 void nat__ZN13ycUpdateQueue6UpdateEf(Ctx *c)
 {
     static int on = -1;
@@ -5860,7 +6193,16 @@ void nat__ZN13ycUpdateQueue6UpdateEf(Ctx *c)
             if (!on) {
                 /* the callback through a cache of the last target per hash of its address */
                 static const GuestFunc *ic[256];
-                RT_CALL_IC(c, fn, ic[(uint32_t)fn >> 2 & 255]);
+                CALLS(11);
+                /* the most called callbacks straight to their natives */
+                if (fn == 0x19a7af0ull)
+                    nat__ZN8GameAnim6UpdateEP20ycUpdateQueueContext(c);
+                else if (fn == 0x19a7b04ull)
+                    nat__ZN8GameAnim10PostUpdateEP20ycUpdateQueueContext(c);
+                else if (fn == 0x1981fc4ull)
+                    nat__ZN10CombatCore6UpdateEP20ycUpdateQueueContext(c);
+                else
+                    RT_CALL_IC(c, fn, ic[(uint32_t)fn >> 2 & 255]);
                 continue;
             }
             const uint64_t t = now_us();
@@ -5926,6 +6268,7 @@ static inline int zones_on(void)
 void f_1b156c_orig(Ctx *c);
 void nat__ZN18ycPaletteComponent6UpdateEf(Ctx *c)
 {
+    CALLS(8);
     static int skip = -1;               /* (measurement) */
     if (skip < 0)
         skip = getenv("MINA_SKIP_PAL") != NULL;
@@ -5943,7 +6286,33 @@ void nat__ZN18ycPaletteComponent6UpdateEf(Ctx *c)
         pal_gen++;
         pal_avoid = (uint32_t)lp(lp(c->x[0] + 0x88) + 0x18);
     }
+    const uint64_t comp = c->x[0];
     f_1b156c_orig(c);
+    static int calls_on = -1;
+    if (calls_on < 0)
+        calls_on = getenv("MINA_CALLS") != NULL;
+    if (calls_on) {
+        /* (MINA_CALLS) the component's palette after it: the same as the last time? */
+        GM_BEGIN;
+        const uint64_t P = lp(comp + 0x88);
+        uint32_t h = 2166136261u;
+        if (P) {
+            const uint32_t n = rt_ld32(GP(P + 0x28)) & 0x3ff;
+            const uint8_t *cols = GP(lp(P + 0x18)), *idx = GP(lp(P + 0x10));
+            for (uint32_t i = 0; i < n * 4; i++)
+                h = (h ^ cols[i]) * 16777619u;
+            if (lp(P + 0x10))
+                for (uint32_t i = 0; i < n; i++)
+                    h = (h ^ idx[i]) * 16777619u;
+            h ^= (uint32_t)rt_ld64(GP(P));
+        }
+        static uint32_t key[1024], val[1024];
+        const uint32_t k = ((uint32_t)comp >> 3) * 2654435761u >> 22;
+        if (key[k] == (uint32_t)comp && val[k] == h)
+            CALLS(12);
+        key[k] = (uint32_t)comp;
+        val[k] = h;
+    }
     pal_scope = was;
     pal_avoid = avoid;
     pal_gen++;
@@ -7172,6 +7541,7 @@ static void pae_setup(PaeCtx *k, uint64_t I)
 }
 static uint32_t pal_anim_entry(Ctx *c)
 {
+    CALLS(9);
     GM_BEGIN;
     const uint64_t E = c->x[0], I = c->x[1];
     float dt = c->v[0].f[0];

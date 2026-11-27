@@ -3168,6 +3168,22 @@ void metal_present(uint64_t drawable)
                         rt_log("[fps]   zones (ms per frame):%s\n", zb);
                     }
                 }
+                {
+                    extern uint32_t g_calls[16];
+                    extern const char *const g_call_name[16];
+                    static int on = -1;
+                    if (on < 0)
+                        on = getenv("MINA_CALLS") != NULL;
+                    if (on && g_fixed_updates) {
+                        char cb[512];
+                        int cn = 0;
+                        for (int k = 0; k < 16 && g_call_name[k]; k++)
+                            cn += snprintf(cb + cn, sizeof cb - (size_t)cn, " %s %.1f", g_call_name[k],
+                                           g_calls[k] / (double)g_fixed_updates);
+                        rt_log("[fps]   calls per fixed update:%s\n", cb);
+                    }
+                    memset(g_calls, 0, sizeof g_calls);
+                }
                 g_composites = g_bounds = 0;
                 g_depth_fs_draws = g_depth_restarts = 0;
 #if defined(__vita__) && defined(MINA_VGL_DBG)

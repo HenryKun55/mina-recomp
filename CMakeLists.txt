@@ -138,7 +138,9 @@ if(VITA)
     ScePower_stub SceAppMgr_stub SceAppUtil_stub SceIme_stub SceLibKernel_stub SceProcessmgr_stub
     SceIofilemgr_stub stdc++ pthread m c)
   # scripted pad input (MINA_INPUT "vita:<button>") joins the real pad's (runtime/src/sdl.c)
-  target_link_options(mina PRIVATE -Wl,--wrap=sceCtrlPeekBufferPositive2)
+  # room after the code for vita-elf-create's SCE data (4 KiB+): without it the link fails when
+  # the code happens to end just short of a 64 KiB boundary ("segment 1 overlaps")
+  target_link_options(mina PRIVATE -Wl,--wrap=sceCtrlPeekBufferPositive2 -Wl,--defsym=__sce_headroom=0x2000)
   if(MINA_LTO)
     target_link_options(mina PRIVATE -flto=auto ${MINA_ARCH_FLAGS} -ffp-contract=off -fno-strict-aliasing)
   endif()
