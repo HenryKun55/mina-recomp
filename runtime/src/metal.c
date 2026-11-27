@@ -3169,15 +3169,15 @@ void metal_present(uint64_t drawable)
                     }
                 }
                 {
-                    extern uint32_t g_calls[16];
-                    extern const char *const g_call_name[16];
+                    extern uint32_t g_calls[24];
+                    extern const char *const g_call_name[24];
                     static int on = -1;
                     if (on < 0)
                         on = getenv("MINA_CALLS") != NULL;
                     if (on && g_fixed_updates) {
                         char cb[512];
                         int cn = 0;
-                        for (int k = 0; k < 16 && g_call_name[k]; k++)
+                        for (int k = 0; k < 24 && g_call_name[k]; k++)
                             cn += snprintf(cb + cn, sizeof cb - (size_t)cn, " %s %.1f", g_call_name[k],
                                            g_calls[k] / (double)g_fixed_updates);
                         rt_log("[fps]   calls per fixed update:%s\n", cb);

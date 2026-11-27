@@ -29,11 +29,13 @@ static uint64_t now_us(void)
 #define lp(a) ((uint64_t)rt_ld32(GP(a)))
 /* MINA_CALLS=1: calls per fixed update of a few hot functions in the [fps] lines (the counts
  * always kept: one add each) */
-uint32_t g_calls[16];
-const char *const g_call_name[16] = { "RecalcWorld", "DerivedState", "UpdateFrame", "RenderFrame", "RenderFrameFast",
+uint32_t g_calls[24];
+const char *const g_call_name[24] = { "RecalcWorld", "DerivedState", "UpdateFrame", "RenderFrame", "RenderFrameFast",
                                       "Shapes", "ShapesFast", "AttackList", "PalComp", "PalAnimEntry", "GetIndex",
-                                      "UQItems", "PalSame", NULL };
+                                      "UQItems", "PalSame", "PalNoEntry", "PalNoEntryUs", "PalEntryUs",
+                                      "PalOff", "PalSkipped", NULL };
 #define CALLS(k) (g_calls[k]++)
+static int g_calls_on;           /* MINA_CALLS set (read once at the first palette update) */
 #define ldfp(a) ({ float f_; memcpy(&f_, GP(a), 4); f_; })
 #define stfp(a, v) do { float f_ = (v); memcpy(GP(a), &f_, 4); } while (0)
 
@@ -6266,6 +6268,9 @@ static inline int zones_on(void)
         g_zone_us[k] += now_us() - t;                                                                     \
     }
 void f_1b156c_orig(Ctx *c);
+static int pm_try(Ctx *c, float dt);
+static void pm_after(Ctx *c, uint64_t comp);
+static void pm_verify(Ctx *c, uint64_t comp, const uint8_t *ents, uint64_t ne);
 void nat__ZN18ycPaletteComponent6UpdateEf(Ctx *c)
 {
     CALLS(8);
@@ -6287,10 +6292,49 @@ void nat__ZN18ycPaletteComponent6UpdateEf(Ctx *c)
         pal_avoid = (uint32_t)lp(lp(c->x[0] + 0x88) + 0x18);
     }
     const uint64_t comp = c->x[0];
-    f_1b156c_orig(c);
+    {
+        /* a step that would give the same palette: only the entries' times advance (pm_try) */
+        static int verify = -1;
+        if (verify < 0)
+            verify = getenv("MINA_VERIFY_PALSKIP") != NULL;
+        GM_BEGIN;
+        const uint64_t x0 = c->x[0];
+        const V128 v0 = c->v[0];
+        static uint8_t ents[16 * 0x58];
+        const uint64_t vec = lp(comp + 0x198), ne = rt_ld64(GP(comp + 0x1a0));
+        if (verify && ne <= 16)
+            memcpy(ents, GP(vec), ne * 0x58);
+        const int skip = pm_try(c, v0.f[0]);
+        c->x[0] = x0;
+        c->v[0] = v0;
+        if (skip) {
+            CALLS(17);
+            if (verify && ne <= 16)
+                pm_verify(c, comp, ents, ne);
+            pal_scope = was;
+            pal_avoid = avoid;
+            pal_gen++;
+            return;
+        }
+    }
     static int calls_on = -1;
     if (calls_on < 0)
-        calls_on = getenv("MINA_CALLS") != NULL;
+        g_calls_on = calls_on = getenv("MINA_CALLS") != NULL;
+    uint64_t t0 = 0;
+    int ne = 0;
+    if (calls_on) {
+        GM_BEGIN;
+        ne = rt_ld64(GP(comp + 0x1a0)) == 0;
+        if (!*(uint8_t *)GP(comp + 0xd0) || !*(uint8_t *)GP(comp + 0xd1))
+            CALLS(16);
+        if (ne)
+            CALLS(13);
+        t0 = now_us();
+    }
+    f_1b156c_orig(c);
+    if (calls_on)
+        g_calls[ne ? 14 : 15] += (uint32_t)(now_us() - t0);
+    pm_after(c, comp);
     if (calls_on) {
         /* (MINA_CALLS) the component's palette after it: the same as the last time? */
         GM_BEGIN;
@@ -7799,6 +7843,370 @@ void nat__ZN18ycPaletteAnimEntry6UpdateEfPNS_10UpdateInfoE(Ctx *c)
     if ((checked & 0x3ff) == 0)
         rt_log("[verify] PaletteAnimEntry: %u checked, %u differ, %u skipped (a resource let go)\n", checked, bad,
                skipped);
+}
+
+/* ---- ycPaletteComponent::Update: a step that would give the same palette is skipped ----------
+ * Each step the game resets the component's palette (x28 = comp+0x88) to its base (the resource
+ * at comp+0x90 taken, or the palette at comp+0x90 written in), runs its animation entries (a frame
+ * palette and a cycled range of colors each, ycPaletteAnimEntry::Update) over it, maps the colors
+ * that changed to the global palette's indices and queues the texture's upload: ~150 us for each
+ * of the 26 animated components on hub_overworld_south, where 92% end the step as they began it.
+ * The result is a function of: the palette's state (header but its upload flags +0x3c/+0x3d,
+ * colors, indices), the global palette (the table's entry +0x30) and the base, and per entry its
+ * fields and what its time selects (frame, flags, range, offset of the cycle: the values
+ * AnimateScalar gives at the new time). When all of them are as at the end of the last step that
+ * ran (no color left dirty), that step's result is already there: only the entries' times (and
+ * loop counts) advance, as the game's code would. Anything else (an entry running out of loops,
+ * a slot or signature full) runs the game's code, which is then recorded.
+ * MINA_NO_NATIVES=PalSkip. MINA_VERIFY_PALSKIP=1: a skip is checked against the game's code. */
+#define PM_SLOTS 40
+#define PM_SIG 384
+#define PM_COLS 512
+typedef struct {
+    uint32_t comp, used, valid, nsig, n, gn, bn, dver;
+    uint32_t sig[PM_SIG];
+    uint8_t hdr[0x40], ghdr[0x40], bhdr[0x40];
+    uint32_t cols[PM_COLS], gcols[PM_COLS], bcols[PM_COLS];
+    uint8_t idx[PM_COLS];
+} PalMemo;
+static PalMemo pm_slot[PM_SLOTS];
+static uint32_t pm_use;
+static PalMemo *pm_find(uint32_t comp, int make)
+{
+    int lru = 0;
+    for (int k = 0; k < PM_SLOTS; k++) {
+        if (pm_slot[k].comp == comp)
+            return &pm_slot[k];
+        if (pm_slot[k].used < pm_slot[lru].used)
+            lru = k;
+    }
+    if (!make)
+        return NULL;
+    PalMemo *m = &pm_slot[lru];
+    m->comp = comp;
+    m->valid = 0;
+    return m;
+}
+static inline uint64_t pm_global(uint8_t *gm_, uint64_t P)
+{
+    const int32_t i = (int32_t)rt_ld32(GP(P + 0x30));
+    return i < 0 ? 0 : rt_ld64(GP(0x60210b8)) + 0x40ull * (uint32_t)i;
+}
+/* the state compared (and recorded): x28's header (upload flags zeroed), own colors and indices;
+ * the global palette's and the base's headers and colors. 0: doesn't fit. */
+typedef struct { uint8_t hdr[0x40], ghdr[0x40], bhdr[0x40]; uint32_t n, gn, bn, ncol, gcol, bcol, idx; } PmState;
+static int pm_state(uint8_t *gm_, uint64_t comp, PmState *s)
+{
+    const uint64_t P = lp(comp + 0x88), G = pm_global(gm_, P), B = comp + 0x90;
+    memcpy(s->hdr, GP(P), 0x40);
+    s->hdr[0x3c] = s->hdr[0x3d] = 0;
+    memset(s->hdr + 0x38, 0, 4);          /* the version: advanced by the last step's delta instead */
+    s->n = rt_ld32(GP(P + 0x28));
+    s->ncol = (uint32_t)lp(P + 0x18);
+    s->idx = (uint32_t)lp(P + 0x10);
+    if (s->n > PM_COLS || (s->n && !s->ncol))
+        return 0;
+    memset(s->ghdr, 0, 0x40);
+    s->gn = 0;
+    s->gcol = 0;
+    if (G) {
+        memcpy(s->ghdr, GP(G), 0x40);
+        s->ghdr[0x3c] = s->ghdr[0x3d] = 0;
+        pal_colors(gm_, G, &s->gn, &s->gcol);
+        if (s->gn > PM_COLS)
+            return 0;
+    }
+    memcpy(s->bhdr, GP(B), 0x40);
+    s->bhdr[0x3c] = s->bhdr[0x3d] = 0;
+    pal_colors(gm_, B, &s->bn, &s->bcol);
+    return s->bn <= PM_COLS;
+}
+/* the entries' signature at their new times (into sig, its length; -1: no skip possible) and the
+ * times and loop counts they'd store */
+typedef struct { float t; int32_t loops; } PmTime;
+static int pm_signature(Ctx *c, uint8_t *gm_, uint64_t comp, float dt, uint32_t *sig, PmTime *tm, int maxe)
+{
+    const uint64_t vec = lp(comp + 0x198), ne = rt_ld64(GP(comp + 0x1a0));
+    if (!ne || ne > (uint64_t)maxe)
+        return -1;
+    int32_t w26 = INT32_MIN;
+    for (uint64_t j = 0; j < ne; j++) {
+        const int32_t p = (int32_t)rt_ld32(GP(vec + 0x58 * j + 0x18));
+        w26 = w26 > p ? w26 : p;
+    }
+    PaeCtx k = { c, gm_, c->sp - 0x100 };
+    int n = 0;
+#define PM_PUSH(v) do { if (n >= PM_SIG) return -1; sig[n++] = (uint32_t)(v); } while (0)
+    for (uint64_t j = 0; j < ne; j++) {
+        const uint64_t E = vec + 0x58 * j;
+        /* the time, as pal_anim_entry advances it */
+        float t;
+        int32_t loops = (int32_t)rt_ld32(GP(E + 0x2c));
+        if (!loops) {
+            t = ldfp(E + 0x20);
+        } else {
+            const float rate = ldfp(E + 0x28), dur = ldfp(E + 0x24);
+            t = ldfp(E + 0x20) + rate * dt;
+            if (!(dur > 0.0f)) {
+            } else if (rate >= 0.0f) {
+                const float lim = dur + hexf(0xba83126fu);
+                if (t >= lim) {
+                    for (;;) {
+                        const int32_t l1 = loops - 1;
+                        if (l1 >= 0) {
+                            loops = l1;
+                            if (l1 == 0)
+                                return -1;          /* runs out: the entry goes */
+                        }
+                        t = t - dur;
+                        if (t < lim || t != t)
+                            break;
+                    }
+                }
+            } else {
+                const float lim = hexf(0x3a83126fu);
+                if (!(t > lim || t != t)) {
+                    for (;;) {
+                        const int32_t l1 = loops - 1;
+                        if (l1 >= 0) {
+                            loops = l1;
+                            if (l1 == 0)
+                                return -1;
+                        }
+                        t = dur + t;
+                        if (t > lim || t != t)
+                            break;
+                    }
+                }
+            }
+        }
+        tm[j].t = t;
+        tm[j].loops = loops;
+        const uint64_t look = L64(E), res = L64(E + 8), subv = lp(res + 0x10), wfb = L64(E + 0x10);
+        PM_PUSH(E);
+        PM_PUSH(look);
+        PM_PUSH(res);
+        PM_PUSH(wfb);
+        PM_PUSH(rt_ld32(GP(E + 0x18)));
+        PM_PUSH(rt_ld32(GP(E + 0x1c)));
+        PM_PUSH(*(uint8_t *)GP(E + 0x50));
+        if (wfb) {
+            /* the palette written from: its header and colors */
+            uint32_t wn, wc;
+            pal_colors(gm_, wfb, &wn, &wc);
+            if (wn > PM_COLS)
+                return -1;
+            uint64_t h = 1469598103934665603ull;
+            const uint8_t *p = GP(wfb);
+            for (int q = 0; q < 0x40; q++)
+                if (q != 0x3c && q != 0x3d)
+                    h = (h ^ p[q]) * 1099511628211ull;
+            p = GP(wc);
+            for (uint32_t q = 0; q < wn * 4; q++)
+                h = (h ^ p[q]) * 1099511628211ull;
+            PM_PUSH(h);
+            PM_PUSH(h >> 32);
+        }
+        const uint64_t nsub = L64(subv) >> 34;
+        PM_PUSH(nsub);
+        if (!nsub || (int32_t)rt_ld32(GP(E + 0x18)) < w26)
+            continue;
+        const uint64_t subs = L64(subv + 8);
+        uint64_t acc = 0;
+        for (uint64_t si = 0; si < nsub; si++) {
+            const uint64_t sub = subs + si * 0x48;
+            const uint64_t m = L64(sub + 0x10) >> 34;
+            if (!((rt_ld32(GP(E + 0x1c)) >> ((uint32_t)si & 31)) & 1)) {
+                acc += m;
+                continue;
+            }
+            const int32_t first_frame = (int32_t)rt_ld32(GP(pae_scalar(&k, look, sub + 0x24, t)));
+            const float fr_rate = ldfp(pae_scalar(&k, look, sub + 0x28, t));
+            const int32_t fi = posmod32(first_frame + fcvtzs32(t * fr_rate), (int32_t)(uint32_t)m);
+            const uint64_t R = L64(lp(res + 0x18) + (acc + (uint64_t)(int64_t)fi) * 8);
+            PM_PUSH(si);
+            PM_PUSH(R);
+            PM_PUSH(R >> 32);
+            PM_PUSH(*(uint8_t *)GP(pae_scalar(&k, look, sub + 0x20, t)));
+            PM_PUSH(rt_ld32(GP(pae_scalar(&k, look, sub + 0x34, t))));
+            PM_PUSH(rt_ld32(GP(pae_scalar(&k, look, sub + 0x38, t))));
+            PM_PUSH(rt_ld32(GP(pae_scalar(&k, look, sub + 0x2c, t))));
+            PM_PUSH(rt_ld32(GP(pae_scalar(&k, look, sub + 0x30, t))));
+            const float off = ldfp(pae_scalar(&k, look, sub + 0x3c, t));
+            const float speed = ldfp(pae_scalar(&k, look, sub + 0x40, t));
+            PM_PUSH(fcvtzs32(off + t * speed));
+            acc += m;
+        }
+    }
+#undef PM_PUSH
+    return n;
+}
+static uint32_t pm_why[8];
+static int pm_same(uint8_t *gm_, const PalMemo *m, const PmState *s, uint64_t comp)
+{
+    if (memcmp(m->hdr, s->hdr, 0x40)) {
+        pm_why[0]++;
+        return 0;
+    }
+    if (memcmp(m->ghdr, s->ghdr, 0x40) || m->gn != s->gn) {
+        pm_why[1]++;
+        return 0;
+    }
+    if (memcmp(m->bhdr, s->bhdr, 0x40) || m->n != s->n || m->bn != s->bn) {
+        pm_why[2]++;
+        return 0;
+    }
+    const uint64_t P = lp(comp + 0x88);
+    if (s->n) {
+        if (memcmp(m->cols, GP(s->ncol), s->n * 4)) {
+            pm_why[3]++;
+            return 0;
+        }
+        if (s->idx && memcmp(m->idx, GP(s->idx), s->n)) {
+            pm_why[4]++;
+            return 0;
+        }
+        const uint64_t dirty = lp(P + 0x20);
+        if (dirty) {
+            const uint8_t *d = GP(dirty);
+            for (uint32_t i = 0; i < s->n; i++)
+                if (d[i]) {
+                    pm_why[5]++;
+                    return 0;
+                }
+        }
+    }
+    if (s->gn && memcmp(m->gcols, GP(s->gcol), s->gn * 4)) {
+        pm_why[6]++;
+        return 0;
+    }
+    if (s->bn && memcmp(m->bcols, GP(s->bcol), s->bn * 4))
+        return 0;
+    return 1;
+}
+static void pm_record(uint8_t *gm_, PalMemo *m, const PmState *s)
+{
+    memcpy(m->hdr, s->hdr, 0x40);
+    memcpy(m->ghdr, s->ghdr, 0x40);
+    memcpy(m->bhdr, s->bhdr, 0x40);
+    m->n = s->n;
+    m->gn = s->gn;
+    m->bn = s->bn;
+    if (s->n) {
+        memcpy(m->cols, GP(s->ncol), s->n * 4);
+        if (s->idx)
+            memcpy(m->idx, GP(s->idx), s->n);
+    }
+    if (s->gn)
+        memcpy(m->gcols, GP(s->gcol), s->gn * 4);
+    if (s->bn)
+        memcpy(m->bcols, GP(s->bcol), s->bn * 4);
+}
+/* 1: skipped (the entries' times advanced); 0: run the game's code and call pm_after */
+static uint32_t pm_sig_tmp[PM_SIG];
+static PmTime pm_tm[16];
+static int pm_pending_sig = -1;
+static PalMemo *pm_pending;
+static int pm_try(Ctx *c, float dt)
+{
+    static int off = -1;
+    if (off < 0)
+        off = rt_native_off("PalSkip");
+    pm_pending = NULL;
+    if (off)
+        return 0;
+    GM_BEGIN;
+    const uint64_t comp = c->x[0];
+    if (!*(uint8_t *)GP(comp + 0xd0) || !*(uint8_t *)GP(comp + 0xd1) || !lp(comp + 0x88))
+        return 0;
+    const int n = pm_signature(c, gm_, comp, dt, pm_sig_tmp, pm_tm, 16);
+    if (n < 0)
+        return 0;
+    PalMemo *m = pm_find((uint32_t)comp, 1);
+    m->used = ++pm_use;
+    PmState s;
+    if (m->valid && !((int)m->nsig == n && !memcmp(m->sig, pm_sig_tmp, n * 4)))
+        pm_why[7]++;
+    if (g_calls_on && (pm_use & 0x3fff) == 0)
+        rt_log("[pm] not skipped: header %u, global %u, base %u, colors %u, indices %u, dirty %u, global colors %u, signature %u\n",
+               pm_why[0], pm_why[1], pm_why[2], pm_why[3], pm_why[4], pm_why[5], pm_why[6], pm_why[7]);
+    if (m->valid && (int)m->nsig == n && !memcmp(m->sig, pm_sig_tmp, n * 4) && pm_state(gm_, comp, &s) &&
+        pm_same(gm_, m, &s, comp)) {
+        const uint64_t P = lp(comp + 0x88);
+        rt_st32(GP(P + 0x38), rt_ld32(GP(P + 0x38)) + m->dver);
+        const uint64_t vec = lp(comp + 0x198), ne = rt_ld64(GP(comp + 0x1a0));
+        for (uint64_t j = 0; j < ne; j++) {
+            const uint64_t E = vec + 0x58 * j;
+            if (rt_ld32(GP(E + 0x2c))) {
+                stfp(E + 0x20, pm_tm[j].t);
+                rt_st32(GP(E + 0x2c), (uint32_t)pm_tm[j].loops);
+            }
+        }
+        return 1;
+    }
+    m->valid = 0;
+    memcpy(m->sig, pm_sig_tmp, n * 4);
+    m->dver = rt_ld32(GP(lp(comp + 0x88) + 0x38));      /* (the version before: pm_after takes the delta) */
+    pm_pending = m;
+    pm_pending_sig = n;
+    return 0;
+}
+/* after the game's code ran on a component pm_try let through: its result recorded */
+static void pm_after(Ctx *c, uint64_t comp)
+{
+    PalMemo *m = pm_pending;
+    pm_pending = NULL;
+    if (!m || m->comp != (uint32_t)comp)
+        return;
+    GM_BEGIN;
+    PmState s;
+    if (!pm_state(gm_, comp, &s))
+        return;
+    pm_record(gm_, m, &s);
+    m->dver = rt_ld32(GP(lp(comp + 0x88) + 0x38)) - m->dver;
+    m->nsig = (uint32_t)pm_pending_sig;
+    m->valid = 1;
+}
+
+/* MINA_VERIFY_PALSKIP: after a skip, the palette (header but upload flags, colors, indices) and
+ * the entries as they are, against the game's code run from the entries as they were */
+static void pm_verify(Ctx *c, uint64_t comp, const uint8_t *ents, uint64_t ne)
+{
+    GM_BEGIN;
+    static uint32_t checked, bad;
+    static uint8_t mine_e[16 * 0x58], mine_c[PM_COLS * 4], mine_i[PM_COLS], hdr[0x40];
+    const uint64_t P = lp(comp + 0x88), vec = lp(comp + 0x198);
+    const uint32_t n = rt_ld32(GP(P + 0x28));
+    const uint64_t cols = lp(P + 0x18), idx = lp(P + 0x10);
+    if (n > PM_COLS)
+        return;
+    memcpy(mine_e, GP(vec), ne * 0x58);
+    memcpy(hdr, GP(P), 0x40);
+    if (n && cols)
+        memcpy(mine_c, GP(cols), n * 4);
+    if (n && idx)
+        memcpy(mine_i, GP(idx), n);
+    memcpy(GP(vec), ents, ne * 0x58);
+    const uint64_t sp = c->sp;
+    f_1b156c_orig(c);
+    c->sp = sp;
+    checked++;
+    const char *what = NULL;
+    uint8_t h2[0x40];
+    memcpy(h2, GP(P), 0x40);
+    hdr[0x3c] = hdr[0x3d] = h2[0x3c] = h2[0x3d] = 0;
+    if (rt_ld64(GP(comp + 0x1a0)) != ne || memcmp(mine_e, GP(vec), ne * 0x58))
+        what = "entries";
+    else if (memcmp(hdr, h2, 0x40))
+        what = "header";
+    else if (n && cols && memcmp(mine_c, GP(cols), n * 4))
+        what = "colors";
+    else if (n && idx && memcmp(mine_i, GP(idx), n))
+        what = "indices";
+    if (what && bad++ < 20)
+        rt_log("[verify] palette skip of %#llx differs: %s\n", (unsigned long long)comp, what);
+    if ((checked & 0x3ff) == 0)
+        rt_log("[verify] palette skips: %u checked, %u differ\n", checked, bad);
 }
 
 #if defined(__vita__)
