@@ -216,7 +216,11 @@ static void rate_frame(uint64_t update_us)
         if ((late >= 4 && avg > 10.0) || avg > 15.0) {
             /* a window with a long hitch (a load, a room) says little: soon again; else the
              * wait doubles while tries fail (a failed try is half a second of 2-step frames) */
-            if (worst > 50.0 || held >= 10) {
+            /* (the window's average without its worst frame: a hitch on top of steps that
+             * don't fit is a failure all the same; on the console the hub flipped 30/60 every
+             * few seconds, each flip a jolt) */
+            const double rest = frames > 1 ? (sum_us - max_us) / 1000.0 / (frames - 1) : avg;
+            if ((worst > 50.0 && rest < 12.0) || held >= 10) {
                 wait = 1;
                 fail_ref = 0;
             } else {
@@ -2779,6 +2783,20 @@ void f_cb1ac_orig(Ctx *c);
 void nat__ZN7ycAudio7Decoder10ThreadMainEPv(Ctx *c)
 {
     pin_to_core(2, "audio decoder");
+#if defined(__vita__)
+    /* The decoders (Vorbis: the bank's short effects decoded whole when it loads, ~29 MiB
+     * of PCM at the title, and the playing streams' rings) shared the sound core with the
+     * mixer: at the start the music's rings ran dry behind the effects (choppy, late music)
+     * while the game's core idled. Below the game thread's and the mixer's priority, on
+     * either core: they take only the time those leave. MINA_DEC_CORE2: the sound core only. */
+    if (!getenv("MINA_DEC_CORE2")) {
+        const int p = sceKernelGetThreadCurrentPriority();
+        const int r1 = sceKernelChangeThreadPriority(0, p + 8);
+        const int r2 = sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(),
+                                                            SCE_KERNEL_CPU_MASK_USER_0 | SCE_KERNEL_CPU_MASK_USER_2);
+        rt_log("[thread] audio decoder: priority %d -> %d (%#x), cores 0 and 2 (%#x)\n", p, p + 8, r1, r2);
+    }
+#endif
     f_cb1ac_orig(c);
 }
 

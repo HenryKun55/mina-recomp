@@ -1343,9 +1343,12 @@ static void d_newBufferWithLength(Ctx *c)
     const uint64_t t2 = a_now();
     if (t2 - t0 > 8000) {          /* where a slow one went (the console's spikes) */
         static int told;
-        if (told++ < 40)
-            rt_log("[buf] new %u-byte buffer: %.1f ms (giving back older ones %.1f, its memory %.1f)\n", b->length,
-                   (t2 - t0) / 1000.0, (t1 - t0) / 1000.0, (t2 - t1) / 1000.0);
+        extern uint64_t g_gb_us[5];
+        if (told++ < 400)
+            rt_log("[buf] new %u-byte buffer: %.1f ms (giving back older ones %.1f: lock %.1f scan %.1f copy %.1f "
+                   "lock %.1f clear %.1f; its memory %.1f)\n", b->length, (t2 - t0) / 1000.0, (t1 - t0) / 1000.0,
+                   g_gb_us[0] / 1000.0, g_gb_us[1] / 1000.0, g_gb_us[2] / 1000.0, g_gb_us[3] / 1000.0,
+                   g_gb_us[4] / 1000.0, (t2 - t1) / 1000.0);
     }
     RET(o);
 }
@@ -2465,9 +2468,13 @@ uint32_t metal_buf_mem_(MBuffer *b)
  * newBufferWithLength 10-17 ms on the console. The buffer is marked read meanwhile (not
  * given back twice); if its memory is asked for again meanwhile, it stays. Called without
  * the staging lock held. */
+uint64_t g_gb_us[5];     /* the last give-back: lock wait, scan, copy, lock again, clear */
 int metal_buf_give_back(MBuffer *b)
 {
+    uint64_t a_now(void);
+    uint64_t gt = a_now();
     metal_staging_lock();
+    { const uint64_t t = a_now(); g_gb_us[0] = t - gt; gt = t; }
     if (!b->contents || b->gpu_only || b->fresh || b->keep_contents || b->reading) {
         metal_staging_unlock();
         return 0;
@@ -2477,6 +2484,7 @@ int metal_buf_give_back(MBuffer *b)
     metal_staging_unlock();
     const uint8_t *m = G(mem);
     const uint32_t len = used_len(mem, b->length);
+    { const uint64_t t = a_now(); g_gb_us[1] = t - gt; gt = t; }
     if (getenv("MINA_STAGINGLOG")) {
         uint32_t first = 0;
         while (first < len && m[first] == 0)
@@ -2486,7 +2494,9 @@ int metal_buf_give_back(MBuffer *b)
     uint8_t *keepb = len ? malloc(len) : NULL;
     if (len && keepb)
         memcpy(keepb, m, len);
+    { const uint64_t t = a_now(); g_gb_us[2] = t - gt; gt = t; }
     metal_staging_lock();
+    { const uint64_t t = a_now(); g_gb_us[3] = t - gt; gt = t; }
     b->reading--;
     const int ok = (!len || keepb) && b->contents == mem && b->contents_asked == asked && !b->keep_contents &&
                    !b->reading;
@@ -2502,6 +2512,7 @@ int metal_buf_give_back(MBuffer *b)
         stage_free(mem, b->length, len);
     else
         free(keepb);
+    g_gb_us[4] = a_now() - gt;
     return ok;
 }
 
